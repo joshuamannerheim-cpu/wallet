@@ -137,7 +137,72 @@ def find_list(obj):
     return []
 
 
+def is_valid_solana_address(value):
+    """
+    Basic Solana address validation.
+    Solana addresses are base58 encoded and normally
+    decode to exactly 32 bytes.
+    """
+    if not isinstance(value, str):
+        return False
+
+    if not (32 <= len(value) <= 44):
+        return False
+
+    # Base58 alphabet excludes 0, O, I and l
+    alphabet = set(
+        "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+        "abcdefghijkmnopqrstuvwxyz"
+    )
+
+    if not all(char in alphabet for char in value):
+        return False
+
+    try:
+        number = 0
+
+        for char in value:
+            number *= 58
+            number += (
+                "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+                "abcdefghijkmnopqrstuvwxyz"
+            ).index(char)
+
+        decoded = number.to_bytes(
+            (number.bit_length() + 7) // 8,
+            byteorder="big"
+        )
+
+        # Account for leading base58 zeroes ("1")
+        leading_zeros = len(value) - len(value.lstrip("1"))
+        decoded = (b"\x00" * leading_zeros) + decoded
+
+        return len(decoded) == 32
+
+    except Exception:
+        return False
+
+
 def wallet_address_from_trader(item):
+    """
+    Extract only a plausible Solana wallet/account address
+    from a Birdeye trader record.
+    """
+
+    preferred_keys = [
+        "owner",
+        "wallet",
+        "wallet_address",
+        "walletAddress"
+    ]
+
+    for key in preferred_keys:
+        value = item.get(key)
+
+        if is_valid_solana_address(value):
+            return value
+
+    return None
     for key in [
         "owner",
         "wallet",
@@ -725,7 +790,20 @@ def discovery_runs():
         ]
     })
 
+@app.get("/reset-candidates")
+def reset_candidates():
+    initialise_database()
 
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM wallet_token_hits")
+            cur.execute("DELETE FROM candidate_wallets")
+            conn.commit()
+
+    return jsonify({
+        "success": True,
+        "message": "Candidate wallet data cleared."
+    })
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     app.run(
