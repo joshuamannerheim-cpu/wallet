@@ -161,6 +161,97 @@ def test_discovery_access():
         "tests": results
     })
 
+@app.get("/test-top-traders")
+def test_top_traders():
+    """
+    Take the highest-ranked trending Solana token and
+    test whether Birdeye Top Traders is available.
+    Kept deliberately small to conserve API usage.
+    """
+
+    # Step 1: get one trending token
+    trending_response = birdeye_get(
+        "/defi/token_trending",
+        {
+            "sort_by": "rank",
+            "sort_type": "asc",
+            "offset": 0,
+            "limit": 1,
+            "interval": "24h"
+        }
+    )
+
+    if trending_response.status_code != 200:
+        return jsonify({
+            "success": False,
+            "stage": "trending",
+            "status_code": trending_response.status_code,
+            "error": trending_response.text[:500]
+        }), trending_response.status_code
+
+    trending_payload = trending_response.json()
+    data = trending_payload.get("data", {})
+
+    # Birdeye may wrap the token list in "tokens" or "items".
+    tokens = (
+        data.get("tokens")
+        or data.get("items")
+        or []
+    )
+
+    if not tokens:
+        return jsonify({
+            "success": False,
+            "stage": "parse_trending",
+            "message": "No trending token could be parsed.",
+            "data_keys": list(data.keys()) if isinstance(data, dict) else []
+        }), 500
+
+    token = tokens[0]
+    token_address = token.get("address")
+
+    if not token_address:
+        return jsonify({
+            "success": False,
+            "stage": "parse_address",
+            "message": "Trending token did not contain an address."
+        }), 500
+
+    # Step 2: request only 5 traders for this token
+    traders_response = birdeye_get(
+        "/defi/v2/tokens/top_traders",
+        {
+            "address": token_address,
+            "time_frame": "30d",
+            "sort_type": "desc",
+            "sort_by": "realized_profit",
+            "offset": 0,
+            "limit": 5
+        }
+    )
+
+    if traders_response.status_code != 200:
+        return jsonify({
+            "success": False,
+            "stage": "top_traders",
+            "token_address": token_address,
+            "status_code": traders_response.status_code,
+            "error": traders_response.text[:500]
+        }), traders_response.status_code
+
+    trader_payload = traders_response.json()
+
+    return jsonify({
+        "success": True,
+        "token": {
+            "symbol": token.get("symbol"),
+            "name": token.get("name"),
+            "address": token_address
+        },
+        "top_traders_access": True,
+        "requested_traders": 5,
+        "data": trader_payload.get("data", trader_payload)
+    })
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
