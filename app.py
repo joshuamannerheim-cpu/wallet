@@ -598,7 +598,20 @@ def score_wallet(wallet):
 
     data = payload.get("data", payload)
 
-    if not isinstance(data, dict):
+if not isinstance(data, dict):
+    return jsonify({
+        "success": False,
+        "stage": "parse_data",
+        "message": "Unexpected Birdeye response structure.",
+        "response_preview": str(data)[:1000]
+    }), 502
+
+# Birdeye P&L Summary may wrap the actual metrics
+# inside data["summary"].
+summary = data.get("summary")
+
+if isinstance(summary, dict):
+    data = summary
         return jsonify({
             "success": False,
             "stage": "parse_data",
