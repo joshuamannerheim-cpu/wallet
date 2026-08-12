@@ -508,17 +508,11 @@ def score_wallet(wallet):
         retries=1
     )
 
-if response.status_code != 200:
-    return jsonify({
-        "success": False,
-        "status_code": response.status_code,
-        "birdeye_error": response.text[:1000],
-        "request": {
-            "wallet": wallet,
-            "duration": "30d",
-            "position_scope": "duration_only"
-        }
-    }), response.status_code
+    if response.status_code != 200:
+        return jsonify({
+            "success": False,
+            "status_code": response.status_code
+        }), response.status_code
 
     payload = response.json()
     data = payload.get("data", payload)
