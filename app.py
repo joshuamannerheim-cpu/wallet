@@ -493,33 +493,57 @@ def discover():
 # SCORE ONE WALLET
 # ---------------------------------------------------------
 
+# ---------------------------------------------------------
+# SCORE ONE WALLET
+# ---------------------------------------------------------
+
 @app.get("/score-wallet/<wallet>")
 def score_wallet(wallet):
-
     initialise_database()
+
+    params = {
+        "wallet": wallet,
+        "duration": "30d"
+    }
 
     response = birdeye_get(
         "/wallet/v2/pnl/summary",
-        {
-            "wallet": wallet,
-            "duration": "30d",
-            "position_scope": "duration_only"
-        },
+        params,
         retries=1
     )
 
+    # Return Birdeye's actual error so we can diagnose
+    # invalid parameters, rate limits or plan restrictions.
     if response.status_code != 200:
         return jsonify({
             "success": False,
-            "status_code": response.status_code
+            "status_code": response.status_code,
+            "birdeye_error": response.text[:1000],
+            "request_parameters": params
         }), response.status_code
 
-    payload = response.json()
+    try:
+        payload = response.json()
+    except Exception:
+        return jsonify({
+            "success": False,
+            "stage": "parse_response",
+            "message": "Birdeye returned a non-JSON response."
+        }), 502
+
     data = payload.get("data", payload)
 
-    counts = data.get("counts", {})
-    pnl = data.get("pnl", {})
-    cashflow = data.get("cashflow_usd", {})
+    if not isinstance(data, dict):
+        return jsonify({
+            "success": False,
+            "stage": "parse_data",
+            "message": "Unexpected Birdeye response structure.",
+            "response_preview": str(data)[:1000]
+        }), 502
+
+    counts = data.get("counts") or {}
+    pnl = data.get("pnl") or {}
+    cashflow = data.get("cashflow_usd") or {}
 
     win_rate = counts.get("win_rate")
     trades = counts.get("total_trade")
@@ -531,7 +555,6 @@ def score_wallet(wallet):
 
     with db() as conn:
         with conn.cursor() as cur:
-
             cur.execute("""
                 SELECT tokens_found
                 FROM candidate_wallets
@@ -562,20 +585,15 @@ def score_wallet(wallet):
                     last_scored
                 )
                 VALUES (
-                    %s,%s,%s,%s,%s,%s,%s,%s,NOW()
+                    %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                 )
                 ON CONFLICT (wallet)
                 DO UPDATE SET
-                    realized_pnl_30d =
-                        EXCLUDED.realized_pnl_30d,
-                    total_pnl_30d =
-                        EXCLUDED.total_pnl_30d,
-                    win_rate_30d =
-                        EXCLUDED.win_rate_30d,
-                    trades_30d =
-                        EXCLUDED.trades_30d,
-                    total_invested_30d =
-                        EXCLUDED.total_invested_30d,
+                    realized_pnl_30d = EXCLUDED.realized_pnl_30d,
+                    total_pnl_30d = EXCLUDED.total_pnl_30d,
+                    win_rate_30d = EXCLUDED.win_rate_30d,
+                    trades_30d = EXCLUDED.trades_30d,
+                    total_invested_30d = EXCLUDED.total_invested_30d,
                     score = EXCLUDED.score,
                     last_scored = NOW()
             """, (
@@ -602,9 +620,9 @@ def score_wallet(wallet):
             "win_rate": win_rate,
             "trades": trades,
             "total_invested_usd": invested
-        }
+        },
+        "raw_data_keys": list(data.keys())
     })
-
 
 # ---------------------------------------------------------
 # CANDIDATE LIST
