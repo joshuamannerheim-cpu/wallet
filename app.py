@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -9,9 +10,11 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.1"
+VERSION = "4.2"
 BIRDEYE_BASE = "https://public-api.birdeye.so"
 BIRDEYE_THROTTLE_SECONDS = 2
+HELIUS_THROTTLE_SECONDS = 2
+HELIUS_HISTORY_LIMIT = 100
 BASE58_ALPHABET = (
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
     "abcdefghijkmnopqrstuvwxyz"
@@ -53,6 +56,20 @@ def birdeye_get(path, params=None, retry_429=True):
         )
 
     return response
+
+
+def helius_get_transactions(wallet):
+    """Fetch a bounded, parsed history sample for heuristic screening."""
+    return requests.get(
+        f"https://api-mainnet.helius-rpc.com/v0/addresses/{wallet}/transactions",
+        params={
+            "api-key": os.getenv("HELIUS_API_KEY", ""),
+            "token-accounts": "balanceChanged",
+            "sort-order": "desc",
+            "limit": HELIUS_HISTORY_LIMIT,
+        },
+        timeout=45,
+    )
 
 
 def initialise_database():
@@ -97,6 +114,23 @@ def initialise_database():
                     status TEXT NOT NULL DEFAULT 'running'
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_screenings (
+                    wallet TEXT PRIMARY KEY,
+                    screening_status TEXT NOT NULL,
+                    risk_score INTEGER NOT NULL DEFAULT 0,
+                    risk_flags TEXT NOT NULL DEFAULT '[]',
+                    transactions_sampled INTEGER NOT NULL DEFAULT 0,
+                    unique_tokens_sampled INTEGER NOT NULL DEFAULT 0,
+                    unique_counterparties INTEGER NOT NULL DEFAULT 0,
+                    largest_funder TEXT,
+                    largest_funder_share DOUBLE PRECISION,
+                    failed_transaction_rate DOUBLE PRECISION,
+                    median_interval_seconds DOUBLE PRECISION,
+                    screened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    details TEXT NOT NULL DEFAULT '{}'
+                )
+            """)
 
             # These are idempotent and preserve databases created by earlier V4 builds.
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS total_pnl_30d DOUBLE PRECISION")
@@ -104,6 +138,9 @@ def initialise_database():
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS score_status TEXT NOT NULL DEFAULT 'unscored'")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS last_scored TIMESTAMPTZ")
+            cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS screening_status TEXT NOT NULL DEFAULT 'unscreened'")
+            cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS screening_risk_score INTEGER")
+            cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS last_screened TIMESTAMPTZ")
         conn.commit()
 
 
@@ -350,6 +387,172 @@ def persist_score(wallet, metrics, score, score_status):
                 score,
                 score_status,
             ))
+        conn.commit()
+
+
+def analyse_wallet_history(wallet, transactions, candidate):
+    """Build explainable risk signals from a bounded Helius history sample."""
+    flags = []
+    risk_score = 0
+    timestamps = []
+    token_mints = set()
+    counterparties = set()
+    funders = {}
+    failed = 0
+
+    for tx in transactions:
+        if not isinstance(tx, dict):
+            continue
+        timestamp = tx.get("timestamp")
+        if isinstance(timestamp, (int, float)):
+            timestamps.append(int(timestamp))
+        if tx.get("transactionError") or tx.get("error"):
+            failed += 1
+
+        for transfer in tx.get("tokenTransfers") or []:
+            if not isinstance(transfer, dict):
+                continue
+            mint = transfer.get("mint")
+            if is_valid_solana_address(mint):
+                token_mints.add(mint)
+            for field in ("fromUserAccount", "toUserAccount"):
+                address = transfer.get(field)
+                if is_valid_solana_address(address) and address != wallet:
+                    counterparties.add(address)
+
+        for transfer in tx.get("nativeTransfers") or []:
+            if not isinstance(transfer, dict):
+                continue
+            sender = transfer.get("fromUserAccount")
+            recipient = transfer.get("toUserAccount")
+            amount = transfer.get("amount")
+            if is_valid_solana_address(sender) and sender != wallet:
+                counterparties.add(sender)
+            if is_valid_solana_address(recipient) and recipient != wallet:
+                counterparties.add(recipient)
+            if (
+                recipient == wallet
+                and is_valid_solana_address(sender)
+                and isinstance(amount, (int, float))
+                and amount > 0
+            ):
+                funders[sender] = funders.get(sender, 0) + float(amount)
+
+    timestamps = sorted(set(timestamps), reverse=True)
+    intervals = [
+        timestamps[index] - timestamps[index + 1]
+        for index in range(len(timestamps) - 1)
+        if timestamps[index] >= timestamps[index + 1]
+    ]
+    median_interval = None
+    if intervals:
+        ordered = sorted(intervals)
+        middle = len(ordered) // 2
+        median_interval = (
+            float(ordered[middle]) if len(ordered) % 2
+            else (ordered[middle - 1] + ordered[middle]) / 2
+        )
+
+    total_funding = sum(funders.values())
+    largest_funder = None
+    largest_funder_share = None
+    if funders and total_funding > 0:
+        largest_funder, largest_amount = max(funders.items(), key=lambda item: item[1])
+        largest_funder_share = largest_amount / total_funding
+
+    transaction_count = len(transactions)
+    failed_rate = failed / transaction_count if transaction_count else None
+
+    if transaction_count < 20:
+        flags.append("limited_onchain_sample")
+        risk_score += 15
+    if candidate["tokens_found"] < 2:
+        flags.append("single_token_evidence")
+        risk_score += 15
+    if candidate["trades"] is not None and candidate["trades"] < 30:
+        flags.append("limited_trade_history")
+        risk_score += 10
+    if candidate["realized_pnl"] is not None and candidate["realized_pnl"] < 1000:
+        flags.append("low_absolute_profit")
+        risk_score += 10
+    if candidate["win_rate"] is not None:
+        win_rate = candidate["win_rate"] / 100 if candidate["win_rate"] > 1 else candidate["win_rate"]
+        if win_rate >= 0.999:
+            flags.append("perfect_win_rate_requires_validation")
+            risk_score += 15
+        elif win_rate < 0.30:
+            flags.append("very_low_win_rate")
+            risk_score += 20
+    if median_interval is not None and median_interval < 10:
+        flags.append("bursty_automated_activity")
+        risk_score += 25
+    elif median_interval is not None and median_interval < 30:
+        flags.append("rapid_activity")
+        risk_score += 10
+    if failed_rate is not None and failed_rate >= 0.20:
+        flags.append("high_failed_transaction_rate")
+        risk_score += 15
+    if largest_funder_share is not None and largest_funder_share >= 0.90 and total_funding >= 100000000:
+        flags.append("concentrated_funding_source")
+        risk_score += 15
+    if len(token_mints) <= 1 and transaction_count >= 20:
+        flags.append("concentrated_token_activity")
+        risk_score += 10
+
+    return {
+        "risk_score": min(risk_score, 100),
+        "risk_flags": flags,
+        "transactions_sampled": transaction_count,
+        "unique_tokens_sampled": len(token_mints),
+        "unique_counterparties": len(counterparties),
+        "largest_funder": largest_funder,
+        "largest_funder_share": largest_funder_share,
+        "failed_transaction_rate": failed_rate,
+        "median_interval_seconds": median_interval,
+        "history_is_bounded": True,
+        "classification": (
+            "high_risk" if risk_score >= 60
+            else "review" if risk_score >= 30
+            else "provisional_pass"
+        ),
+    }
+
+
+def persist_screening(wallet, screening, status="screened"):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO wallet_screenings (
+                    wallet, screening_status, risk_score, risk_flags,
+                    transactions_sampled, unique_tokens_sampled,
+                    unique_counterparties, largest_funder, largest_funder_share,
+                    failed_transaction_rate, median_interval_seconds, screened_at, details
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                ON CONFLICT (wallet) DO UPDATE SET
+                    screening_status = EXCLUDED.screening_status,
+                    risk_score = EXCLUDED.risk_score,
+                    risk_flags = EXCLUDED.risk_flags,
+                    transactions_sampled = EXCLUDED.transactions_sampled,
+                    unique_tokens_sampled = EXCLUDED.unique_tokens_sampled,
+                    unique_counterparties = EXCLUDED.unique_counterparties,
+                    largest_funder = EXCLUDED.largest_funder,
+                    largest_funder_share = EXCLUDED.largest_funder_share,
+                    failed_transaction_rate = EXCLUDED.failed_transaction_rate,
+                    median_interval_seconds = EXCLUDED.median_interval_seconds,
+                    screened_at = NOW(), details = EXCLUDED.details
+            """, (
+                wallet, status, screening["risk_score"],
+                json.dumps(screening["risk_flags"]), screening["transactions_sampled"],
+                screening["unique_tokens_sampled"], screening["unique_counterparties"],
+                screening["largest_funder"], screening["largest_funder_share"],
+                screening["failed_transaction_rate"], screening["median_interval_seconds"],
+                json.dumps(screening),
+            ))
+            cur.execute("""
+                UPDATE candidate_wallets SET screening_status = %s,
+                    screening_risk_score = %s, last_screened = NOW(), updated_at = NOW()
+                WHERE wallet = %s
+            """, (status, screening["risk_score"], wallet))
         conn.commit()
 
 
@@ -674,6 +877,141 @@ def score_batch():
 
 
 # =========================================================
+# V4.2 DEEP SCREENING
+# =========================================================
+
+def candidate_for_screening(wallet):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT tokens_found, realized_pnl_30d, win_rate_30d, trades_30d,
+                    score, score_status FROM candidate_wallets WHERE wallet = %s
+            """, (wallet,))
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "tokens_found": row[0], "realized_pnl": row[1], "win_rate": row[2],
+        "trades": row[3], "score": row[4], "score_status": row[5],
+    }
+
+
+@app.get("/screen-wallet/<wallet>")
+def screen_wallet(wallet):
+    initialise_database()
+    if not is_valid_solana_address(wallet):
+        return jsonify({"success": False, "error": "Invalid Solana wallet address"}), 400
+    candidate = candidate_for_screening(wallet)
+    if not candidate:
+        return jsonify({"success": False, "error": "Wallet is not a candidate"}), 404
+    if candidate["score_status"] != "scored":
+        return jsonify({"success": False, "error": "Wallet must be scored first"}), 409
+
+    response = helius_get_transactions(wallet)
+    if response.status_code != 200:
+        return jsonify({
+            "success": False, "status_code": response.status_code,
+            "helius_error": response.text[:1000],
+        }), response.status_code
+    try:
+        transactions = response.json()
+    except Exception:
+        return jsonify({"success": False, "error": "Helius returned invalid JSON"}), 502
+    if not isinstance(transactions, list):
+        return jsonify({"success": False, "error": "Unexpected Helius response structure"}), 502
+
+    screening = analyse_wallet_history(wallet, transactions, candidate)
+    persist_screening(wallet, screening)
+    return jsonify({
+        "success": True, "wallet": wallet, "screening": screening,
+        "disclaimer": "Heuristic risk signals only; they do not prove common ownership or insider activity.",
+    })
+
+
+@app.get("/screen-batch")
+def screen_batch():
+    """Deep-screen at most five scored candidates; stop immediately on Helius 429."""
+    initialise_database()
+    try:
+        limit = int(request.args.get("limit", 5))
+    except ValueError:
+        limit = 5
+    limit = min(max(limit, 1), 5)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet, tokens_found, realized_pnl_30d, win_rate_30d,
+                    trades_30d, score, score_status
+                FROM candidate_wallets
+                WHERE score_status = 'scored' AND score >= 30
+                    AND (last_screened IS NULL OR screening_status = 'error')
+                ORDER BY score DESC, realized_pnl_30d DESC NULLS LAST
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+
+    results = []
+    stopped_on_429 = False
+    for row in rows:
+        wallet = row[0]
+        candidate = {
+            "tokens_found": row[1], "realized_pnl": row[2], "win_rate": row[3],
+            "trades": row[4], "score": row[5], "score_status": row[6],
+        }
+        time.sleep(HELIUS_THROTTLE_SECONDS)
+        response = helius_get_transactions(wallet)
+        if response.status_code == 429:
+            results.append({"wallet": wallet, "status": 429, "message": "Helius rate limit reached; batch stopped"})
+            stopped_on_429 = True
+            break
+        if response.status_code != 200:
+            results.append({"wallet": wallet, "status": response.status_code})
+            continue
+        try:
+            transactions = response.json()
+        except Exception:
+            results.append({"wallet": wallet, "status": "parse_error"})
+            continue
+        if not isinstance(transactions, list):
+            results.append({"wallet": wallet, "status": "unexpected_response"})
+            continue
+        screening = analyse_wallet_history(wallet, transactions, candidate)
+        persist_screening(wallet, screening)
+        results.append({"wallet": wallet, "status": 200, **screening})
+
+    return jsonify({
+        "success": True, "requested": limit, "selected": len(rows),
+        "processed": len(results), "stopped_on_429": stopped_on_429,
+        "results": results,
+        "disclaimer": "Heuristic risk signals only; they do not prove common ownership or insider activity.",
+    })
+
+
+@app.get("/screenings")
+def screenings():
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet, screening_status, risk_score, risk_flags,
+                    transactions_sampled, unique_tokens_sampled, unique_counterparties,
+                    largest_funder, largest_funder_share, failed_transaction_rate,
+                    median_interval_seconds, screened_at
+                FROM wallet_screenings ORDER BY risk_score ASC, screened_at DESC
+            """)
+            rows = cur.fetchall()
+    return jsonify({"success": True, "count": len(rows), "screenings": [{
+        "wallet": row[0], "screening_status": row[1], "risk_score": row[2],
+        "risk_flags": json.loads(row[3]), "transactions_sampled": row[4],
+        "unique_tokens_sampled": row[5], "unique_counterparties": row[6],
+        "largest_funder": row[7], "largest_funder_share": row[8],
+        "failed_transaction_rate": row[9], "median_interval_seconds": row[10],
+        "screened_at": row[11],
+    } for row in rows]})
+
+
+# =========================================================
 # CANDIDATES / DISCOVERY HISTORY
 # =========================================================
 
@@ -691,7 +1029,8 @@ def candidates():
             cur.execute("""
                 SELECT wallet, tokens_found, realized_pnl_30d, total_pnl_30d,
                     win_rate_30d, trades_30d, total_invested_30d, score,
-                    score_status, created_at, last_scored
+                    score_status, created_at, last_scored, screening_status,
+                    screening_risk_score, last_screened
                 FROM candidate_wallets
                 ORDER BY score DESC, tokens_found DESC, realized_pnl_30d DESC NULLS LAST
                 LIMIT %s
@@ -707,6 +1046,8 @@ def candidates():
             "win_rate_30d": row[4], "trades_30d": row[5],
             "total_invested_30d": row[6], "score": row[7],
             "score_status": row[8], "created_at": row[9], "last_scored": row[10],
+            "screening_status": row[11], "screening_risk_score": row[12],
+            "last_screened": row[13],
             "capital_efficiency": scoring["capital_efficiency"],
             "risk_flags": scoring["flags"] if row[8] == "scored" else [],
         })
