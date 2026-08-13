@@ -10,7 +10,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.4.0"
+VERSION = "4.5.0"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -24,6 +24,9 @@ STABLE_MINTS = {
 }
 BIRDEYE_BASE = "https://public-api.birdeye.so"
 BIRDEYE_THROTTLE_SECONDS = 2
+DISCOVERY_MAX_TOKENS = 20
+DISCOVERY_PAGE_SIZE = 5
+DISCOVERY_WALLETS_PER_TOKEN = 5
 HELIUS_THROTTLE_SECONDS = 2
 HELIUS_HISTORY_LIMIT = 100
 BASE58_ALPHABET = (
@@ -842,12 +845,25 @@ def health():
 
 @app.get("/discover")
 def discover():
+    """
+    V4.5 discovery:
+    - supports up to 20 trending tokens per run;
+    - pages Birdeye trending results in conservative groups of five;
+    - accepts ?offset=N so successive runs can rotate through the universe;
+    - preserves cross-token observations in the existing evidence tables.
+    """
     initialise_database()
     try:
-        token_limit = int(request.args.get("tokens", 3))
+        token_limit = int(request.args.get("tokens", 10))
     except ValueError:
-        token_limit = 3
-    token_limit = min(max(token_limit, 1), 5)
+        token_limit = 10
+    token_limit = min(max(token_limit, 1), DISCOVERY_MAX_TOKENS)
+
+    try:
+        start_offset = int(request.args.get("offset", 0))
+    except ValueError:
+        start_offset = 0
+    start_offset = max(start_offset, 0)
 
     with db() as conn:
         with conn.cursor() as cur:
@@ -855,38 +871,85 @@ def discover():
             run_id = cur.fetchone()[0]
         conn.commit()
 
-    trending_response = birdeye_get("/defi/token_trending", {
-        "sort_by": "rank", "sort_type": "asc", "offset": 0,
-        "limit": token_limit, "interval": "24h",
-    })
-    if trending_response.status_code != 200:
+    # Birdeye's regular/standard access has behaved reliably in small pages.
+    # Fetch multiple pages instead of silently capping the entire run at five.
+    tokens = []
+    seen_token_addresses = set()
+    trending_statuses = []
+    api_429s = 0
+
+    page_offset = start_offset
+    while len(tokens) < token_limit:
+        page_limit = min(DISCOVERY_PAGE_SIZE, token_limit - len(tokens))
+        trending_response = birdeye_get("/defi/token_trending", {
+            "sort_by": "rank",
+            "sort_type": "asc",
+            "offset": page_offset,
+            "limit": page_limit,
+            "interval": "24h",
+        }, retry_429=False)
+
+        trending_statuses.append({
+            "offset": page_offset,
+            "limit": page_limit,
+            "status": trending_response.status_code,
+        })
+
+        if trending_response.status_code == 429:
+            api_429s += 1
+            break
+        if trending_response.status_code != 200:
+            break
+
+        page_tokens = find_list(trending_response.json())
+        added = 0
+        for token in page_tokens:
+            token_address = token.get("address") if isinstance(token, dict) else None
+            if not is_valid_solana_address(token_address):
+                continue
+            if token_address in seen_token_addresses:
+                continue
+            seen_token_addresses.add(token_address)
+            tokens.append(token)
+            added += 1
+            if len(tokens) >= token_limit:
+                break
+
+        # No more usable results on this page.
+        if added == 0 or len(page_tokens) < page_limit:
+            break
+
+        page_offset += page_limit
+        time.sleep(BIRDEYE_THROTTLE_SECONDS)
+
+    if not tokens:
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE discovery_runs SET completed_at = NOW(), status = 'failed'
+                    UPDATE discovery_runs SET completed_at = NOW(),
+                        tokens_examined = 0, wallets_found = 0, api_429s = %s,
+                        status = 'failed'
                     WHERE id = %s
-                """, (run_id,))
+                """, (api_429s, run_id))
             conn.commit()
         return jsonify({
             "success": False,
             "stage": "trending",
-            "status_code": trending_response.status_code,
-            "error": trending_response.text[:500],
-        }), trending_response.status_code
+            "run_id": run_id,
+            "api_429s": api_429s,
+            "trending_pages": trending_statuses,
+            "error": "No usable trending tokens returned.",
+        }), 429 if api_429s else 502
 
-    tokens = find_list(trending_response.json())
     wallets_found = set()
     results = []
-    api_429s = 0
     tokens_examined = 0
 
     for token in tokens[:token_limit]:
         token_address = token.get("address")
-        if not is_valid_solana_address(token_address):
-            continue
-
         token_symbol = token.get("symbol")
         token_name = token.get("name")
+
         time.sleep(BIRDEYE_THROTTLE_SECONDS)
         trader_response = birdeye_get("/defi/v2/tokens/top_traders", {
             "address": token_address,
@@ -894,8 +957,8 @@ def discover():
             "sort_type": "desc",
             "sort_by": "realized_pnl",
             "offset": 0,
-            "limit": 5,
-        })
+            "limit": DISCOVERY_WALLETS_PER_TOKEN,
+        }, retry_429=False)
         tokens_examined += 1
 
         if trader_response.status_code == 429:
@@ -918,28 +981,38 @@ def discover():
                     wallet = wallet_address_from_trader(trader)
                     if not wallet:
                         continue
+
                     wallets_found.add(wallet)
                     valid_wallets += 1
                     token_realized = get_nested_number(trader, [
                         ("realized_pnl",), ("realizedPnl",),
                         ("realized_profit",), ("pnl", "realized_profit"),
                     ])
+
                     cur.execute("""
                         INSERT INTO wallet_token_hits (
-                            wallet, token_address, token_symbol, token_name, token_realized_pnl
+                            wallet, token_address, token_symbol, token_name,
+                            token_realized_pnl
                         ) VALUES (%s, %s, %s, %s, %s)
                         ON CONFLICT (wallet, token_address) DO UPDATE SET
                             token_symbol = EXCLUDED.token_symbol,
                             token_name = EXCLUDED.token_name,
                             token_realized_pnl = EXCLUDED.token_realized_pnl
-                    """, (wallet, token_address, token_symbol, token_name, token_realized))
+                    """, (
+                        wallet, token_address, token_symbol,
+                        token_name, token_realized,
+                    ))
                     cur.execute("""
                         INSERT INTO candidate_wallets (wallet, tokens_found)
-                        VALUES (%s, 1) ON CONFLICT (wallet) DO NOTHING
+                        VALUES (%s, 1)
+                        ON CONFLICT (wallet) DO NOTHING
                     """, (wallet,))
                     cur.execute("""
                         UPDATE candidate_wallets SET
-                            tokens_found = (SELECT COUNT(*) FROM wallet_token_hits WHERE wallet = %s),
+                            tokens_found = (
+                                SELECT COUNT(*) FROM wallet_token_hits
+                                WHERE wallet = %s
+                            ),
                             updated_at = NOW()
                         WHERE wallet = %s
                     """, (wallet, wallet))
@@ -950,25 +1023,40 @@ def discover():
                         ON CONFLICT (run_id, wallet, token_address) DO NOTHING
                     """, (run_id, wallet, token_address, token_symbol))
             conn.commit()
-        results.append({"token": token_symbol, "status": 200, "wallets": valid_wallets})
+
+        results.append({
+            "token": token_symbol,
+            "status": 200,
+            "wallets": valid_wallets,
+        })
 
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE discovery_runs SET completed_at = NOW(), tokens_examined = %s,
-                    wallets_found = %s, api_429s = %s, status = 'completed'
+                UPDATE discovery_runs SET completed_at = NOW(),
+                    tokens_examined = %s, wallets_found = %s,
+                    api_429s = %s, status = 'completed'
                 WHERE id = %s
-            """, (tokens_examined, len(wallets_found), api_429s, run_id))
+            """, (
+                tokens_examined, len(wallets_found), api_429s, run_id,
+            ))
         conn.commit()
 
     return jsonify({
         "success": True,
         "run_id": run_id,
+        "requested_tokens": token_limit,
+        "start_offset": start_offset,
         "tokens_examined": tokens_examined,
         "unique_wallets_found": len(wallets_found),
         "api_429s": api_429s,
+        "trending_pages": trending_statuses,
         "results": results,
-        "note": "Discovery only. Candidates still require wallet-level performance and risk screening.",
+        "note": (
+            "V4.5 discovery only. Rotate offset between runs to broaden token "
+            "coverage. Candidates still require scoring, Helius screening and "
+            "token-level validation."
+        ),
     })
 
 
@@ -1418,8 +1506,11 @@ def discovery_evidence():
         })
         results.append(record)
     results.sort(key=lambda item: (
-        item["cross_token_evidence"], item["independent_repeat_evidence"],
-        item["distinct_tokens_observed"], item["discovery_runs_observed"], item["score"],
+        item["cross_token_evidence"],
+        item["distinct_tokens_observed"],
+        item["independent_repeat_evidence"],
+        min(item["discovery_runs_observed"], 3),
+        item["score"],
     ), reverse=True)
     return jsonify({
         "success": True,
@@ -1675,6 +1766,7 @@ def classify_candidate(candidate, screening=None, validation=None, evidence=None
             "confidence": "HIGH",
             "reasons": sorted(set(blockers)),
             "watch_eligible": False,
+            "signal_eligible": False,
             "capital_efficiency": efficiency,
         }
 
@@ -1784,6 +1876,26 @@ def classify_candidate(candidate, screening=None, validation=None, evidence=None
         and realized > 0
     )
 
+    # ASYMMETRIC preserves low-risk wallets whose hit rate is below WATCH
+    # standards but whose material winners substantially outweigh losers.
+    asymmetric_core = (
+        not watch_core
+        and risk_score is not None
+        and risk_score <= 25
+        and validation_status == "validated"
+        and validation_strength == "strong"
+        and material_tokens is not None
+        and material_tokens >= 5
+        and material_rate is not None
+        and 0.30 <= material_rate < 0.60
+        and profit_factor is not None
+        and profit_factor >= 5.0
+        and trades is not None
+        and trades >= 30
+        and realized is not None
+        and realized > 0
+    )
+
     if watch_core:
         classification = "WATCH"
         confidence = (
@@ -1792,6 +1904,15 @@ def classify_candidate(candidate, screening=None, validation=None, evidence=None
             or evidence.get("independent_repeat_evidence")
             else "MEDIUM"
         )
+    elif asymmetric_core:
+        classification = "ASYMMETRIC"
+        confidence = (
+            "HIGH"
+            if evidence.get("cross_token_evidence")
+            or evidence.get("independent_repeat_evidence")
+            else "MEDIUM"
+        )
+        reasons.append("asymmetric_payoff_profile")
     else:
         classification = "REVIEW"
         confidence = (
@@ -1805,6 +1926,7 @@ def classify_candidate(candidate, screening=None, validation=None, evidence=None
         "confidence": confidence,
         "reasons": reasons,
         "watch_eligible": classification == "WATCH",
+        "signal_eligible": classification in {"WATCH", "ASYMMETRIC"},
         "capital_efficiency": efficiency,
     }
 
@@ -1843,7 +1965,7 @@ def shortlist():
             rows = cur.fetchall()
 
     items = []
-    counts = {"WATCH": 0, "REVIEW": 0, "REJECT": 0}
+    counts = {"WATCH": 0, "ASYMMETRIC": 0, "REVIEW": 0, "REJECT": 0}
 
     for row in rows:
         wallet = row[0]
@@ -1881,6 +2003,7 @@ def shortlist():
             "classification": classification["classification"],
             "confidence": classification["confidence"],
             "watch_eligible": classification["watch_eligible"],
+            "signal_eligible": classification["signal_eligible"],
             "reasons": classification["reasons"],
             "score": row[7],
             "realized_pnl_30d": row[2],
@@ -1897,7 +2020,7 @@ def shortlist():
             "last_validated": row[14],
         })
 
-    class_order = {"WATCH": 0, "REVIEW": 1, "REJECT": 2}
+    class_order = {"WATCH": 0, "ASYMMETRIC": 1, "REVIEW": 2, "REJECT": 3}
     confidence_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
     items.sort(key=lambda item: (
         class_order[item["classification"]],
@@ -1916,11 +2039,17 @@ def shortlist():
                 "material tokens, >=60% material-token profitability, healthy "
                 "profit factor, meaningful trade history, and positive realized PnL."
             ),
-            "REVIEW": "No hard reject signal, but WATCH evidence is incomplete or mixed.",
+            "ASYMMETRIC": (
+                "Low Helius risk plus strong validation and >=5 material tokens; "
+                "30-60% material-token profitability but material profit factor >=5. "
+                "Kept separate from WATCH for future lower-weight signal use."
+            ),
+            "REVIEW": "No hard reject signal, but WATCH/ASYMMETRIC evidence is incomplete or mixed.",
             "REJECT": "Hard risk or performance exclusion triggered.",
             "note": (
-                "WATCH means eligible to contribute to a future consensus signal; "
-                "it is not a recommendation to buy or copy a wallet."
+                "WATCH is the primary future consensus cohort. ASYMMETRIC is a "
+                "separate lower-consistency/high-payoff cohort and must not be treated "
+                "as equivalent to WATCH. Neither is a recommendation to buy or copy a wallet."
             ),
         },
         "counts": counts,
