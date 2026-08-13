@@ -10,7 +10,8 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.2"
+VERSION = "4.2.1"
+SCREENING_VERSION = "4.2.1"
 BIRDEYE_BASE = "https://public-api.birdeye.so"
 BIRDEYE_THROTTLE_SECONDS = 2
 HELIUS_THROTTLE_SECONDS = 2
@@ -125,6 +126,10 @@ def initialise_database():
                     unique_counterparties INTEGER NOT NULL DEFAULT 0,
                     largest_funder TEXT,
                     largest_funder_share DOUBLE PRECISION,
+                    funding_transfer_count INTEGER NOT NULL DEFAULT 0,
+                    total_native_funding_lamports DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    transaction_types TEXT NOT NULL DEFAULT '{}',
+                    screening_version TEXT NOT NULL DEFAULT '4.2',
                     failed_transaction_rate DOUBLE PRECISION,
                     median_interval_seconds DOUBLE PRECISION,
                     screened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -141,6 +146,10 @@ def initialise_database():
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS screening_status TEXT NOT NULL DEFAULT 'unscreened'")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS screening_risk_score INTEGER")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS last_screened TIMESTAMPTZ")
+            cur.execute("ALTER TABLE wallet_screenings ADD COLUMN IF NOT EXISTS funding_transfer_count INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE wallet_screenings ADD COLUMN IF NOT EXISTS total_native_funding_lamports DOUBLE PRECISION NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE wallet_screenings ADD COLUMN IF NOT EXISTS transaction_types TEXT NOT NULL DEFAULT '{}'")
+            cur.execute("ALTER TABLE wallet_screenings ADD COLUMN IF NOT EXISTS screening_version TEXT NOT NULL DEFAULT '4.2'")
         conn.commit()
 
 
@@ -398,6 +407,8 @@ def analyse_wallet_history(wallet, transactions, candidate):
     token_mints = set()
     counterparties = set()
     funders = {}
+    funding_transfer_count = 0
+    transaction_types = {}
     failed = 0
 
     for tx in transactions:
@@ -408,6 +419,9 @@ def analyse_wallet_history(wallet, transactions, candidate):
             timestamps.append(int(timestamp))
         if tx.get("transactionError") or tx.get("error"):
             failed += 1
+        transaction_type = tx.get("type") or "UNKNOWN"
+        if isinstance(transaction_type, str):
+            transaction_types[transaction_type] = transaction_types.get(transaction_type, 0) + 1
 
         for transfer in tx.get("tokenTransfers") or []:
             if not isinstance(transfer, dict):
@@ -437,6 +451,7 @@ def analyse_wallet_history(wallet, transactions, candidate):
                 and amount > 0
             ):
                 funders[sender] = funders.get(sender, 0) + float(amount)
+                funding_transfer_count += 1
 
     timestamps = sorted(set(timestamps), reverse=True)
     intervals = [
@@ -492,12 +507,27 @@ def analyse_wallet_history(wallet, transactions, candidate):
     if failed_rate is not None and failed_rate >= 0.20:
         flags.append("high_failed_transaction_rate")
         risk_score += 15
-    if largest_funder_share is not None and largest_funder_share >= 0.90 and total_funding >= 100000000:
+    if (
+        funding_transfer_count >= 3
+        and largest_funder_share is not None
+        and largest_funder_share >= 0.90
+        and total_funding >= 100000000
+    ):
         flags.append("concentrated_funding_source")
         risk_score += 15
     if len(token_mints) <= 1 and transaction_count >= 20:
         flags.append("concentrated_token_activity")
         risk_score += 10
+
+    dominant_type = None
+    dominant_type_share = None
+    if transaction_types and transaction_count:
+        dominant_type, dominant_count = max(transaction_types.items(), key=lambda item: item[1])
+        dominant_type_share = dominant_count / transaction_count
+        service_like_types = {"TRANSFER", "TOKEN_MINT", "COMPRESSED_NFT_MINT", "UNKNOWN"}
+        if dominant_type in service_like_types and dominant_type_share >= 0.80:
+            flags.append("service_like_activity")
+            risk_score += 15
 
     return {
         "risk_score": min(risk_score, 100),
@@ -507,9 +537,17 @@ def analyse_wallet_history(wallet, transactions, candidate):
         "unique_counterparties": len(counterparties),
         "largest_funder": largest_funder,
         "largest_funder_share": largest_funder_share,
+        "funding_transfer_count": funding_transfer_count,
+        "total_native_funding_lamports": total_funding,
+        "transaction_types": transaction_types,
+        "dominant_transaction_type": dominant_type,
+        "dominant_transaction_type_share": dominant_type_share,
         "failed_transaction_rate": failed_rate,
         "median_interval_seconds": median_interval,
         "history_is_bounded": True,
+        "screening_version": SCREENING_VERSION,
+        "sampled_counterparties": sorted(counterparties),
+        "sampled_funders": sorted(funders),
         "classification": (
             "high_risk" if risk_score >= 60
             else "review" if risk_score >= 30
@@ -526,8 +564,10 @@ def persist_screening(wallet, screening, status="screened"):
                     wallet, screening_status, risk_score, risk_flags,
                     transactions_sampled, unique_tokens_sampled,
                     unique_counterparties, largest_funder, largest_funder_share,
+                    funding_transfer_count, total_native_funding_lamports,
+                    transaction_types, screening_version,
                     failed_transaction_rate, median_interval_seconds, screened_at, details
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
                 ON CONFLICT (wallet) DO UPDATE SET
                     screening_status = EXCLUDED.screening_status,
                     risk_score = EXCLUDED.risk_score,
@@ -537,6 +577,10 @@ def persist_screening(wallet, screening, status="screened"):
                     unique_counterparties = EXCLUDED.unique_counterparties,
                     largest_funder = EXCLUDED.largest_funder,
                     largest_funder_share = EXCLUDED.largest_funder_share,
+                    funding_transfer_count = EXCLUDED.funding_transfer_count,
+                    total_native_funding_lamports = EXCLUDED.total_native_funding_lamports,
+                    transaction_types = EXCLUDED.transaction_types,
+                    screening_version = EXCLUDED.screening_version,
                     failed_transaction_rate = EXCLUDED.failed_transaction_rate,
                     median_interval_seconds = EXCLUDED.median_interval_seconds,
                     screened_at = NOW(), details = EXCLUDED.details
@@ -545,6 +589,8 @@ def persist_screening(wallet, screening, status="screened"):
                 json.dumps(screening["risk_flags"]), screening["transactions_sampled"],
                 screening["unique_tokens_sampled"], screening["unique_counterparties"],
                 screening["largest_funder"], screening["largest_funder_share"],
+                screening["funding_transfer_count"], screening["total_native_funding_lamports"],
+                json.dumps(screening["transaction_types"]), SCREENING_VERSION,
                 screening["failed_transaction_rate"], screening["median_interval_seconds"],
                 json.dumps(screening),
             ))
@@ -945,10 +991,17 @@ def screen_batch():
                     trades_30d, score, score_status
                 FROM candidate_wallets
                 WHERE score_status = 'scored' AND score >= 30
-                    AND (last_screened IS NULL OR screening_status = 'error')
+                    AND (
+                        last_screened IS NULL OR screening_status = 'error'
+                        OR NOT EXISTS (
+                            SELECT 1 FROM wallet_screenings ws
+                            WHERE ws.wallet = candidate_wallets.wallet
+                                AND ws.screening_version = %s
+                        )
+                    )
                 ORDER BY score DESC, realized_pnl_30d DESC NULLS LAST
                 LIMIT %s
-            """, (limit,))
+            """, (SCREENING_VERSION, limit))
             rows = cur.fetchall()
 
     results = []
@@ -997,7 +1050,8 @@ def screenings():
                 SELECT wallet, screening_status, risk_score, risk_flags,
                     transactions_sampled, unique_tokens_sampled, unique_counterparties,
                     largest_funder, largest_funder_share, failed_transaction_rate,
-                    median_interval_seconds, screened_at
+                    median_interval_seconds, screened_at, funding_transfer_count,
+                    total_native_funding_lamports, transaction_types, screening_version
                 FROM wallet_screenings ORDER BY risk_score ASC, screened_at DESC
             """)
             rows = cur.fetchall()
@@ -1007,8 +1061,62 @@ def screenings():
         "unique_tokens_sampled": row[5], "unique_counterparties": row[6],
         "largest_funder": row[7], "largest_funder_share": row[8],
         "failed_transaction_rate": row[9], "median_interval_seconds": row[10],
-        "screened_at": row[11],
+        "screened_at": row[11], "funding_transfer_count": row[12],
+        "total_native_funding_lamports": row[13],
+        "transaction_types": json.loads(row[14]), "screening_version": row[15],
     } for row in rows]})
+
+
+@app.get("/screening-relationships")
+def screening_relationships():
+    """Compare screened wallets using only counterparties present in bounded samples."""
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet, details FROM wallet_screenings
+                WHERE screening_version = %s ORDER BY wallet
+            """, (SCREENING_VERSION,))
+            rows = cur.fetchall()
+
+    samples = {}
+    for wallet, details_text in rows:
+        try:
+            details = json.loads(details_text)
+        except (TypeError, ValueError):
+            details = {}
+        samples[wallet] = {
+            "counterparties": set(details.get("sampled_counterparties") or []),
+            "funders": set(details.get("sampled_funders") or []),
+        }
+
+    relationships = []
+    wallets = sorted(samples)
+    for left_index, left in enumerate(wallets):
+        for right in wallets[left_index + 1:]:
+            shared_funders = sorted(samples[left]["funders"] & samples[right]["funders"])
+            shared_counterparties = sorted(
+                samples[left]["counterparties"] & samples[right]["counterparties"]
+            )
+            if shared_funders or shared_counterparties:
+                relationships.append({
+                    "wallet_a": left, "wallet_b": right,
+                    "shared_funders": shared_funders,
+                    "shared_funder_count": len(shared_funders),
+                    "shared_counterparties": shared_counterparties[:25],
+                    "shared_counterparty_count": len(shared_counterparties),
+                    "counterparties_truncated": len(shared_counterparties) > 25,
+                })
+
+    relationships.sort(
+        key=lambda item: (item["shared_funder_count"], item["shared_counterparty_count"]),
+        reverse=True,
+    )
+    return jsonify({
+        "success": True, "screening_version": SCREENING_VERSION,
+        "wallets_compared": len(wallets), "relationships": relationships,
+        "disclaimer": "Shared sampled addresses are leads only and do not prove common ownership.",
+    })
 
 
 # =========================================================
