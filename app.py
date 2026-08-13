@@ -10,8 +10,8 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.2.1"
-SCREENING_VERSION = "4.2.1"
+VERSION = "4.2.2"
+SCREENING_VERSION = "4.2.2"
 BIRDEYE_BASE = "https://public-api.birdeye.so"
 BIRDEYE_THROTTLE_SECONDS = 2
 HELIUS_THROTTLE_SECONDS = 2
@@ -444,7 +444,12 @@ def analyse_wallet_history(wallet, transactions, candidate):
                 counterparties.add(sender)
             if is_valid_solana_address(recipient) and recipient != wallet:
                 counterparties.add(recipient)
+            # Only plain TRANSFER transactions count as funding candidates.
+            # Native movements inside swaps commonly represent proceeds,
+            # routing, refunds, rent, or wrapped-SOL operations.
             if (
+                transaction_type == "TRANSFER"
+                and
                 recipient == wallet
                 and is_valid_solana_address(sender)
                 and isinstance(amount, (int, float))
@@ -600,6 +605,14 @@ def persist_screening(wallet, screening, status="screened"):
                 WHERE wallet = %s
             """, (status, screening["risk_score"], wallet))
         conn.commit()
+
+
+def compact_screening(screening):
+    """Keep raw address evidence in PostgreSQL, not in ordinary API responses."""
+    return {
+        key: value for key, value in screening.items()
+        if key not in {"sampled_counterparties", "sampled_funders"}
+    }
 
 
 # =========================================================
@@ -969,7 +982,7 @@ def screen_wallet(wallet):
     screening = analyse_wallet_history(wallet, transactions, candidate)
     persist_screening(wallet, screening)
     return jsonify({
-        "success": True, "wallet": wallet, "screening": screening,
+        "success": True, "wallet": wallet, "screening": compact_screening(screening),
         "disclaimer": "Heuristic risk signals only; they do not prove common ownership or insider activity.",
     })
 
@@ -1031,7 +1044,7 @@ def screen_batch():
             continue
         screening = analyse_wallet_history(wallet, transactions, candidate)
         persist_screening(wallet, screening)
-        results.append({"wallet": wallet, "status": 200, **screening})
+        results.append({"wallet": wallet, "status": 200, **compact_screening(screening)})
 
     return jsonify({
         "success": True, "requested": limit, "selected": len(rows),
@@ -1069,7 +1082,7 @@ def screenings():
 
 @app.get("/screening-relationships")
 def screening_relationships():
-    """Compare screened wallets using only counterparties present in bounded samples."""
+    """Compare bounded samples after removing ubiquitous infrastructure addresses."""
     initialise_database()
     with db() as conn:
         with conn.cursor() as cur:
@@ -1092,29 +1105,68 @@ def screening_relationships():
 
     relationships = []
     wallets = sorted(samples)
+    candidate_wallets = set(wallets)
+    address_frequency = {}
+    for sample in samples.values():
+        for address in sample["counterparties"]:
+            address_frequency[address] = address_frequency.get(address, 0) + 1
+
+    # In a five-wallet comparison, appearance in three or more samples is more
+    # consistent with a router, protocol, exchange, or other shared infrastructure.
+    infrastructure_addresses = {
+        address for address, count in address_frequency.items()
+        if count >= 3
+    }
+    for sample in samples.values():
+        sample["counterparties"] -= infrastructure_addresses
+        sample["counterparties"] -= candidate_wallets
+        sample["funders"] -= infrastructure_addresses
+        sample["funders"] -= candidate_wallets
+
     for left_index, left in enumerate(wallets):
         for right in wallets[left_index + 1:]:
             shared_funders = sorted(samples[left]["funders"] & samples[right]["funders"])
-            shared_counterparties = sorted(
-                samples[left]["counterparties"] & samples[right]["counterparties"]
-            )
+            left_counterparties = samples[left]["counterparties"]
+            right_counterparties = samples[right]["counterparties"]
+            shared_counterparties = sorted(left_counterparties & right_counterparties)
+            union = left_counterparties | right_counterparties
+            overlap_ratio = len(shared_counterparties) / len(union) if union else 0
+
+            if shared_funders:
+                strength = "high"
+            elif len(shared_counterparties) >= 3 and overlap_ratio >= 0.25:
+                strength = "high"
+            elif len(shared_counterparties) >= 2 and overlap_ratio >= 0.10:
+                strength = "moderate"
+            else:
+                strength = "low"
+
             if shared_funders or shared_counterparties:
                 relationships.append({
                     "wallet_a": left, "wallet_b": right,
-                    "shared_funders": shared_funders,
+                    "relationship_strength": strength,
+                    "counterparty_overlap_ratio": round(overlap_ratio, 4),
+                    "shared_funders": shared_funders[:10],
                     "shared_funder_count": len(shared_funders),
-                    "shared_counterparties": shared_counterparties[:25],
+                    "shared_counterparties": shared_counterparties[:10],
                     "shared_counterparty_count": len(shared_counterparties),
-                    "counterparties_truncated": len(shared_counterparties) > 25,
+                    "addresses_truncated": (
+                        len(shared_counterparties) > 10 or len(shared_funders) > 10
+                    ),
                 })
 
     relationships.sort(
-        key=lambda item: (item["shared_funder_count"], item["shared_counterparty_count"]),
+        key=lambda item: (
+            {"high": 3, "moderate": 2, "low": 1}[item["relationship_strength"]],
+            item["shared_funder_count"], item["counterparty_overlap_ratio"],
+        ),
         reverse=True,
     )
     return jsonify({
         "success": True, "screening_version": SCREENING_VERSION,
-        "wallets_compared": len(wallets), "relationships": relationships,
+        "wallets_compared": len(wallets),
+        "infrastructure_addresses_excluded": len(infrastructure_addresses),
+        "relationships": relationships,
         "disclaimer": "Shared sampled addresses are leads only and do not prove common ownership.",
     })
 
