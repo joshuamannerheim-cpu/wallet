@@ -10,7 +10,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.2.2"
+VERSION = "4.3"
 SCREENING_VERSION = "4.2.2"
 BIRDEYE_BASE = "https://public-api.birdeye.so"
 BIRDEYE_THROTTLE_SECONDS = 2
@@ -57,6 +57,16 @@ def birdeye_get(path, params=None, retry_429=True):
         )
 
     return response
+
+
+def birdeye_post(path, body=None):
+    """POST to Birdeye without automatic retry; callers stop on rate limits."""
+    return requests.post(
+        f"{BIRDEYE_BASE}{path}",
+        headers={**birdeye_headers(), "content-type": "application/json"},
+        json=body or {},
+        timeout=45,
+    )
 
 
 def helius_get_transactions(wallet):
@@ -136,6 +146,29 @@ def initialise_database():
                     details TEXT NOT NULL DEFAULT '{}'
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS discovery_observations (
+                    run_id BIGINT NOT NULL REFERENCES discovery_runs(id),
+                    wallet TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (run_id, wallet, token_address)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_token_validations (
+                    wallet TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT,
+                    realized_pnl DOUBLE PRECISION,
+                    total_pnl DOUBLE PRECISION,
+                    invested DOUBLE PRECISION,
+                    trades INTEGER,
+                    win_rate DOUBLE PRECISION,
+                    validated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (wallet, token_address)
+                )
+            """)
 
             # These are idempotent and preserve databases created by earlier V4 builds.
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS total_pnl_30d DOUBLE PRECISION")
@@ -150,6 +183,8 @@ def initialise_database():
             cur.execute("ALTER TABLE wallet_screenings ADD COLUMN IF NOT EXISTS total_native_funding_lamports DOUBLE PRECISION NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE wallet_screenings ADD COLUMN IF NOT EXISTS transaction_types TEXT NOT NULL DEFAULT '{}'")
             cur.execute("ALTER TABLE wallet_screenings ADD COLUMN IF NOT EXISTS screening_version TEXT NOT NULL DEFAULT '4.2'")
+            cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAULT 'unvalidated'")
+            cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ")
         conn.commit()
 
 
@@ -615,6 +650,128 @@ def compact_screening(screening):
     }
 
 
+def parse_token_pnl_details(payload):
+    """Normalize Birdeye PnL Details token rows across wrapper variations."""
+    root = payload.get("data", payload) if isinstance(payload, dict) else payload
+    entries = []
+
+    def collect(obj, inherited_address=None):
+        if isinstance(obj, list):
+            for item in obj:
+                collect(item)
+            return
+        if not isinstance(obj, dict):
+            return
+
+        address = (
+            obj.get("token_address") or obj.get("tokenAddress")
+            or obj.get("address") or inherited_address
+        )
+        looks_like_token = address and any(
+            key in obj for key in ("pnl", "counts", "cashflow_usd", "realized_pnl")
+        )
+        if looks_like_token and is_valid_solana_address(address):
+            entries.append((address, obj))
+            return
+
+        for key, value in obj.items():
+            child_address = key if is_valid_solana_address(key) else None
+            collect(value, child_address)
+
+    collect(root)
+    normalized = []
+    seen = set()
+    for token_address, item in entries:
+        if token_address in seen:
+            continue
+        seen.add(token_address)
+        trades = get_nested_number(item, [
+            ("counts", "total_trade"), ("counts", "total_trades"),
+            ("total_trade",), ("trades",),
+        ])
+        normalized.append({
+            "token_address": token_address,
+            "token_symbol": item.get("symbol") or item.get("token_symbol"),
+            "realized_pnl": get_nested_number(item, [
+                ("pnl", "realized_profit_usd"), ("pnl", "realized_profit"),
+                ("realized_pnl",),
+            ]),
+            "total_pnl": get_nested_number(item, [
+                ("pnl", "total_usd"), ("pnl", "total_pnl_usd"), ("total_pnl",),
+            ]),
+            "invested": get_nested_number(item, [
+                ("cashflow_usd", "total_invested"), ("total_invested",),
+            ]),
+            "trades": int(trades) if trades is not None else None,
+            "win_rate": get_nested_number(item, [
+                ("counts", "win_rate"), ("win_rate",),
+            ]),
+        })
+    return normalized
+
+
+def summarize_token_validation(rows):
+    realized = [row for row in rows if row["realized_pnl"] is not None]
+    profitable = [row for row in realized if row["realized_pnl"] > 0]
+    losing = [row for row in realized if row["realized_pnl"] < 0]
+    material = [
+        row for row in realized
+        if abs(row["realized_pnl"]) >= 100 or (row["invested"] or 0) >= 500
+    ]
+    material_profitable = [row for row in material if row["realized_pnl"] > 0]
+    profit_sum = sum(row["realized_pnl"] for row in profitable)
+    loss_sum = abs(sum(row["realized_pnl"] for row in losing))
+    profit_factor = profit_sum / loss_sum if loss_sum > 0 else None
+    return {
+        "tokens_returned": len(rows),
+        "tokens_with_realized_pnl": len(realized),
+        "profitable_tokens": len(profitable),
+        "losing_tokens": len(losing),
+        "material_tokens": len(material),
+        "material_profitable_tokens": len(material_profitable),
+        "token_profit_rate": len(profitable) / len(realized) if realized else None,
+        "material_token_profit_rate": (
+            len(material_profitable) / len(material) if material else None
+        ),
+        "profit_factor": profit_factor,
+        "perfect_win_rate_supported": bool(realized) and not losing,
+        "validation_strength": (
+            "strong" if len(material) >= 5
+            else "moderate" if len(material) >= 3
+            else "limited"
+        ),
+    }
+
+
+def persist_token_validation(wallet, rows):
+    with db() as conn:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute("""
+                    INSERT INTO wallet_token_validations (
+                        wallet, token_address, token_symbol, realized_pnl,
+                        total_pnl, invested, trades, win_rate, validated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (wallet, token_address) DO UPDATE SET
+                        token_symbol = EXCLUDED.token_symbol,
+                        realized_pnl = EXCLUDED.realized_pnl,
+                        total_pnl = EXCLUDED.total_pnl,
+                        invested = EXCLUDED.invested,
+                        trades = EXCLUDED.trades,
+                        win_rate = EXCLUDED.win_rate,
+                        validated_at = NOW()
+                """, (
+                    wallet, row["token_address"], row["token_symbol"],
+                    row["realized_pnl"], row["total_pnl"], row["invested"],
+                    row["trades"], row["win_rate"],
+                ))
+            cur.execute("""
+                UPDATE candidate_wallets SET validation_status = %s,
+                    last_validated = NOW(), updated_at = NOW() WHERE wallet = %s
+            """, ("validated" if rows else "parse_incomplete", wallet))
+        conn.commit()
+
+
 # =========================================================
 # HOME / HEALTH
 # =========================================================
@@ -759,6 +916,11 @@ def discover():
                             updated_at = NOW()
                         WHERE wallet = %s
                     """, (wallet, wallet))
+                    cur.execute("""
+                        INSERT INTO discovery_observations (run_id, wallet, token_address)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (run_id, wallet, token_address) DO NOTHING
+                    """, (run_id, wallet, token_address))
             conn.commit()
         results.append({"token": token_symbol, "status": 200, "wallets": valid_wallets})
 
@@ -1172,6 +1334,155 @@ def screening_relationships():
 
 
 # =========================================================
+# V4.3 REPEAT EVIDENCE / TOKEN VALIDATION
+# =========================================================
+
+@app.get("/discovery-evidence")
+def discovery_evidence():
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.wallet, c.tokens_found,
+                    COUNT(DISTINCT o.run_id) AS discovery_runs,
+                    COUNT(DISTINCT o.token_address) AS observed_tokens,
+                    MIN(o.observed_at), MAX(o.observed_at)
+                FROM candidate_wallets c
+                LEFT JOIN discovery_observations o ON o.wallet = c.wallet
+                GROUP BY c.wallet, c.tokens_found
+                ORDER BY discovery_runs DESC, observed_tokens DESC, c.score DESC
+            """)
+            rows = cur.fetchall()
+    return jsonify({"success": True, "wallets": [{
+        "wallet": row[0], "tokens_found": row[1],
+        "discovery_runs_observed": row[2], "distinct_tokens_observed": row[3],
+        "first_observed": row[4], "last_observed": row[5],
+        "repeat_evidence": row[2] >= 2,
+        "cross_token_evidence": row[3] >= 2,
+    } for row in rows]})
+
+
+def validate_wallet_tokens(wallet, token_addresses=None):
+    body = {
+        "wallet": wallet, "duration": "30d", "position_scope": "duration_only",
+        "sort_type": "desc", "sort_by": "last_trade", "limit": 20, "offset": 0,
+    }
+    if token_addresses:
+        body["token_addresses"] = token_addresses[:20]
+    return birdeye_post("/wallet/v2/pnl/details", body)
+
+
+@app.get("/validate-wallet/<wallet>")
+def validate_wallet(wallet):
+    initialise_database()
+    if not is_valid_solana_address(wallet):
+        return jsonify({"success": False, "error": "Invalid Solana wallet address"}), 400
+    candidate = candidate_for_screening(wallet)
+    if not candidate:
+        return jsonify({"success": False, "error": "Wallet is not a candidate"}), 404
+
+    response = validate_wallet_tokens(wallet)
+    if response.status_code != 200:
+        return jsonify({
+            "success": False, "status_code": response.status_code,
+            "birdeye_error": response.text[:1000],
+        }), response.status_code
+    try:
+        rows = parse_token_pnl_details(response.json())
+    except Exception:
+        return jsonify({"success": False, "error": "Birdeye returned invalid JSON"}), 502
+    persist_token_validation(wallet, rows)
+    return jsonify({
+        "success": True, "wallet": wallet,
+        "summary": summarize_token_validation(rows), "tokens": rows,
+        "note": "Per-token results are a bounded 30-day sample and may omit unsupported protocol history.",
+    })
+
+
+@app.get("/validate-batch")
+def validate_batch():
+    """Validate at most two leading wallets per invocation."""
+    initialise_database()
+    try:
+        limit = int(request.args.get("limit", 2))
+    except ValueError:
+        limit = 2
+    limit = min(max(limit, 1), 2)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.wallet FROM candidate_wallets c
+                LEFT JOIN wallet_screenings ws ON ws.wallet = c.wallet
+                    AND ws.screening_version = %s
+                WHERE c.score_status = 'scored' AND c.score >= 30
+                    AND c.validation_status IN ('unvalidated', 'parse_incomplete')
+                    AND COALESCE(ws.risk_score, 100) <= 45
+                    AND COALESCE(ws.risk_flags, '[]') NOT LIKE '%%service_like_activity%%'
+                ORDER BY COALESCE(ws.risk_score, 100) ASC,
+                    c.score DESC, c.realized_pnl_30d DESC NULLS LAST
+                LIMIT %s
+            """, (SCREENING_VERSION, limit))
+            wallets = [row[0] for row in cur.fetchall()]
+
+    results = []
+    stopped_on_429 = False
+    for wallet in wallets:
+        time.sleep(BIRDEYE_THROTTLE_SECONDS)
+        response = validate_wallet_tokens(wallet)
+        if response.status_code == 429:
+            results.append({"wallet": wallet, "status": 429, "message": "Birdeye rate limit reached; batch stopped"})
+            stopped_on_429 = True
+            break
+        if response.status_code != 200:
+            results.append({"wallet": wallet, "status": response.status_code})
+            continue
+        try:
+            rows = parse_token_pnl_details(response.json())
+        except Exception:
+            results.append({"wallet": wallet, "status": "parse_error"})
+            continue
+        persist_token_validation(wallet, rows)
+        results.append({
+            "wallet": wallet, "status": 200,
+            "summary": summarize_token_validation(rows),
+            "tokens_preview": rows[:5],
+            "tokens_preview_truncated": len(rows) > 5,
+        })
+
+    return jsonify({
+        "success": True, "requested": limit, "selected": len(wallets),
+        "processed": len(results), "stopped_on_429": stopped_on_429,
+        "results": results,
+    })
+
+
+@app.get("/validations")
+def validations():
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet, token_address, token_symbol, realized_pnl,
+                    total_pnl, invested, trades, win_rate, validated_at
+                FROM wallet_token_validations
+                ORDER BY wallet, realized_pnl DESC NULLS LAST
+            """)
+            rows = cur.fetchall()
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row[0], []).append({
+            "token_address": row[1], "token_symbol": row[2],
+            "realized_pnl": row[3], "total_pnl": row[4], "invested": row[5],
+            "trades": row[6], "win_rate": row[7], "validated_at": row[8],
+        })
+    return jsonify({"success": True, "wallets": [{
+        "wallet": wallet, "summary": summarize_token_validation(token_rows),
+        "tokens": token_rows,
+    } for wallet, token_rows in grouped.items()]})
+
+
+# =========================================================
 # CANDIDATES / DISCOVERY HISTORY
 # =========================================================
 
@@ -1190,7 +1501,8 @@ def candidates():
                 SELECT wallet, tokens_found, realized_pnl_30d, total_pnl_30d,
                     win_rate_30d, trades_30d, total_invested_30d, score,
                     score_status, created_at, last_scored, screening_status,
-                    screening_risk_score, last_screened
+                    screening_risk_score, last_screened, validation_status,
+                    last_validated
                 FROM candidate_wallets
                 ORDER BY score DESC, tokens_found DESC, realized_pnl_30d DESC NULLS LAST
                 LIMIT %s
@@ -1208,6 +1520,7 @@ def candidates():
             "score_status": row[8], "created_at": row[9], "last_scored": row[10],
             "screening_status": row[11], "screening_risk_score": row[12],
             "last_screened": row[13],
+            "validation_status": row[14], "last_validated": row[15],
             "capital_efficiency": scoring["capital_efficiency"],
             "risk_flags": scoring["flags"] if row[8] == "scored" else [],
         })
