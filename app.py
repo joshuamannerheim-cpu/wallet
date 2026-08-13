@@ -10,8 +10,18 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.3"
+VERSION = "4.3.1"
 SCREENING_VERSION = "4.2.2"
+INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
+SOL_MINT = "So11111111111111111111111111111111111111112"
+STABLE_SYMBOLS = {
+    "USDC", "USDT", "USD1", "PYUSD", "USDS", "USDE", "DAI", "FDUSD",
+}
+STABLE_MINTS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",  # USD1
+}
 BIRDEYE_BASE = "https://public-api.birdeye.so"
 BIRDEYE_THROTTLE_SECONDS = 2
 HELIUS_THROTTLE_SECONDS = 2
@@ -151,6 +161,7 @@ def initialise_database():
                     run_id BIGINT NOT NULL REFERENCES discovery_runs(id),
                     wallet TEXT NOT NULL,
                     token_address TEXT NOT NULL,
+                    token_symbol TEXT,
                     observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (run_id, wallet, token_address)
                 )
@@ -185,6 +196,7 @@ def initialise_database():
             cur.execute("ALTER TABLE wallet_screenings ADD COLUMN IF NOT EXISTS screening_version TEXT NOT NULL DEFAULT '4.2'")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAULT 'unvalidated'")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ")
+            cur.execute("ALTER TABLE discovery_observations ADD COLUMN IF NOT EXISTS token_symbol TEXT")
         conn.commit()
 
 
@@ -711,7 +723,13 @@ def parse_token_pnl_details(payload):
 
 
 def summarize_token_validation(rows):
-    realized = [row for row in rows if row["realized_pnl"] is not None]
+    strategy_rows = [
+        row for row in rows
+        if row["token_address"] != SOL_MINT
+        and row["token_address"] not in STABLE_MINTS
+        and (row.get("token_symbol") or "").upper() not in STABLE_SYMBOLS
+    ]
+    realized = [row for row in strategy_rows if row["realized_pnl"] is not None]
     profitable = [row for row in realized if row["realized_pnl"] > 0]
     losing = [row for row in realized if row["realized_pnl"] < 0]
     material = [
@@ -719,11 +737,15 @@ def summarize_token_validation(rows):
         if abs(row["realized_pnl"]) >= 100 or (row["invested"] or 0) >= 500
     ]
     material_profitable = [row for row in material if row["realized_pnl"] > 0]
-    profit_sum = sum(row["realized_pnl"] for row in profitable)
-    loss_sum = abs(sum(row["realized_pnl"] for row in losing))
+    material_gains = [row for row in material if row["realized_pnl"] >= 100]
+    material_losses = [row for row in material if row["realized_pnl"] <= -100]
+    profit_sum = sum(row["realized_pnl"] for row in material_gains)
+    loss_sum = abs(sum(row["realized_pnl"] for row in material_losses))
     profit_factor = profit_sum / loss_sum if loss_sum > 0 else None
     return {
         "tokens_returned": len(rows),
+        "strategy_tokens": len(strategy_rows),
+        "excluded_base_or_stable_tokens": len(rows) - len(strategy_rows),
         "tokens_with_realized_pnl": len(realized),
         "profitable_tokens": len(profitable),
         "losing_tokens": len(losing),
@@ -733,7 +755,12 @@ def summarize_token_validation(rows):
         "material_token_profit_rate": (
             len(material_profitable) / len(material) if material else None
         ),
-        "profit_factor": profit_factor,
+        "material_profit_factor": profit_factor,
+        "material_profit_factor_status": (
+            "calculated" if loss_sum > 0
+            else "no_material_losses" if profit_sum > 0
+            else "insufficient_material_outcomes"
+        ),
         "perfect_win_rate_supported": bool(realized) and not losing,
         "validation_strength": (
             "strong" if len(material) >= 5
@@ -917,10 +944,11 @@ def discover():
                         WHERE wallet = %s
                     """, (wallet, wallet))
                     cur.execute("""
-                        INSERT INTO discovery_observations (run_id, wallet, token_address)
-                        VALUES (%s, %s, %s)
+                        INSERT INTO discovery_observations (
+                            run_id, wallet, token_address, token_symbol
+                        ) VALUES (%s, %s, %s, %s)
                         ON CONFLICT (run_id, wallet, token_address) DO NOTHING
-                    """, (run_id, wallet, token_address))
+                    """, (run_id, wallet, token_address, token_symbol))
             conn.commit()
         results.append({"token": token_symbol, "status": 200, "wallets": valid_wallets})
 
@@ -1343,23 +1371,61 @@ def discovery_evidence():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT c.wallet, c.tokens_found,
-                    COUNT(DISTINCT o.run_id) AS discovery_runs,
-                    COUNT(DISTINCT o.token_address) AS observed_tokens,
-                    MIN(o.observed_at), MAX(o.observed_at)
+                SELECT c.wallet, c.tokens_found, o.run_id, o.token_address,
+                    COALESCE(o.token_symbol, h.token_symbol), o.observed_at, c.score
                 FROM candidate_wallets c
                 LEFT JOIN discovery_observations o ON o.wallet = c.wallet
-                GROUP BY c.wallet, c.tokens_found
-                ORDER BY discovery_runs DESC, observed_tokens DESC, c.score DESC
+                LEFT JOIN wallet_token_hits h ON h.wallet = o.wallet
+                    AND h.token_address = o.token_address
+                ORDER BY c.score DESC, o.observed_at ASC
             """)
             rows = cur.fetchall()
-    return jsonify({"success": True, "wallets": [{
-        "wallet": row[0], "tokens_found": row[1],
-        "discovery_runs_observed": row[2], "distinct_tokens_observed": row[3],
-        "first_observed": row[4], "last_observed": row[5],
-        "repeat_evidence": row[2] >= 2,
-        "cross_token_evidence": row[3] >= 2,
-    } for row in rows]})
+
+    grouped = {}
+    for wallet, tokens_found, run_id, token_address, token_symbol, observed_at, score in rows:
+        record = grouped.setdefault(wallet, {
+            "wallet": wallet, "tokens_found": tokens_found, "score": score,
+            "observations": [],
+        })
+        if run_id is not None:
+            record["observations"].append({
+                "run_id": run_id, "token_address": token_address,
+                "token_symbol": token_symbol, "observed_at": observed_at,
+            })
+
+    results = []
+    for record in grouped.values():
+        observations = record.pop("observations")
+        runs = {item["run_id"] for item in observations}
+        tokens = {item["token_address"] for item in observations}
+        times = sorted(item["observed_at"] for item in observations if item["observed_at"])
+        span_seconds = (times[-1] - times[0]).total_seconds() if len(times) >= 2 else 0
+        token_labels = sorted({
+            item["token_symbol"] or item["token_address"] for item in observations
+        })
+        record.update({
+            "discovery_runs_observed": len(runs),
+            "distinct_tokens_observed": len(tokens),
+            "observed_tokens": token_labels,
+            "first_observed": times[0] if times else None,
+            "last_observed": times[-1] if times else None,
+            "observation_span_seconds": span_seconds,
+            "same_token_repeat": len(runs) >= 2 and len(tokens) == 1,
+            "independent_repeat_evidence": (
+                len(runs) >= 2 and span_seconds >= INDEPENDENT_REPEAT_SECONDS
+            ),
+            "cross_token_evidence": len(tokens) >= 2,
+        })
+        results.append(record)
+    results.sort(key=lambda item: (
+        item["cross_token_evidence"], item["independent_repeat_evidence"],
+        item["distinct_tokens_observed"], item["discovery_runs_observed"], item["score"],
+    ), reverse=True)
+    return jsonify({
+        "success": True,
+        "independent_repeat_minimum_hours": INDEPENDENT_REPEAT_SECONDS / 3600,
+        "wallets": results,
+    })
 
 
 def validate_wallet_tokens(wallet, token_addresses=None):
