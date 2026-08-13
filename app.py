@@ -10,7 +10,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.3.1"
+VERSION = "4.4.0"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -1547,6 +1547,385 @@ def validations():
         "tokens": token_rows,
     } for wallet, token_rows in grouped.items()]})
 
+
+# =========================================================
+# V4.4 AUTOMATIC CLASSIFICATION / SHORTLIST
+# =========================================================
+
+def load_validation_summaries():
+    """Build current per-wallet validation summaries from persisted token rows."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet, token_address, token_symbol, realized_pnl,
+                    total_pnl, invested, trades, win_rate, validated_at
+                FROM wallet_token_validations
+                ORDER BY wallet, realized_pnl DESC NULLS LAST
+            """)
+            rows = cur.fetchall()
+
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row[0], []).append({
+            "token_address": row[1],
+            "token_symbol": row[2],
+            "realized_pnl": row[3],
+            "total_pnl": row[4],
+            "invested": row[5],
+            "trades": row[6],
+            "win_rate": row[7],
+            "validated_at": row[8],
+        })
+    return {
+        wallet: summarize_token_validation(token_rows)
+        for wallet, token_rows in grouped.items()
+    }
+
+
+def load_repeat_evidence():
+    """Summarize independent and cross-token discovery evidence per wallet."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet, run_id, token_address, observed_at
+                FROM discovery_observations
+                ORDER BY wallet, observed_at ASC
+            """)
+            rows = cur.fetchall()
+
+    grouped = {}
+    for wallet, run_id, token_address, observed_at in rows:
+        grouped.setdefault(wallet, []).append({
+            "run_id": run_id,
+            "token_address": token_address,
+            "observed_at": observed_at,
+        })
+
+    evidence = {}
+    for wallet, observations in grouped.items():
+        runs = {item["run_id"] for item in observations}
+        tokens = {item["token_address"] for item in observations}
+        times = sorted(
+            item["observed_at"] for item in observations if item["observed_at"]
+        )
+        span_seconds = (
+            (times[-1] - times[0]).total_seconds() if len(times) >= 2 else 0
+        )
+        evidence[wallet] = {
+            "discovery_runs_observed": len(runs),
+            "distinct_tokens_observed": len(tokens),
+            "observation_span_seconds": span_seconds,
+            "independent_repeat_evidence": (
+                len(runs) >= 2 and span_seconds >= INDEPENDENT_REPEAT_SECONDS
+            ),
+            "cross_token_evidence": len(tokens) >= 2,
+        }
+    return evidence
+
+
+def classify_candidate(candidate, screening=None, validation=None, evidence=None):
+    """
+    Combine performance, Helius risk, token-level validation, and discovery
+    evidence into a conservative research classification.
+
+    WATCH means eligible to contribute to a future consensus signal.
+    It is not a recommendation to buy or copy the wallet.
+    """
+    screening = screening or {}
+    validation = validation or {}
+    evidence = evidence or {}
+
+    reasons = []
+    blockers = []
+    confidence_points = 0
+
+    score = candidate.get("score") or 0
+    realized = candidate.get("realized_pnl")
+    total_pnl = candidate.get("total_pnl")
+    trades = candidate.get("trades")
+    invested = candidate.get("invested")
+    score_status = candidate.get("score_status")
+    validation_status = candidate.get("validation_status")
+    risk_score = screening.get("risk_score")
+    risk_flags = set(screening.get("risk_flags") or [])
+
+    efficiency = None
+    if realized is not None and invested is not None and invested > 0:
+        efficiency = realized / invested
+
+    # Hard rejection signals.
+    if score_status != "scored":
+        blockers.append("wallet_not_scored")
+    if total_pnl is not None and total_pnl < 0:
+        blockers.append("negative_total_pnl")
+    if realized is not None and realized <= 0:
+        blockers.append("non_positive_realized_pnl")
+    if trades is not None and trades > 5000:
+        blockers.append("extreme_hft_activity")
+    if "service_like_activity" in risk_flags:
+        blockers.append("service_like_activity")
+    if "bursty_automated_activity" in risk_flags:
+        blockers.append("bursty_automated_activity")
+    if risk_score is not None and risk_score >= 60:
+        blockers.append("high_screening_risk")
+
+    if blockers:
+        return {
+            "classification": "REJECT",
+            "confidence": "HIGH",
+            "reasons": sorted(set(blockers)),
+            "watch_eligible": False,
+            "capital_efficiency": efficiency,
+        }
+
+    # Screening evidence.
+    if risk_score is None:
+        reasons.append("screening_required")
+    elif risk_score <= 25:
+        confidence_points += 2
+        reasons.append("low_screening_risk")
+    elif risk_score <= 45:
+        confidence_points += 1
+        reasons.append("moderate_screening_risk")
+    else:
+        reasons.append("elevated_screening_risk")
+
+    # Token-level validation evidence.
+    material_tokens = validation.get("material_tokens")
+    material_rate = validation.get("material_token_profit_rate")
+    profit_factor = validation.get("material_profit_factor")
+    validation_strength = validation.get("validation_strength")
+
+    if validation_status != "validated" or not validation:
+        reasons.append("token_validation_required")
+    else:
+        if validation_strength == "strong":
+            confidence_points += 2
+            reasons.append("strong_token_validation")
+        elif validation_strength == "moderate":
+            confidence_points += 1
+            reasons.append("moderate_token_validation")
+        else:
+            reasons.append("limited_token_validation")
+
+        if material_tokens is not None and material_tokens >= 5:
+            confidence_points += 1
+            reasons.append("adequate_material_sample")
+        else:
+            reasons.append("small_material_sample")
+
+        if material_rate is not None:
+            if material_rate >= 0.60:
+                confidence_points += 2
+                reasons.append("high_material_token_hit_rate")
+            elif material_rate >= 0.40:
+                confidence_points += 1
+                reasons.append("moderate_material_token_hit_rate")
+            else:
+                reasons.append("low_material_token_hit_rate")
+
+        if profit_factor is not None:
+            if profit_factor >= 2.0:
+                confidence_points += 1
+                reasons.append("healthy_material_profit_factor")
+            elif profit_factor < 1.0:
+                reasons.append("weak_material_profit_factor")
+        elif validation.get("material_profit_factor_status") == "no_material_losses":
+            # Positive, but do not over-reward a tiny sample with no observed losses.
+            reasons.append("no_material_losses_observed")
+
+    # Performance sanity checks.
+    if score >= 50:
+        confidence_points += 1
+        reasons.append("strong_performance_score")
+    elif score < 30:
+        reasons.append("weak_performance_score")
+
+    if efficiency is not None:
+        if efficiency >= 0.05:
+            confidence_points += 1
+            reasons.append("positive_capital_efficiency")
+        elif efficiency < 0.01:
+            reasons.append("low_capital_efficiency")
+
+    if trades is not None and 30 <= trades <= 1000:
+        confidence_points += 1
+        reasons.append("meaningful_trade_history")
+    elif trades is not None and trades < 10:
+        reasons.append("insufficient_trade_history")
+
+    # Discovery evidence is a confidence enhancer, not a hard prerequisite yet.
+    if evidence.get("cross_token_evidence"):
+        confidence_points += 2
+        reasons.append("cross_token_discovery_evidence")
+    elif evidence.get("independent_repeat_evidence"):
+        confidence_points += 1
+        reasons.append("independent_repeat_discovery_evidence")
+    else:
+        reasons.append("single_discovery_evidence")
+
+    # WATCH deliberately requires all core evidence, not just a high point total.
+    watch_core = (
+        risk_score is not None
+        and risk_score <= 25
+        and validation_status == "validated"
+        and validation_strength == "strong"
+        and material_tokens is not None
+        and material_tokens >= 5
+        and material_rate is not None
+        and material_rate >= 0.60
+        and (
+            profit_factor is None
+            or profit_factor >= 2.0
+        )
+        and trades is not None
+        and trades >= 30
+        and realized is not None
+        and realized > 0
+    )
+
+    if watch_core:
+        classification = "WATCH"
+        confidence = (
+            "HIGH"
+            if evidence.get("cross_token_evidence")
+            or evidence.get("independent_repeat_evidence")
+            else "MEDIUM"
+        )
+    else:
+        classification = "REVIEW"
+        confidence = (
+            "HIGH" if confidence_points >= 8
+            else "MEDIUM" if confidence_points >= 5
+            else "LOW"
+        )
+
+    return {
+        "classification": classification,
+        "confidence": confidence,
+        "reasons": reasons,
+        "watch_eligible": classification == "WATCH",
+        "capital_efficiency": efficiency,
+    }
+
+
+@app.get("/shortlist")
+def shortlist():
+    """
+    Return classified candidates using persisted score, screening,
+    validation, and discovery evidence.
+    """
+    initialise_database()
+    try:
+        limit = int(request.args.get("limit", 100))
+    except ValueError:
+        limit = 100
+    limit = min(max(limit, 1), 500)
+
+    validation_summaries = load_validation_summaries()
+    repeat_evidence = load_repeat_evidence()
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.wallet, c.tokens_found, c.realized_pnl_30d,
+                    c.total_pnl_30d, c.win_rate_30d, c.trades_30d,
+                    c.total_invested_30d, c.score, c.score_status,
+                    c.screening_status, c.screening_risk_score,
+                    c.validation_status, c.last_scored, c.last_screened,
+                    c.last_validated, ws.risk_flags
+                FROM candidate_wallets c
+                LEFT JOIN wallet_screenings ws ON ws.wallet = c.wallet
+                    AND ws.screening_version = %s
+                ORDER BY c.score DESC, c.realized_pnl_30d DESC NULLS LAST
+                LIMIT %s
+            """, (SCREENING_VERSION, limit))
+            rows = cur.fetchall()
+
+    items = []
+    counts = {"WATCH": 0, "REVIEW": 0, "REJECT": 0}
+
+    for row in rows:
+        wallet = row[0]
+        try:
+            screening_flags = json.loads(row[15]) if row[15] else []
+        except (TypeError, ValueError):
+            screening_flags = []
+
+        candidate = {
+            "wallet": wallet,
+            "tokens_found": row[1],
+            "realized_pnl": row[2],
+            "total_pnl": row[3],
+            "win_rate": row[4],
+            "trades": row[5],
+            "invested": row[6],
+            "score": row[7],
+            "score_status": row[8],
+            "screening_status": row[9],
+            "validation_status": row[11],
+        }
+        screening = {
+            "risk_score": row[10],
+            "risk_flags": screening_flags,
+        }
+        validation = validation_summaries.get(wallet)
+        evidence = repeat_evidence.get(wallet, {})
+        classification = classify_candidate(
+            candidate, screening, validation, evidence
+        )
+        counts[classification["classification"]] += 1
+
+        items.append({
+            "wallet": wallet,
+            "classification": classification["classification"],
+            "confidence": classification["confidence"],
+            "watch_eligible": classification["watch_eligible"],
+            "reasons": classification["reasons"],
+            "score": row[7],
+            "realized_pnl_30d": row[2],
+            "win_rate_30d": row[4],
+            "trades_30d": row[5],
+            "capital_efficiency": classification["capital_efficiency"],
+            "screening_risk_score": row[10],
+            "screening_risk_flags": screening_flags,
+            "validation_status": row[11],
+            "validation_summary": validation,
+            "discovery_evidence": evidence,
+            "last_scored": row[12],
+            "last_screened": row[13],
+            "last_validated": row[14],
+        })
+
+    class_order = {"WATCH": 0, "REVIEW": 1, "REJECT": 2}
+    confidence_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    items.sort(key=lambda item: (
+        class_order[item["classification"]],
+        confidence_order[item["confidence"]],
+        item["screening_risk_score"] if item["screening_risk_score"] is not None else 999,
+        -(item["score"] or 0),
+        -(item["realized_pnl_30d"] or 0),
+    ))
+
+    return jsonify({
+        "success": True,
+        "version": VERSION,
+        "classification_policy": {
+            "WATCH": (
+                "Low Helius risk plus strong token validation, at least five "
+                "material tokens, >=60% material-token profitability, healthy "
+                "profit factor, meaningful trade history, and positive realized PnL."
+            ),
+            "REVIEW": "No hard reject signal, but WATCH evidence is incomplete or mixed.",
+            "REJECT": "Hard risk or performance exclusion triggered.",
+            "note": (
+                "WATCH means eligible to contribute to a future consensus signal; "
+                "it is not a recommendation to buy or copy a wallet."
+            ),
+        },
+        "counts": counts,
+        "candidates": items,
+    })
 
 # =========================================================
 # CANDIDATES / DISCOVERY HISTORY
