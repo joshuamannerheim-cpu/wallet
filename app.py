@@ -1,5 +1,7 @@
 import json
 import os
+import random
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -10,7 +12,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.5.0"
+VERSION = "4.6.0-premium"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -23,16 +25,39 @@ STABLE_MINTS = {
     "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",  # USD1
 }
 BIRDEYE_BASE = "https://public-api.birdeye.so"
-BIRDEYE_THROTTLE_SECONDS = 2
-DISCOVERY_MAX_TOKENS = 20
-DISCOVERY_PAGE_SIZE = 5
+BIRDEYE_RPS = min(max(float(os.getenv("BIRDEYE_RPS", "7")), 1.0), 10.0)
+DISCOVERY_MAX_TOKENS = 50
+DISCOVERY_PAGE_SIZE = 10
 DISCOVERY_WALLETS_PER_TOKEN = 5
-HELIUS_THROTTLE_SECONDS = 2
+PIPELINE_MAX_SECONDS = min(max(int(os.getenv("PIPELINE_MAX_SECONDS", "75")), 15), 90)
 HELIUS_HISTORY_LIMIT = 100
 BASE58_ALPHABET = (
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
     "abcdefghijkmnopqrstuvwxyz"
 )
+
+_rate_lock = threading.Lock()
+_next_birdeye_request = 0.0
+_diagnostic_lock = threading.Lock()
+_diagnostics = {"birdeye_requests": 0, "helius_requests": 0, "retries": 0,
+                "rate_limits": 0, "timeouts": 0, "upstream_errors": 0}
+
+
+def diagnostic_increment(name):
+    with _diagnostic_lock:
+        _diagnostics[name] = _diagnostics.get(name, 0) + 1
+
+
+def throttle_birdeye():
+    """Process-wide Premium limiter; defaults to 7 RPS and never exceeds 10 RPS."""
+    global _next_birdeye_request
+    interval = 1.0 / BIRDEYE_RPS
+    with _rate_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_birdeye_request - now)
+        _next_birdeye_request = max(now, _next_birdeye_request) + interval
+    if wait:
+        time.sleep(wait)
 
 
 # =========================================================
@@ -51,48 +76,58 @@ def db():
     return psycopg.connect(os.environ["DATABASE_URL"])
 
 
+def upstream_request(method, url, *, headers=None, params=None, json_body=None,
+                     timeout=30, retries=2, provider="birdeye"):
+    """Bounded retry/backoff for 429s, 5xx responses and network timeouts."""
+    last_error = None
+    for attempt in range(retries + 1):
+        if provider == "birdeye":
+            throttle_birdeye()
+        diagnostic_increment(f"{provider}_requests")
+        try:
+            response = requests.request(method, url, headers=headers, params=params,
+                                        json=json_body, timeout=timeout)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = exc
+            diagnostic_increment("timeouts")
+            if attempt >= retries:
+                raise
+        else:
+            if response.status_code == 429:
+                diagnostic_increment("rate_limits")
+            if response.status_code not in {429, 500, 502, 503, 504} or attempt >= retries:
+                if response.status_code >= 500:
+                    diagnostic_increment("upstream_errors")
+                return response
+        diagnostic_increment("retries")
+        time.sleep(min(0.75 * (2 ** attempt) + random.uniform(0.05, 0.25), 5.0))
+    raise last_error
+
+
 def birdeye_get(path, params=None, retry_429=True):
-    """Make a conservative Birdeye request with at most one 429 retry."""
-    response = requests.get(
-        f"{BIRDEYE_BASE}{path}",
-        headers=birdeye_headers(),
-        params=params,
-        timeout=30,
-    )
-
-    if response.status_code == 429 and retry_429:
-        time.sleep(5)
-        response = requests.get(
-            f"{BIRDEYE_BASE}{path}",
-            headers=birdeye_headers(),
-            params=params,
-            timeout=30,
-        )
-
-    return response
+    return upstream_request("GET", f"{BIRDEYE_BASE}{path}",
+                            headers=birdeye_headers(), params=params, timeout=20,
+                            retries=2 if retry_429 else 0)
 
 
-def birdeye_post(path, body=None):
-    """POST to Birdeye without automatic retry; callers stop on rate limits."""
-    return requests.post(
-        f"{BIRDEYE_BASE}{path}",
-        headers={**birdeye_headers(), "content-type": "application/json"},
-        json=body or {},
-        timeout=45,
-    )
+def birdeye_post(path, body=None, retry_429=True):
+    return upstream_request("POST", f"{BIRDEYE_BASE}{path}",
+                            headers={**birdeye_headers(), "content-type": "application/json"},
+                            json_body=body or {}, timeout=25,
+                            retries=2 if retry_429 else 0)
 
 
 def helius_get_transactions(wallet):
     """Fetch a bounded, parsed history sample for heuristic screening."""
-    return requests.get(
-        f"https://api-mainnet.helius-rpc.com/v0/addresses/{wallet}/transactions",
+    return upstream_request(
+        "GET", f"https://api-mainnet.helius-rpc.com/v0/addresses/{wallet}/transactions",
         params={
             "api-key": os.getenv("HELIUS_API_KEY", ""),
             "token-accounts": "balanceChanged",
             "sort-order": "desc",
             "limit": HELIUS_HISTORY_LIMIT,
         },
-        timeout=45,
+        timeout=25, retries=1, provider="helius",
     )
 
 
@@ -835,8 +870,20 @@ def health():
     healthy = all(checks.values())
     return jsonify({
         "status": "healthy" if healthy else "configuration_required",
-        "checks": checks,
+        "checks": checks, "version": VERSION, "birdeye_rps": BIRDEYE_RPS,
     }), 200 if healthy else 503
+
+
+@app.get("/diagnostics")
+def diagnostics():
+    """Secret-free operational counters for this application process."""
+    with _diagnostic_lock:
+        counters = dict(_diagnostics)
+    return jsonify({"success": True, "version": VERSION, "premium_mode": True,
+                    "birdeye_rps": BIRDEYE_RPS,
+                    "discovery_max_tokens": DISCOVERY_MAX_TOKENS,
+                    "pipeline_max_seconds": PIPELINE_MAX_SECONDS,
+                    "counters": counters})
 
 
 # =========================================================
@@ -854,9 +901,9 @@ def discover():
     """
     initialise_database()
     try:
-        token_limit = int(request.args.get("tokens", 10))
+        token_limit = int(request.args.get("tokens", 25))
     except ValueError:
-        token_limit = 10
+        token_limit = 25
     token_limit = min(max(token_limit, 1), DISCOVERY_MAX_TOKENS)
 
     try:
@@ -871,8 +918,7 @@ def discover():
             run_id = cur.fetchone()[0]
         conn.commit()
 
-    # Birdeye's regular/standard access has behaved reliably in small pages.
-    # Fetch multiple pages instead of silently capping the entire run at five.
+    # Premium access supports a broader run, while paging keeps responses bounded.
     tokens = []
     seen_token_addresses = set()
     trending_statuses = []
@@ -920,7 +966,6 @@ def discover():
             break
 
         page_offset += page_limit
-        time.sleep(BIRDEYE_THROTTLE_SECONDS)
 
     if not tokens:
         with db() as conn:
@@ -950,7 +995,6 @@ def discover():
         token_symbol = token.get("symbol")
         token_name = token.get("name")
 
-        time.sleep(BIRDEYE_THROTTLE_SECONDS)
         trader_response = birdeye_get("/defi/v2/tokens/top_traders", {
             "address": token_address,
             "time_frame": "30d",
@@ -1053,7 +1097,7 @@ def discover():
         "trending_pages": trending_statuses,
         "results": results,
         "note": (
-            "V4.5 discovery only. Rotate offset between runs to broaden token "
+            "V4.6 Premium discovery. Rotate offset between runs to broaden token "
             "coverage. Candidates still require scoring, Helius screening and "
             "token-level validation."
         ),
@@ -1148,7 +1192,6 @@ def score_batch():
     results = []
     stopped_on_429 = False
     for wallet, tokens_found in wallets:
-        time.sleep(BIRDEYE_THROTTLE_SECONDS)
         # Batch mode must stop immediately on a 429, so it deliberately disables retry.
         response = birdeye_get(
             "/wallet/v2/pnl/summary",
@@ -1303,7 +1346,6 @@ def screen_batch():
             "tokens_found": row[1], "realized_pnl": row[2], "win_rate": row[3],
             "trades": row[4], "score": row[5], "score_status": row[6],
         }
-        time.sleep(HELIUS_THROTTLE_SECONDS)
         response = helius_get_transactions(wallet)
         if response.status_code == 429:
             results.append({"wallet": wallet, "status": 429, "message": "Helius rate limit reached; batch stopped"})
@@ -1585,7 +1627,6 @@ def validate_batch():
     results = []
     stopped_on_429 = False
     for wallet in wallets:
-        time.sleep(BIRDEYE_THROTTLE_SECONDS)
         response = validate_wallet_tokens(wallet)
         if response.status_code == 429:
             results.append({"wallet": wallet, "status": 429, "message": "Birdeye rate limit reached; batch stopped"})
@@ -2127,6 +2168,100 @@ def discovery_history():
             "api_429s": row[5], "status": row[6],
         } for row in rows],
     })
+
+
+@app.get("/premium-funnel")
+def premium_funnel():
+    """Bounded score -> prefilter -> Helius -> validation pipeline."""
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 5)), 1), 10)
+    except ValueError:
+        limit = 5
+    deadline = time.monotonic() + PIPELINE_MAX_SECONDS
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet FROM candidate_wallets
+                WHERE score_status <> 'parse_incomplete'
+                    AND (last_scored IS NULL OR last_screened IS NULL
+                         OR validation_status <> 'validated')
+                ORDER BY CASE WHEN last_scored IS NULL THEN 0 ELSE 1 END,
+                    tokens_found DESC, score DESC,
+                    realized_pnl_30d DESC NULLS LAST, created_at ASC
+                LIMIT %s
+            """, (limit,))
+            wallets = [row[0] for row in cur.fetchall()]
+
+    results, stopped_reason = [], None
+    for wallet in wallets:
+        if time.monotonic() >= deadline:
+            stopped_reason = "deadline_guard"
+            break
+        item = {"wallet": wallet, "stages": {}}
+        candidate = candidate_for_screening(wallet)
+        if not candidate or candidate["score_status"] != "scored":
+            result = score_wallet(wallet)
+            response, status = result if isinstance(result, tuple) else (result, result.status_code)
+            item["stages"]["score"] = status
+            if status != 200:
+                results.append(item)
+                if status == 429:
+                    stopped_reason = "birdeye_429"
+                    break
+                continue
+            candidate = candidate_for_screening(wallet)
+        else:
+            item["stages"]["score"] = "already_complete"
+
+        # This protects Helius CUs without weakening WATCH or ASYMMETRIC rules.
+        if not candidate or candidate["score"] < 30:
+            item["stages"]["prefilter"] = "rejected_score_below_30"
+            results.append(item)
+            continue
+        item["stages"]["prefilter"] = "passed"
+
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM wallet_screenings WHERE wallet = %s AND screening_version = %s",
+                            (wallet, SCREENING_VERSION))
+                screened = cur.fetchone() is not None
+        if not screened:
+            result = screen_wallet(wallet)
+            response, status = result if isinstance(result, tuple) else (result, result.status_code)
+            item["stages"]["screen"] = status
+            if status != 200:
+                results.append(item)
+                if status == 429:
+                    stopped_reason = "helius_429"
+                    break
+                continue
+        else:
+            item["stages"]["screen"] = "already_complete"
+
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT screening_risk_score, validation_status FROM candidate_wallets WHERE wallet = %s",
+                            (wallet,))
+                risk_score, validation_status = cur.fetchone()
+        if risk_score is None or risk_score > 45:
+            item["stages"]["validation"] = "skipped_risk_prefilter"
+        elif validation_status != "validated" and time.monotonic() < deadline:
+            result = validate_wallet(wallet)
+            response, status = result if isinstance(result, tuple) else (result, result.status_code)
+            item["stages"]["validation"] = status
+            if status == 429:
+                stopped_reason = "birdeye_429"
+        else:
+            item["stages"]["validation"] = "already_complete"
+        results.append(item)
+        if stopped_reason:
+            break
+
+    return jsonify({"success": True, "version": VERSION, "selected": len(wallets),
+                    "processed": len(results), "stopped_reason": stopped_reason,
+                    "deadline_seconds": PIPELINE_MAX_SECONDS, "results": results,
+                    "note": "Repeat this idempotent endpoint to continue incomplete work."})
 
 
 if __name__ == "__main__":
