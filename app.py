@@ -13,7 +13,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.7.0-paper"
+VERSION = "4.7.1-paper-notifications"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -36,6 +36,16 @@ DISCOVERY_WALLETS_PER_TOKEN = 5
 PIPELINE_MAX_SECONDS = min(max(int(os.getenv("PIPELINE_MAX_SECONDS", "75")), 15), 90)
 HELIUS_HISTORY_LIMIT = 100
 SIGNAL_WINDOW_MINUTES = min(max(int(os.getenv("SIGNAL_WINDOW_MINUTES", "60")), 15), 360)
+TELEGRAM_ALERT_STATUSES = {
+    value.strip().upper()
+    for value in os.getenv(
+        "TELEGRAM_ALERT_STATUSES", "BUILDING,PAPER_CONFIRMED,INVALIDATED"
+    ).split(",")
+    if value.strip()
+}
+TELEGRAM_TIMEOUT_SECONDS = min(
+    max(int(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "10")), 3), 30
+)
 WATCH_WEIGHT = 1.0
 ASYMMETRIC_WEIGHT = 0.35
 CONFIDENCE_MULTIPLIERS = {"HIGH": 1.0, "MEDIUM": 0.75, "LOW": 0.5}
@@ -48,8 +58,10 @@ BASE58_ALPHABET = (
 _rate_lock = threading.Lock()
 _next_birdeye_request = 0.0
 _diagnostic_lock = threading.Lock()
-_diagnostics = {"birdeye_requests": 0, "helius_requests": 0, "retries": 0,
-                "rate_limits": 0, "timeouts": 0, "upstream_errors": 0}
+_diagnostics = {"birdeye_requests": 0, "helius_requests": 0,
+                "telegram_requests": 0, "telegram_deliveries": 0,
+                "telegram_failures": 0, "retries": 0, "rate_limits": 0,
+                "timeouts": 0, "upstream_errors": 0}
 
 
 def diagnostic_increment(name):
@@ -286,8 +298,29 @@ def initialise_database():
                     recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS notification_deliveries (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_key TEXT NOT NULL UNIQUE,
+                    notification_type TEXT NOT NULL,
+                    channel TEXT NOT NULL DEFAULT 'telegram',
+                    token_address TEXT,
+                    token_symbol TEXT,
+                    signal_status TEXT,
+                    message TEXT NOT NULL,
+                    delivery_status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    response_code INTEGER,
+                    response_summary TEXT NOT NULL DEFAULT '{}',
+                    error_message TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    delivered_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_token_time_idx ON wallet_activity (token_address, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_wallet_time_idx ON wallet_activity (wallet, occurred_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS notification_delivery_status_idx ON notification_deliveries (delivery_status, created_at)")
 
             # These are idempotent and preserve databases created by earlier V4 builds.
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS total_pnl_30d DOUBLE PRECISION")
@@ -958,6 +991,8 @@ def diagnostics():
                     "signal_window_minutes": SIGNAL_WINDOW_MINUTES,
                     "helius_webhook_configured": bool(os.getenv("HELIUS_WEBHOOK_SECRET")),
                     "admin_key_configured": bool(os.getenv("ADMIN_API_KEY")),
+                    "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
+                    "telegram_alert_statuses": sorted(TELEGRAM_ALERT_STATUSES),
                     "counters": counters})
 
 
@@ -2240,6 +2275,147 @@ def admin_authorized():
     return bool(configured) and bool(supplied) and hmac.compare_digest(configured, supplied)
 
 
+def telegram_configured():
+    return bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+
+
+def format_signal_notification(signal, *, test=False):
+    symbol = signal.get("token_symbol") or "Unknown token"
+    status = signal.get("status") or "UNKNOWN"
+    heading = "TEST — Wallet Monitor notification pipeline" if test else f"Paper signal: {status}"
+    return "\n".join([
+        heading,
+        f"Token: {symbol}",
+        f"Address: {signal.get('token_address') or 'test-only'}",
+        f"Buy score: {signal.get('buy_score', 0)}",
+        f"Sell score: {signal.get('sell_score', 0)}",
+        f"Independent buy clusters: {signal.get('independent_buy_clusters', 0)}",
+        f"Independent sell clusters: {signal.get('independent_sell_clusters', 0)}",
+        "Safety: unverified",
+        "PAPER RESEARCH ONLY — not a trade instruction.",
+    ])
+
+
+def telegram_send(message):
+    """Deliver one Telegram message without exposing credentials in logs."""
+    if not telegram_configured():
+        return {
+            "success": False, "status": "configuration_required",
+            "response_code": None, "summary": {},
+            "error": "Telegram environment variables are not configured",
+        }
+
+    diagnostic_increment("telegram_requests")
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=TELEGRAM_TIMEOUT_SECONDS,
+        )
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        diagnostic_increment("telegram_failures")
+        return {
+            "success": False, "status": "failed", "response_code": None,
+            "summary": {}, "error": type(exc).__name__,
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    summary = {
+        "ok": bool(payload.get("ok")),
+        "error_code": payload.get("error_code"),
+        "description": payload.get("description"),
+        "message_id": (payload.get("result") or {}).get("message_id"),
+    }
+    success = response.status_code == 200 and summary["ok"]
+    diagnostic_increment("telegram_deliveries" if success else "telegram_failures")
+    return {
+        "success": success, "status": "delivered" if success else "failed",
+        "response_code": response.status_code, "summary": summary,
+        "error": None if success else (summary.get("description") or "Telegram rejected delivery"),
+    }
+
+
+def queue_notification(event_key, notification_type, signal, message):
+    """Create one idempotent delivery record and return its stable identifier."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO notification_deliveries (
+                    event_key, notification_type, token_address, token_symbol,
+                    signal_status, message
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (event_key) DO NOTHING
+                RETURNING id
+            """, (
+                event_key, notification_type, signal.get("token_address"),
+                signal.get("token_symbol"), signal.get("status"), message,
+            ))
+            row = cur.fetchone()
+            if row:
+                notification_id, created = row[0], True
+            else:
+                cur.execute(
+                    "SELECT id FROM notification_deliveries WHERE event_key = %s",
+                    (event_key,),
+                )
+                notification_id, created = cur.fetchone()[0], False
+        conn.commit()
+    return notification_id, created
+
+
+def deliver_notification(notification_id):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT message, delivery_status, attempts
+                FROM notification_deliveries WHERE id = %s
+            """, (notification_id,))
+            row = cur.fetchone()
+    if not row:
+        return {"success": False, "status": "not_found", "notification_id": notification_id}
+    message, delivery_status, attempts = row
+    if delivery_status == "delivered":
+        return {"success": True, "status": "duplicate_suppressed",
+                "notification_id": notification_id, "attempts": attempts}
+
+    result = telegram_send(message)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE notification_deliveries
+                SET delivery_status = %s, attempts = attempts + 1,
+                    response_code = %s, response_summary = %s,
+                    error_message = %s,
+                    delivered_at = CASE WHEN %s = 'delivered' THEN NOW() ELSE delivered_at END,
+                    updated_at = NOW()
+                WHERE id = %s
+            """, (
+                result["status"], result.get("response_code"),
+                json.dumps(result.get("summary") or {}), result.get("error"),
+                result["status"], notification_id,
+            ))
+        conn.commit()
+    return {**result, "notification_id": notification_id, "attempts": attempts + 1}
+
+
+def queue_and_deliver_signal_notification(signal, event_key, *, test=False):
+    message = format_signal_notification(signal, test=test)
+    notification_id, created = queue_notification(
+        event_key, "test" if test else "signal_transition", signal, message
+    )
+    result = deliver_notification(notification_id)
+    result["created"] = created
+    return result
+
+
 def parse_helius_activity(payload, tracked_wallets):
     """Convert enhanced Helius SWAP transactions into bounded wallet-token deltas."""
     transactions = payload if isinstance(payload, list) else [payload]
@@ -2351,6 +2527,7 @@ def refresh_paper_signals():
         item[side][cluster_id] = max(prior, float(weight or 0))
 
     refreshed = []
+    notification_transitions = []
     with db() as conn:
         with conn.cursor() as cur:
             for token, item in grouped.items():
@@ -2401,11 +2578,24 @@ def refresh_paper_signals():
                             token_address, token_symbol, status, buy_score, sell_score,
                             independent_buy_clusters, independent_sell_clusters, details
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id
                     """, (
                         token, item.get("token_symbol"), status, buy_score, sell_score,
                         buy_clusters, sell_clusters,
                         json.dumps({"wallets": wallets, "clusters": clusters}),
                     ))
+                    history_id = cur.fetchone()[0]
+                    if status in TELEGRAM_ALERT_STATUSES:
+                        notification_transitions.append({
+                            "history_id": history_id,
+                            "token_address": token,
+                            "token_symbol": item.get("token_symbol"),
+                            "status": status,
+                            "buy_score": buy_score,
+                            "sell_score": sell_score,
+                            "independent_buy_clusters": buy_clusters,
+                            "independent_sell_clusters": sell_clusters,
+                        })
                 refreshed.append({
                     "token_address": token, "token_symbol": item.get("token_symbol"),
                     "status": status, "buy_score": buy_score, "sell_score": sell_score,
@@ -2437,6 +2627,17 @@ def refresh_paper_signals():
                 WHERE last_activity_at < %s AND status <> 'EXPIRED'
             """, (cutoff,))
         conn.commit()
+
+    for transition in notification_transitions:
+        try:
+            queue_and_deliver_signal_notification(
+                transition,
+                f"signal-history:{transition['history_id']}",
+            )
+        except Exception:
+            # Signal persistence and Helius acknowledgement must not fail because
+            # a downstream notification provider or audit write is unavailable.
+            diagnostic_increment("telegram_failures")
     return refreshed
 
 
@@ -2859,6 +3060,102 @@ def signal_history_endpoint():
         "details": json.loads(row[8] or "{}"), "recorded_at": row[9],
         "actionable": False,
     } for row in rows]})
+
+
+@app.post("/test-notification")
+def test_notification_endpoint():
+    """Admin-only, non-trading end-to-end Telegram delivery test."""
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    test_signal = {
+        "token_address": None,
+        "token_symbol": "TEST",
+        "status": "PAPER_CONFIRMED",
+        "buy_score": 2.5,
+        "sell_score": 0,
+        "independent_buy_clusters": 3,
+        "independent_sell_clusters": 0,
+    }
+    result = queue_and_deliver_signal_notification(
+        test_signal,
+        f"test:{time.time_ns()}:{random.randint(1000, 9999)}",
+        test=True,
+    )
+    status_code = 200 if result.get("success") else 503
+    return jsonify({
+        "success": bool(result.get("success")),
+        "delivery_status": result.get("status"),
+        "notification_id": result.get("notification_id"),
+        "attempts": result.get("attempts"),
+        "telegram_configured": telegram_configured(),
+        "paper_mode": True,
+        "actionable": False,
+    }), status_code
+
+
+@app.post("/retry-notifications")
+def retry_notifications_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 20)), 1), 50)
+    except ValueError:
+        limit = 20
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id FROM notification_deliveries
+                WHERE delivery_status <> 'delivered' AND attempts < 5
+                ORDER BY created_at ASC LIMIT %s
+            """, (limit,))
+            notification_ids = [row[0] for row in cur.fetchall()]
+    results = [deliver_notification(notification_id) for notification_id in notification_ids]
+    delivered = sum(1 for result in results if result.get("success"))
+    return jsonify({
+        "success": True, "selected": len(notification_ids),
+        "delivered_or_already_delivered": delivered,
+        "results": results, "paper_mode": True, "actionable": False,
+    })
+
+
+@app.get("/notification-deliveries")
+def notification_deliveries_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+    except ValueError:
+        limit = 50
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, event_key, notification_type, channel, token_address,
+                    token_symbol, signal_status, delivery_status, attempts,
+                    response_code, error_message, created_at, delivered_at, updated_at
+                FROM notification_deliveries ORDER BY id DESC LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    return jsonify({
+        "success": True, "count": len(rows),
+        "deliveries": [{
+            "id": row[0], "event_key": row[1], "notification_type": row[2],
+            "channel": row[3], "token_address": row[4], "token_symbol": row[5],
+            "signal_status": row[6], "delivery_status": row[7],
+            "attempts": row[8], "response_code": row[9],
+            "error_message": row[10], "created_at": row[11],
+            "delivered_at": row[12], "updated_at": row[13],
+        } for row in rows],
+        "paper_mode": True, "actionable": False,
+    })
 
 
 @app.get("/premium-funnel")
