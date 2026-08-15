@@ -1,9 +1,10 @@
 import json
+import hmac
 import os
 import random
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 import requests
@@ -12,12 +13,15 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.6.1-premium"
+VERSION = "4.7.0-paper"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
 STABLE_SYMBOLS = {
     "USDC", "USDT", "USD1", "PYUSD", "USDS", "USDE", "DAI", "FDUSD",
+}
+EXCLUDED_SIGNAL_SYMBOLS = STABLE_SYMBOLS | {
+    "SOL", "WSOL", "JITOSOL", "MSOL", "BSOL", "BNSOL", "JUPSOL", "INF",
 }
 STABLE_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
@@ -31,6 +35,11 @@ DISCOVERY_PAGE_SIZE = 10
 DISCOVERY_WALLETS_PER_TOKEN = 5
 PIPELINE_MAX_SECONDS = min(max(int(os.getenv("PIPELINE_MAX_SECONDS", "75")), 15), 90)
 HELIUS_HISTORY_LIMIT = 100
+SIGNAL_WINDOW_MINUTES = min(max(int(os.getenv("SIGNAL_WINDOW_MINUTES", "60")), 15), 360)
+WATCH_WEIGHT = 1.0
+ASYMMETRIC_WEIGHT = 0.35
+CONFIDENCE_MULTIPLIERS = {"HIGH": 1.0, "MEDIUM": 0.75, "LOW": 0.5}
+HARD_RELATIONSHIP_STRENGTHS = {"high", "moderate"}
 BASE58_ALPHABET = (
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
     "abcdefghijkmnopqrstuvwxyz"
@@ -218,6 +227,67 @@ def initialise_database():
                     PRIMARY KEY (wallet, token_address)
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_clusters (
+                    wallet TEXT PRIMARY KEY,
+                    cluster_id TEXT NOT NULL,
+                    classification TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    signal_weight DOUBLE PRECISION NOT NULL,
+                    relationship_basis TEXT NOT NULL DEFAULT 'independent',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_activity (
+                    signature TEXT NOT NULL,
+                    wallet TEXT NOT NULL,
+                    cluster_id TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT,
+                    side TEXT NOT NULL,
+                    token_amount DOUBLE PRECISION,
+                    estimated_usd_value DOUBLE PRECISION,
+                    occurred_at TIMESTAMPTZ NOT NULL,
+                    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    raw_summary TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (signature, wallet, token_address, side)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS paper_signals (
+                    token_address TEXT PRIMARY KEY,
+                    token_symbol TEXT,
+                    status TEXT NOT NULL,
+                    buy_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    sell_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    independent_buy_clusters INTEGER NOT NULL DEFAULT 0,
+                    independent_sell_clusters INTEGER NOT NULL DEFAULT 0,
+                    contributing_wallets TEXT NOT NULL DEFAULT '[]',
+                    contributing_clusters TEXT NOT NULL DEFAULT '[]',
+                    first_activity_at TIMESTAMPTZ,
+                    last_activity_at TIMESTAMPTZ,
+                    safety_status TEXT NOT NULL DEFAULT 'unverified',
+                    actionable BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS paper_signal_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT,
+                    status TEXT NOT NULL,
+                    buy_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    sell_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    independent_buy_clusters INTEGER NOT NULL DEFAULT 0,
+                    independent_sell_clusters INTEGER NOT NULL DEFAULT 0,
+                    details TEXT NOT NULL DEFAULT '{}',
+                    recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_token_time_idx ON wallet_activity (token_address, occurred_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_wallet_time_idx ON wallet_activity (wallet, occurred_at DESC)")
 
             # These are idempotent and preserve databases created by earlier V4 builds.
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS total_pnl_30d DOUBLE PRECISION")
@@ -847,7 +917,8 @@ def home():
         "service": "Solana Smart Wallet Monitor",
         "status": "online",
         "version": VERSION,
-        "mode": "candidate discovery and scoring",
+        "mode": "relationship-aware consensus paper tracking",
+        "actionable": False,
     })
 
 
@@ -880,9 +951,13 @@ def diagnostics():
     with _diagnostic_lock:
         counters = dict(_diagnostics)
     return jsonify({"success": True, "version": VERSION, "premium_mode": True,
+                    "paper_mode": True, "signals_actionable": False,
                     "birdeye_rps": BIRDEYE_RPS,
                     "discovery_max_tokens": DISCOVERY_MAX_TOKENS,
                     "pipeline_max_seconds": PIPELINE_MAX_SECONDS,
+                    "signal_window_minutes": SIGNAL_WINDOW_MINUTES,
+                    "helius_webhook_configured": bool(os.getenv("HELIUS_WEBHOOK_SECRET")),
+                    "admin_key_configured": bool(os.getenv("ADMIN_API_KEY")),
                     "counters": counters})
 
 
@@ -893,9 +968,9 @@ def diagnostics():
 @app.get("/discover")
 def discover():
     """
-    V4.5 discovery:
-    - supports up to 20 trending tokens per run;
-    - pages Birdeye trending results in conservative groups of five;
+    V4.7 discovery inherited from the validated Premium funnel:
+    - supports up to 50 trending tokens per run;
+    - pages Birdeye trending results in bounded groups;
     - accepts ?offset=N so successive runs can rotate through the universe;
     - preserves cross-token observations in the existing evidence tables.
     """
@@ -1972,6 +2047,399 @@ def classify_candidate(candidate, screening=None, validation=None, evidence=None
     }
 
 
+def load_signal_eligible_wallets():
+    """Return current WATCH/ASYMMETRIC wallets with conservative signal weights."""
+    validation_summaries = load_validation_summaries()
+    repeat_evidence = load_repeat_evidence()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.wallet, c.tokens_found, c.realized_pnl_30d,
+                    c.total_pnl_30d, c.win_rate_30d, c.trades_30d,
+                    c.total_invested_30d, c.score, c.score_status,
+                    c.screening_status, c.screening_risk_score,
+                    c.validation_status, COALESCE(ws.risk_flags, '[]')
+                FROM candidate_wallets c
+                LEFT JOIN wallet_screenings ws ON ws.wallet = c.wallet
+                    AND ws.screening_version = %s
+                WHERE c.score_status = 'scored'
+            """, (SCREENING_VERSION,))
+            rows = cur.fetchall()
+
+    eligible = {}
+    for row in rows:
+        wallet = row[0]
+        try:
+            risk_flags = json.loads(row[12]) if row[12] else []
+        except (TypeError, ValueError):
+            risk_flags = []
+        candidate = {
+            "wallet": wallet, "tokens_found": row[1], "realized_pnl": row[2],
+            "total_pnl": row[3], "win_rate": row[4], "trades": row[5],
+            "invested": row[6], "score": row[7], "score_status": row[8],
+            "screening_status": row[9], "validation_status": row[11],
+        }
+        classification = classify_candidate(
+            candidate,
+            {"risk_score": row[10], "risk_flags": risk_flags},
+            validation_summaries.get(wallet), repeat_evidence.get(wallet, {}),
+        )
+        label = classification["classification"]
+        if label not in {"WATCH", "ASYMMETRIC"}:
+            continue
+        base_weight = WATCH_WEIGHT if label == "WATCH" else ASYMMETRIC_WEIGHT
+        confidence = classification["confidence"]
+        eligible[wallet] = {
+            "wallet": wallet, "classification": label, "confidence": confidence,
+            "signal_weight": round(
+                base_weight * CONFIDENCE_MULTIPLIERS.get(confidence, 0.5), 4
+            ),
+            "score": row[7], "screening_risk_score": row[10],
+            "discovery_evidence": repeat_evidence.get(wallet, {}),
+        }
+    return eligible
+
+
+def compute_and_persist_wallet_clusters():
+    """Cluster eligible wallets using material shared-funder/counterparty evidence."""
+    eligible = load_signal_eligible_wallets()
+    wallets = sorted(eligible)
+    parent = {wallet: wallet for wallet in wallets}
+
+    def find(wallet):
+        while parent[wallet] != wallet:
+            parent[wallet] = parent[parent[wallet]]
+            wallet = parent[wallet]
+        return wallet
+
+    def union(left, right):
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet, details FROM wallet_screenings
+                WHERE screening_version = %s
+            """, (SCREENING_VERSION,))
+            rows = cur.fetchall()
+
+    all_samples = {}
+    for wallet, details_text in rows:
+        try:
+            details = json.loads(details_text or "{}")
+        except (TypeError, ValueError):
+            details = {}
+        all_samples[wallet] = {
+            "counterparties": set(details.get("sampled_counterparties") or []),
+            "funders": set(details.get("sampled_funders") or []),
+        }
+
+    address_frequency = {}
+    for sample in all_samples.values():
+        for address in sample["counterparties"]:
+            address_frequency[address] = address_frequency.get(address, 0) + 1
+    infrastructure = {address for address, count in address_frequency.items() if count >= 3}
+    samples = {
+        wallet: all_samples.get(wallet, {"counterparties": set(), "funders": set()})
+        for wallet in wallets
+    }
+    for sample in samples.values():
+        sample["counterparties"] -= infrastructure
+        sample["counterparties"] -= set(wallets)
+        sample["funders"] -= infrastructure
+        sample["funders"] -= set(wallets)
+
+    material_edges = []
+    for index, left in enumerate(wallets):
+        left_sample = samples.get(left, {"counterparties": set(), "funders": set()})
+        for right in wallets[index + 1:]:
+            right_sample = samples.get(right, {"counterparties": set(), "funders": set()})
+            shared_funders = left_sample["funders"] & right_sample["funders"]
+            shared_counterparties = left_sample["counterparties"] & right_sample["counterparties"]
+            union_addresses = left_sample["counterparties"] | right_sample["counterparties"]
+            overlap = len(shared_counterparties) / len(union_addresses) if union_addresses else 0
+            strength = (
+                "high" if shared_funders
+                else "high" if len(shared_counterparties) >= 3 and overlap >= 0.25
+                else "moderate" if len(shared_counterparties) >= 2 and overlap >= 0.10
+                else "low"
+            )
+            if strength in HARD_RELATIONSHIP_STRENGTHS:
+                union(left, right)
+                material_edges.append({
+                    "wallet_a": left, "wallet_b": right, "strength": strength,
+                    "shared_funder_count": len(shared_funders),
+                    "shared_counterparty_count": len(shared_counterparties),
+                    "overlap_ratio": round(overlap, 4),
+                })
+
+    clusters = {}
+    for wallet in wallets:
+        clusters.setdefault(find(wallet), []).append(wallet)
+    edge_map = {wallet: [] for wallet in wallets}
+    for edge in material_edges:
+        edge_map[edge["wallet_a"]].append(edge)
+        edge_map[edge["wallet_b"]].append(edge)
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM wallet_clusters")
+            for wallet in wallets:
+                record = eligible[wallet]
+                cluster_id = find(wallet)
+                cur.execute("""
+                    INSERT INTO wallet_clusters (
+                        wallet, cluster_id, classification, confidence,
+                        signal_weight, relationship_basis, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """, (
+                    wallet, cluster_id, record["classification"],
+                    record["confidence"], record["signal_weight"],
+                    json.dumps(edge_map[wallet] or [{"strength": "independent"}]),
+                ))
+        conn.commit()
+    return eligible, clusters, material_edges, len(infrastructure)
+
+
+def load_tracked_wallet_map():
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet, cluster_id, classification, confidence, signal_weight
+                FROM wallet_clusters
+            """)
+            rows = cur.fetchall()
+    return {
+        row[0]: {
+            "cluster_id": row[1], "classification": row[2],
+            "confidence": row[3], "signal_weight": row[4],
+        }
+        for row in rows
+    }
+
+
+def webhook_authorized():
+    configured = os.getenv("HELIUS_WEBHOOK_SECRET", "")
+    supplied = (
+        request.headers.get("Authorization", "")
+        or request.headers.get("X-Webhook-Secret", "")
+    )
+    if not configured or not supplied:
+        return False
+    return (
+        hmac.compare_digest(configured, supplied)
+        or hmac.compare_digest(f"Bearer {configured}", supplied)
+    )
+
+
+def admin_authorized():
+    configured = os.getenv("ADMIN_API_KEY", "")
+    supplied = request.headers.get("X-Admin-Key", "")
+    return bool(configured) and bool(supplied) and hmac.compare_digest(configured, supplied)
+
+
+def parse_helius_activity(payload, tracked_wallets):
+    """Convert enhanced Helius SWAP transactions into bounded wallet-token deltas."""
+    transactions = payload if isinstance(payload, list) else [payload]
+    events = []
+    for transaction in transactions:
+        if not isinstance(transaction, dict):
+            continue
+        if str(transaction.get("type") or "").upper() != "SWAP":
+            continue
+        signature = transaction.get("signature")
+        if not isinstance(signature, str) or not signature:
+            continue
+        timestamp = transaction.get("timestamp")
+        if not isinstance(timestamp, (int, float)):
+            continue
+        occurred_at = datetime.fromtimestamp(timestamp, timezone.utc)
+        transfers = transaction.get("tokenTransfers") or []
+        for wallet, tracked in tracked_wallets.items():
+            deltas = {}
+            symbols = {}
+            for transfer in transfers:
+                if not isinstance(transfer, dict):
+                    continue
+                mint = transfer.get("mint")
+                if not is_valid_solana_address(mint) or mint in STABLE_MINTS or mint == SOL_MINT:
+                    continue
+                symbol = transfer.get("symbol") or transfer.get("tokenSymbol")
+                if isinstance(symbol, str) and symbol.upper() in EXCLUDED_SIGNAL_SYMBOLS:
+                    continue
+                amount = transfer.get("tokenAmount")
+                try:
+                    amount = float(amount)
+                except (TypeError, ValueError):
+                    continue
+                if transfer.get("toUserAccount") == wallet:
+                    deltas[mint] = deltas.get(mint, 0.0) + amount
+                if transfer.get("fromUserAccount") == wallet:
+                    deltas[mint] = deltas.get(mint, 0.0) - amount
+                if isinstance(symbol, str) and symbol:
+                    symbols[mint] = symbol
+            for mint, delta in deltas.items():
+                if abs(delta) <= 0:
+                    continue
+                events.append({
+                    "signature": signature, "wallet": wallet,
+                    "cluster_id": tracked["cluster_id"],
+                    "token_address": mint, "token_symbol": symbols.get(mint),
+                    "side": "BUY" if delta > 0 else "SELL",
+                    "token_amount": abs(delta), "occurred_at": occurred_at,
+                    "raw_summary": {
+                        "helius_type": transaction.get("type"),
+                        "source": transaction.get("source"),
+                        "fee_payer": transaction.get("feePayer"),
+                    },
+                })
+    return events
+
+
+def persist_wallet_activity(events):
+    inserted = 0
+    with db() as conn:
+        with conn.cursor() as cur:
+            for event in events:
+                cur.execute("""
+                    INSERT INTO wallet_activity (
+                        signature, wallet, cluster_id, token_address, token_symbol,
+                        side, token_amount, occurred_at, raw_summary
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (signature, wallet, token_address, side) DO NOTHING
+                """, (
+                    event["signature"], event["wallet"], event["cluster_id"],
+                    event["token_address"], event.get("token_symbol"), event["side"],
+                    event.get("token_amount"), event["occurred_at"],
+                    json.dumps(event.get("raw_summary") or {}),
+                ))
+                inserted += cur.rowcount
+        conn.commit()
+    return inserted
+
+
+def refresh_paper_signals():
+    """Aggregate recent events with one maximum-weight vote per wallet cluster."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=SIGNAL_WINDOW_MINUTES)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT a.token_address, a.token_symbol, a.wallet, c.cluster_id,
+                    a.side, a.occurred_at, c.signal_weight
+                FROM wallet_activity a
+                JOIN wallet_clusters c ON c.wallet = a.wallet
+                WHERE a.occurred_at >= %s
+                ORDER BY a.token_address, a.occurred_at ASC
+            """, (cutoff,))
+            rows = cur.fetchall()
+
+    grouped = {}
+    for token, symbol, wallet, cluster_id, side, occurred_at, weight in rows:
+        item = grouped.setdefault(token, {
+            "token_address": token, "token_symbol": symbol,
+            "first_activity_at": occurred_at, "last_activity_at": occurred_at,
+            "BUY": {}, "SELL": {}, "wallets": set(),
+        })
+        if symbol and not item.get("token_symbol"):
+            item["token_symbol"] = symbol
+        item["first_activity_at"] = min(item["first_activity_at"], occurred_at)
+        item["last_activity_at"] = max(item["last_activity_at"], occurred_at)
+        item["wallets"].add(wallet)
+        prior = item[side].get(cluster_id, 0)
+        item[side][cluster_id] = max(prior, float(weight or 0))
+
+    refreshed = []
+    with db() as conn:
+        with conn.cursor() as cur:
+            for token, item in grouped.items():
+                buy_score = round(sum(item["BUY"].values()), 4)
+                sell_score = round(sum(item["SELL"].values()), 4)
+                buy_clusters = len(item["BUY"])
+                sell_clusters = len(item["SELL"])
+                if sell_clusters >= 2 and sell_score >= max(1.5, buy_score * 0.75):
+                    status = "INVALIDATED"
+                elif buy_clusters >= 3 and buy_score >= 2.0:
+                    status = "PAPER_CONFIRMED"
+                elif buy_clusters >= 2:
+                    status = "BUILDING"
+                else:
+                    status = "OBSERVE"
+                wallets = sorted(item["wallets"])
+                clusters = sorted(set(item["BUY"]) | set(item["SELL"]))
+                cur.execute("SELECT status FROM paper_signals WHERE token_address = %s", (token,))
+                prior = cur.fetchone()
+                cur.execute("""
+                    INSERT INTO paper_signals (
+                        token_address, token_symbol, status, buy_score, sell_score,
+                        independent_buy_clusters, independent_sell_clusters,
+                        contributing_wallets, contributing_clusters,
+                        first_activity_at, last_activity_at, safety_status,
+                        actionable, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        'unverified', FALSE, NOW())
+                    ON CONFLICT (token_address) DO UPDATE SET
+                        token_symbol = COALESCE(EXCLUDED.token_symbol, paper_signals.token_symbol),
+                        status = EXCLUDED.status, buy_score = EXCLUDED.buy_score,
+                        sell_score = EXCLUDED.sell_score,
+                        independent_buy_clusters = EXCLUDED.independent_buy_clusters,
+                        independent_sell_clusters = EXCLUDED.independent_sell_clusters,
+                        contributing_wallets = EXCLUDED.contributing_wallets,
+                        contributing_clusters = EXCLUDED.contributing_clusters,
+                        first_activity_at = EXCLUDED.first_activity_at,
+                        last_activity_at = EXCLUDED.last_activity_at,
+                        safety_status = 'unverified', actionable = FALSE, updated_at = NOW()
+                """, (
+                    token, item.get("token_symbol"), status, buy_score, sell_score,
+                    buy_clusters, sell_clusters, json.dumps(wallets),
+                    json.dumps(clusters), item["first_activity_at"], item["last_activity_at"],
+                ))
+                if not prior or prior[0] != status:
+                    cur.execute("""
+                        INSERT INTO paper_signal_history (
+                            token_address, token_symbol, status, buy_score, sell_score,
+                            independent_buy_clusters, independent_sell_clusters, details
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        token, item.get("token_symbol"), status, buy_score, sell_score,
+                        buy_clusters, sell_clusters,
+                        json.dumps({"wallets": wallets, "clusters": clusters}),
+                    ))
+                refreshed.append({
+                    "token_address": token, "token_symbol": item.get("token_symbol"),
+                    "status": status, "buy_score": buy_score, "sell_score": sell_score,
+                    "independent_buy_clusters": buy_clusters,
+                    "independent_sell_clusters": sell_clusters,
+                    "actionable": False, "safety_status": "unverified",
+                })
+
+            cur.execute("""
+                SELECT token_address, token_symbol, buy_score, sell_score,
+                    independent_buy_clusters, independent_sell_clusters
+                FROM paper_signals
+                WHERE last_activity_at < %s AND status <> 'EXPIRED'
+            """, (cutoff,))
+            expiring = cur.fetchall()
+            for expired in expiring:
+                cur.execute("""
+                    INSERT INTO paper_signal_history (
+                        token_address, token_symbol, status, buy_score, sell_score,
+                        independent_buy_clusters, independent_sell_clusters, details
+                    ) VALUES (%s, %s, 'EXPIRED', %s, %s, %s, %s, %s)
+                """, (
+                    expired[0], expired[1], expired[2], expired[3],
+                    expired[4], expired[5], json.dumps({"reason": "signal_window_elapsed"}),
+                ))
+            cur.execute("""
+                UPDATE paper_signals SET status = 'EXPIRED', actionable = FALSE,
+                    updated_at = NOW()
+                WHERE last_activity_at < %s AND status <> 'EXPIRED'
+            """, (cutoff,))
+        conn.commit()
+    return refreshed
+
+
 @app.get("/shortlist")
 def shortlist():
     """
@@ -2168,6 +2636,229 @@ def discovery_history():
             "api_429s": row[5], "status": row[6],
         } for row in rows],
     })
+
+
+# =========================================================
+# V4.7 RELATIONSHIP-AWARE PAPER SIGNALS
+# =========================================================
+
+@app.post("/refresh-wallet-clusters")
+def refresh_wallet_clusters_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    eligible, clusters, edges, infrastructure_count = compute_and_persist_wallet_clusters()
+    return jsonify({
+        "success": True, "version": VERSION, "eligible_wallets": len(eligible),
+        "independent_clusters": len(clusters), "material_relationships": len(edges),
+        "infrastructure_addresses_excluded": infrastructure_count,
+        "paper_mode": True, "actionable": False,
+    })
+
+
+@app.get("/tracked-wallets")
+def tracked_wallets_endpoint():
+    initialise_database()
+    tracked = load_tracked_wallet_map()
+    items = [{"wallet": wallet, **details} for wallet, details in sorted(tracked.items())]
+    return jsonify({
+        "success": True, "count": len(items), "wallets": items,
+        "refresh_required": not bool(items), "paper_mode": True,
+    })
+
+
+@app.get("/wallet-clusters")
+def wallet_clusters_endpoint():
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT cluster_id, wallet, classification, confidence,
+                    signal_weight, relationship_basis, updated_at
+                FROM wallet_clusters ORDER BY cluster_id, signal_weight DESC
+            """)
+            rows = cur.fetchall()
+    grouped = {}
+    for cluster_id, wallet, classification, confidence, weight, basis, updated_at in rows:
+        cluster = grouped.setdefault(cluster_id, {
+            "cluster_id": cluster_id, "wallets": [], "maximum_vote_weight": 0,
+        })
+        try:
+            relationship_basis = json.loads(basis or "[]")
+        except (TypeError, ValueError):
+            relationship_basis = []
+        cluster["wallets"].append({
+            "wallet": wallet, "classification": classification,
+            "confidence": confidence, "individual_weight": weight,
+            "relationship_basis": relationship_basis, "updated_at": updated_at,
+        })
+        cluster["maximum_vote_weight"] = max(cluster["maximum_vote_weight"], weight)
+    return jsonify({
+        "success": True, "cluster_count": len(grouped),
+        "clusters": list(grouped.values()),
+        "policy": "Each cluster contributes only its highest eligible wallet weight.",
+    })
+
+
+@app.post("/helius-webhook")
+def helius_webhook_endpoint():
+    if not os.getenv("HELIUS_WEBHOOK_SECRET"):
+        return jsonify({"success": False, "error": "HELIUS_WEBHOOK_SECRET is not configured"}), 503
+    if not webhook_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"success": False, "error": "JSON body required"}), 400
+    tracked = load_tracked_wallet_map()
+    if not tracked:
+        compute_and_persist_wallet_clusters()
+        tracked = load_tracked_wallet_map()
+    events = parse_helius_activity(payload, tracked)
+    inserted = persist_wallet_activity(events)
+    signals = refresh_paper_signals() if inserted else []
+    return jsonify({
+        "success": True, "events_parsed": len(events), "events_inserted": inserted,
+        "signals_refreshed": len(signals), "paper_mode": True,
+        "actionable": False,
+    })
+
+
+@app.post("/refresh-paper-signals")
+def refresh_paper_signals_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    refreshed = refresh_paper_signals()
+    return jsonify({
+        "success": True, "count": len(refreshed), "signals": refreshed,
+        "paper_mode": True, "actionable": False,
+    })
+
+
+@app.get("/wallet-activity")
+def wallet_activity_endpoint():
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+    except ValueError:
+        limit = 100
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT signature, wallet, cluster_id, token_address, token_symbol,
+                    side, token_amount, estimated_usd_value, occurred_at, received_at
+                FROM wallet_activity ORDER BY occurred_at DESC LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    return jsonify({"success": True, "count": len(rows), "events": [{
+        "signature": row[0], "wallet": row[1], "cluster_id": row[2],
+        "token_address": row[3], "token_symbol": row[4], "side": row[5],
+        "token_amount": row[6], "estimated_usd_value": row[7],
+        "occurred_at": row[8], "received_at": row[9],
+    } for row in rows]})
+
+
+def serialize_signal_row(row):
+    try:
+        wallets = json.loads(row[8] or "[]")
+        clusters = json.loads(row[9] or "[]")
+    except (TypeError, ValueError):
+        wallets, clusters = [], []
+    return {
+        "token_address": row[0], "token_symbol": row[1], "status": row[2],
+        "buy_score": row[3], "sell_score": row[4],
+        "independent_buy_clusters": row[5],
+        "independent_sell_clusters": row[6],
+        "contributing_wallets": wallets, "contributing_clusters": clusters,
+        "first_activity_at": row[10], "last_activity_at": row[11],
+        "safety_status": row[12], "actionable": False, "updated_at": row[14],
+    }
+
+
+SIGNAL_SELECT = """
+    SELECT token_address, token_symbol, status, buy_score, sell_score,
+        independent_buy_clusters, independent_sell_clusters, actionable,
+        contributing_wallets, contributing_clusters, first_activity_at,
+        last_activity_at, safety_status, actionable, updated_at
+    FROM paper_signals
+"""
+
+
+@app.get("/signals")
+def signals_endpoint():
+    initialise_database()
+    status = request.args.get("status")
+    with db() as conn:
+        with conn.cursor() as cur:
+            if status:
+                cur.execute(SIGNAL_SELECT + " WHERE status = %s ORDER BY updated_at DESC", (status.upper(),))
+            else:
+                cur.execute(SIGNAL_SELECT + " ORDER BY updated_at DESC")
+            rows = cur.fetchall()
+    return jsonify({
+        "success": True, "count": len(rows),
+        "signals": [serialize_signal_row(row) for row in rows],
+        "paper_mode": True, "actionable": False,
+        "warning": "Paper research only; token safety is not yet verified.",
+    })
+
+
+@app.get("/signal/<token_address>")
+def signal_detail_endpoint(token_address):
+    initialise_database()
+    if not is_valid_solana_address(token_address):
+        return jsonify({"success": False, "error": "Invalid Solana token address"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(SIGNAL_SELECT + " WHERE token_address = %s", (token_address,))
+            row = cur.fetchone()
+            cur.execute("""
+                SELECT signature, wallet, cluster_id, side, token_amount, occurred_at
+                FROM wallet_activity WHERE token_address = %s
+                ORDER BY occurred_at DESC LIMIT 100
+            """, (token_address,))
+            events = cur.fetchall()
+    if not row:
+        return jsonify({"success": False, "error": "Signal not found"}), 404
+    return jsonify({
+        "success": True, "signal": serialize_signal_row(row),
+        "events": [{"signature": event[0], "wallet": event[1],
+                    "cluster_id": event[2], "side": event[3],
+                    "token_amount": event[4], "occurred_at": event[5]}
+                   for event in events],
+        "paper_mode": True, "actionable": False,
+    })
+
+
+@app.get("/signal-history")
+def signal_history_endpoint():
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+    except ValueError:
+        limit = 100
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, token_address, token_symbol, status, buy_score,
+                    sell_score, independent_buy_clusters,
+                    independent_sell_clusters, details, recorded_at
+                FROM paper_signal_history ORDER BY id DESC LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    return jsonify({"success": True, "count": len(rows), "history": [{
+        "id": row[0], "token_address": row[1], "token_symbol": row[2],
+        "status": row[3], "buy_score": row[4], "sell_score": row[5],
+        "independent_buy_clusters": row[6],
+        "independent_sell_clusters": row[7],
+        "details": json.loads(row[8] or "{}"), "recorded_at": row[9],
+        "actionable": False,
+    } for row in rows]})
 
 
 @app.get("/premium-funnel")
