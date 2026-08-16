@@ -13,7 +13,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.7.2-paper-sync-watchlist"
+VERSION = "4.8.0-paper-evm"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -36,6 +36,19 @@ DISCOVERY_WALLETS_PER_TOKEN = 5
 PIPELINE_MAX_SECONDS = min(max(int(os.getenv("PIPELINE_MAX_SECONDS", "75")), 15), 90)
 HELIUS_HISTORY_LIMIT = 100
 HELIUS_WEBHOOKS_URL = "https://mainnet.helius-rpc.com/v0/webhooks"
+ROBINHOOD_CHAIN_ID = 4663
+DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
+ROBINHOOD_BLOCKSCOUT_URL = "https://robinhoodchain.blockscout.com/api/v2"
+EVM_REFRESH_MAX_SECONDS = min(
+    max(int(os.getenv("EVM_REFRESH_MAX_SECONDS", "55")), 15), 75
+)
+EVM_ALERT_STATUSES = {
+    value.strip().upper()
+    for value in os.getenv(
+        "EVM_ALERT_STATUSES", "EVM_MOMENTUM,EVM_HIGH_MOMENTUM,EVM_RISK"
+    ).split(",")
+    if value.strip()
+}
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://wallet-production-3b7b.up.railway.app"
 ).rstrip("/")
@@ -68,11 +81,11 @@ CONFIDENCE_MULTIPLIERS = {"HIGH": 1.0, "MEDIUM": 0.75, "LOW": 0.5}
 HARD_RELATIONSHIP_STRENGTHS = {"high", "moderate"}
 DEFAULT_TOKEN_WATCHLIST = (
     ("robinhood", "native:ETH", "ETH", "Ether", "portfolio", "benchmark"),
-    ("robinhood", "0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1", "IF", "What IF", "portfolio", "pending_evm_module"),
-    ("robinhood", "0xe934e36A439C94017B64a3FecE66AF12099aBF50", "STONKBROKER", "StonkBroker", "portfolio", "pending_evm_module"),
-    ("robinhood", "0x020bfC650A365f8BB26819deAAbF3E21291018b4", "CASHCAT", "Cash Cat", "portfolio", "pending_evm_module"),
-    ("robinhood", "0xfd181632e1F2335DaB74535E6dD29082d3191bb2", "RFLX", "RFLIX", "portfolio", "pending_evm_module"),
-    ("robinhood", "0xeC45C6C413b498Cf5aCF5a1a889F1a95cA9b6bB3", "PORTLY", "PORTLY", "existing_test_case", "pending_evm_module"),
+    ("robinhood", "0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1", "IF", "What IF", "portfolio", "evm_monitoring_ready"),
+    ("robinhood", "0xe934e36A439C94017B64a3FecE66AF12099aBF50", "STONKBROKER", "StonkBroker", "portfolio", "evm_monitoring_ready"),
+    ("robinhood", "0x020bfC650A365f8BB26819deAAbF3E21291018b4", "CASHCAT", "Cash Cat", "portfolio", "evm_monitoring_ready"),
+    ("robinhood", "0xfd181632e1F2335DaB74535E6dD29082d3191bb2", "RFLX", "RFLIX", "portfolio", "evm_monitoring_ready"),
+    ("robinhood", "0xeC45C6C413b498Cf5aCF5a1a889F1a95cA9b6bB3", "PORTLY", "PORTLY", "existing_test_case", "evm_monitoring_ready"),
 )
 BASE58_ALPHABET = (
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -84,6 +97,8 @@ _next_birdeye_request = 0.0
 _diagnostic_lock = threading.Lock()
 _diagnostics = {"birdeye_requests": 0, "helius_requests": 0,
                 "helius_syncs": 0, "helius_sync_failures": 0,
+                "dexscreener_requests": 0, "blockscout_requests": 0,
+                "evm_refreshes": 0, "evm_refresh_failures": 0,
                 "telegram_requests": 0, "telegram_deliveries": 0,
                 "telegram_failures": 0, "retries": 0, "rate_limits": 0,
                 "timeouts": 0, "upstream_errors": 0}
@@ -372,10 +387,84 @@ def initialise_database():
                     PRIMARY KEY (chain, token_address)
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS evm_token_snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    chain TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT NOT NULL,
+                    price_usd DOUBLE PRECISION,
+                    liquidity_usd DOUBLE PRECISION,
+                    market_cap_usd DOUBLE PRECISION,
+                    fdv_usd DOUBLE PRECISION,
+                    volume_h1_usd DOUBLE PRECISION,
+                    volume_h24_usd DOUBLE PRECISION,
+                    buys_h1 INTEGER,
+                    sells_h1 INTEGER,
+                    buys_h24 INTEGER,
+                    sells_h24 INTEGER,
+                    price_change_h1_pct DOUBLE PRECISION,
+                    price_change_h24_pct DOUBLE PRECISION,
+                    holder_count BIGINT,
+                    pair_address TEXT,
+                    dex_id TEXT,
+                    data_quality TEXT NOT NULL DEFAULT 'partial',
+                    provider_errors TEXT NOT NULL DEFAULT '[]',
+                    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS evm_token_signals (
+                    chain TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'EVM_OBSERVE',
+                    momentum_score INTEGER NOT NULL DEFAULT 0,
+                    risk_score INTEGER NOT NULL DEFAULT 0,
+                    reasons TEXT NOT NULL DEFAULT '[]',
+                    holder_change_pct DOUBLE PRECISION,
+                    liquidity_change_pct DOUBLE PRECISION,
+                    volume_liquidity_ratio DOUBLE PRECISION,
+                    buy_sell_ratio DOUBLE PRECISION,
+                    latest_snapshot_id BIGINT REFERENCES evm_token_snapshots(id),
+                    data_quality TEXT NOT NULL DEFAULT 'partial',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (chain, token_address)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS evm_signal_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    chain TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT NOT NULL,
+                    previous_status TEXT,
+                    status TEXT NOT NULL,
+                    momentum_score INTEGER NOT NULL DEFAULT 0,
+                    risk_score INTEGER NOT NULL DEFAULT 0,
+                    details TEXT NOT NULL DEFAULT '{}',
+                    recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS evm_refresh_runs (
+                    id BIGSERIAL PRIMARY KEY,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ,
+                    tokens_selected INTEGER NOT NULL DEFAULT 0,
+                    snapshots_created INTEGER NOT NULL DEFAULT 0,
+                    transitions_created INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    details TEXT NOT NULL DEFAULT '{}'
+                )
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_token_time_idx ON wallet_activity (token_address, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_wallet_time_idx ON wallet_activity (wallet, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS notification_delivery_status_idx ON notification_deliveries (delivery_status, created_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS helius_sync_created_idx ON helius_sync_history (created_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS evm_snapshot_token_time_idx ON evm_token_snapshots (chain, token_address, captured_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS evm_signal_status_idx ON evm_token_signals (status, updated_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS evm_history_time_idx ON evm_signal_history (recorded_at DESC)")
 
             # These are idempotent and preserve databases created by earlier V4 builds.
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS total_pnl_30d DOUBLE PRECISION")
@@ -403,7 +492,12 @@ def initialise_database():
                         token_symbol = EXCLUDED.token_symbol,
                         token_name = EXCLUDED.token_name,
                         source = EXCLUDED.source,
-                        monitoring_status = EXCLUDED.monitoring_status,
+                        monitoring_status = CASE
+                            WHEN token_watchlist.monitoring_status IN (
+                                'live_evm_monitoring', 'partial_evm_monitoring'
+                            ) THEN token_watchlist.monitoring_status
+                            ELSE EXCLUDED.monitoring_status
+                        END,
                         updated_at = NOW()
                 """, (chain, address, symbol, name, source, monitoring_status))
         conn.commit()
@@ -1015,10 +1109,10 @@ def persist_token_validation(wallet, rows):
 @app.get("/")
 def home():
     return jsonify({
-        "service": "Solana Smart Wallet Monitor",
+        "service": "Solana Smart Wallet + Robinhood Chain Contract Monitor",
         "status": "online",
         "version": VERSION,
-        "mode": "relationship-aware consensus paper tracking",
+        "mode": "relationship-aware Solana consensus plus EVM contract paper tracking",
         "actionable": False,
     })
 
@@ -1064,6 +1158,9 @@ def diagnostics():
                     "admin_key_configured": bool(os.getenv("ADMIN_API_KEY")),
                     "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
                     "telegram_alert_statuses": sorted(TELEGRAM_ALERT_STATUSES),
+                    "evm_chain_id": ROBINHOOD_CHAIN_ID,
+                    "evm_refresh_max_seconds": EVM_REFRESH_MAX_SECONDS,
+                    "evm_alert_statuses": sorted(EVM_ALERT_STATUSES),
                     "counters": counters})
 
 
@@ -2656,6 +2753,392 @@ def queue_and_deliver_signal_notification(signal, event_key, *, test=False):
     return result
 
 
+# =========================================================
+# V4.8 ROBINHOOD CHAIN CONTRACT MONITORING
+# =========================================================
+
+def safe_float(value):
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def safe_int(value):
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def percentage_change(current, previous):
+    if current is None or previous in {None, 0}:
+        return None
+    return ((current - previous) / abs(previous)) * 100.0
+
+
+def fetch_robinhood_token_snapshot(token):
+    """Fetch one bounded market/holder snapshot without wallet custody access."""
+    address = token[1]
+    snapshot = {
+        "chain": token[0], "token_address": address,
+        "token_symbol": token[2], "provider_errors": [],
+    }
+    market_ok = False
+    holders_ok = False
+
+    try:
+        response = upstream_request(
+            "GET", DEXSCREENER_TOKEN_URL.format(address=address),
+            timeout=10, retries=1, provider="dexscreener",
+        )
+        if response.status_code == 200:
+            payload = response.json()
+            pairs = payload.get("pairs") if isinstance(payload, dict) else []
+            pairs = pairs if isinstance(pairs, list) else []
+            robinhood_pairs = [
+                pair for pair in pairs if isinstance(pair, dict) and (
+                    "robinhood" in str(pair.get("chainId") or "").lower()
+                    or str(pair.get("chainId") or "") == str(ROBINHOOD_CHAIN_ID)
+                )
+            ]
+            if robinhood_pairs:
+                pair = max(
+                    robinhood_pairs,
+                    key=lambda item: safe_float((item.get("liquidity") or {}).get("usd")) or 0,
+                )
+                transactions = pair.get("txns") or {}
+                snapshot.update({
+                    "price_usd": safe_float(pair.get("priceUsd")),
+                    "liquidity_usd": safe_float((pair.get("liquidity") or {}).get("usd")),
+                    "market_cap_usd": safe_float(pair.get("marketCap")),
+                    "fdv_usd": safe_float(pair.get("fdv")),
+                    "volume_h1_usd": safe_float((pair.get("volume") or {}).get("h1")),
+                    "volume_h24_usd": safe_float((pair.get("volume") or {}).get("h24")),
+                    "buys_h1": safe_int((transactions.get("h1") or {}).get("buys")),
+                    "sells_h1": safe_int((transactions.get("h1") or {}).get("sells")),
+                    "buys_h24": safe_int((transactions.get("h24") or {}).get("buys")),
+                    "sells_h24": safe_int((transactions.get("h24") or {}).get("sells")),
+                    "price_change_h1_pct": safe_float((pair.get("priceChange") or {}).get("h1")),
+                    "price_change_h24_pct": safe_float((pair.get("priceChange") or {}).get("h24")),
+                    "pair_address": pair.get("pairAddress"),
+                    "dex_id": pair.get("dexId"),
+                })
+                market_ok = True
+            else:
+                snapshot["provider_errors"].append("dexscreener_no_robinhood_pair")
+        else:
+            snapshot["provider_errors"].append(f"dexscreener_http_{response.status_code}")
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        snapshot["provider_errors"].append(f"dexscreener_{type(exc).__name__}")
+
+    try:
+        response = upstream_request(
+            "GET", f"{ROBINHOOD_BLOCKSCOUT_URL}/tokens/{address}",
+            timeout=10, retries=0, provider="blockscout",
+        )
+        if response.status_code == 200:
+            payload = response.json()
+            holder_count = safe_int(payload.get("holders_count")) if isinstance(payload, dict) else None
+            snapshot["holder_count"] = holder_count
+            holders_ok = holder_count is not None
+            if not holders_ok:
+                snapshot["provider_errors"].append("blockscout_holder_count_missing")
+        else:
+            snapshot["provider_errors"].append(f"blockscout_http_{response.status_code}")
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        snapshot["provider_errors"].append(f"blockscout_{type(exc).__name__}")
+
+    snapshot["data_quality"] = (
+        "complete" if market_ok and holders_ok
+        else "market_only" if market_ok
+        else "metadata_only" if holders_ok
+        else "unavailable"
+    )
+    return snapshot
+
+
+def classify_evm_snapshot(snapshot, previous):
+    """Conservative research state; never an execution recommendation."""
+    liquidity = snapshot.get("liquidity_usd")
+    volume_h1 = snapshot.get("volume_h1_usd")
+    buys = snapshot.get("buys_h1")
+    sells = snapshot.get("sells_h1")
+    price_change = snapshot.get("price_change_h1_pct")
+    holder_change = percentage_change(
+        snapshot.get("holder_count"), previous.get("holder_count") if previous else None
+    )
+    liquidity_change = percentage_change(
+        liquidity, previous.get("liquidity_usd") if previous else None
+    )
+    volume_liquidity = (
+        volume_h1 / liquidity if volume_h1 is not None and liquidity not in {None, 0} else None
+    )
+    buy_sell = (
+        buys / sells if buys is not None and sells not in {None, 0}
+        else 3.0 if buys and sells == 0 else None
+    )
+
+    momentum_score = 0
+    risk_score = 0
+    reasons = []
+    if liquidity is not None and liquidity < 10000:
+        risk_score += 50
+        reasons.append("very_low_liquidity")
+    elif liquidity is not None and liquidity >= 25000:
+        momentum_score += 10
+        reasons.append("minimum_liquidity_present")
+    if liquidity_change is not None and liquidity_change <= -20:
+        risk_score += 35
+        reasons.append("rapid_liquidity_decline")
+    if holder_change is not None and holder_change <= -5:
+        risk_score += 25
+        reasons.append("holder_count_decline")
+    elif holder_change is not None and holder_change >= 0.5:
+        momentum_score += 20
+        reasons.append("holder_growth")
+    if price_change is not None and price_change >= 5:
+        momentum_score += 20 if price_change < 20 else 15
+        reasons.append("positive_hourly_momentum")
+    if volume_liquidity is not None and volume_liquidity >= 0.25:
+        momentum_score += 20
+        reasons.append("material_volume_to_liquidity")
+        if volume_liquidity >= 0.75:
+            momentum_score += 10
+    if buy_sell is not None and buy_sell >= 1.25:
+        momentum_score += 20
+        reasons.append("buy_transaction_imbalance")
+        if buy_sell >= 2:
+            momentum_score += 10
+    if (
+        price_change is not None and abs(price_change) >= 30
+        and (volume_liquidity is None or volume_liquidity < 0.10)
+    ):
+        risk_score += 30
+        reasons.append("large_move_without_market_depth")
+    if snapshot.get("data_quality") == "unavailable":
+        risk_score += 20
+        reasons.append("providers_unavailable")
+
+    if risk_score >= 50:
+        status = "EVM_RISK"
+    elif previous and momentum_score >= 70 and holder_change is not None:
+        status = "EVM_HIGH_MOMENTUM"
+    elif momentum_score >= 45:
+        status = "EVM_MOMENTUM"
+    else:
+        status = "EVM_OBSERVE"
+    return {
+        "status": status, "momentum_score": min(momentum_score, 100),
+        "risk_score": min(risk_score, 100), "reasons": reasons,
+        "holder_change_pct": holder_change,
+        "liquidity_change_pct": liquidity_change,
+        "volume_liquidity_ratio": volume_liquidity,
+        "buy_sell_ratio": buy_sell,
+    }
+
+
+def format_evm_notification(signal, *, test=False):
+    heading = "TEST — V4.8 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
+    return "\n".join([
+        heading,
+        f"Token: {signal.get('token_symbol') or 'Unknown'}",
+        f"Address: {signal.get('token_address') or 'test-only'}",
+        f"Momentum score: {signal.get('momentum_score', 0)}/100",
+        f"Risk score: {signal.get('risk_score', 0)}/100",
+        f"Data quality: {signal.get('data_quality', 'partial')}",
+        f"Reasons: {', '.join(signal.get('reasons') or ['baseline observation'])}",
+        "ROBINHOOD CHAIN — PAPER RESEARCH ONLY; not a trade instruction.",
+    ])
+
+
+def queue_and_deliver_evm_notification(signal, event_key, *, test=False):
+    notification_id, created = queue_notification(
+        event_key, "evm_test" if test else "evm_state_transition",
+        signal, format_evm_notification(signal, test=test),
+    )
+    result = deliver_notification(notification_id)
+    result["created"] = created
+    return result
+
+
+def previous_evm_snapshot(chain, address):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT liquidity_usd, holder_count FROM evm_token_snapshots
+                WHERE chain = %s AND token_address = %s
+                ORDER BY captured_at DESC LIMIT 1
+            """, (chain, address))
+            row = cur.fetchone()
+    return None if not row else {"liquidity_usd": row[0], "holder_count": row[1]}
+
+
+def persist_evm_snapshot(snapshot):
+    previous = previous_evm_snapshot(snapshot["chain"], snapshot["token_address"])
+    classification = classify_evm_snapshot(snapshot, previous)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT status FROM evm_token_signals
+                WHERE chain = %s AND token_address = %s
+            """, (snapshot["chain"], snapshot["token_address"]))
+            old_row = cur.fetchone()
+            previous_status = old_row[0] if old_row else None
+            cur.execute("""
+                INSERT INTO evm_token_snapshots (
+                    chain, token_address, token_symbol, price_usd, liquidity_usd,
+                    market_cap_usd, fdv_usd, volume_h1_usd, volume_h24_usd,
+                    buys_h1, sells_h1, buys_h24, sells_h24,
+                    price_change_h1_pct, price_change_h24_pct, holder_count,
+                    pair_address, dex_id, data_quality, provider_errors
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                ) RETURNING id
+            """, (
+                snapshot["chain"], snapshot["token_address"], snapshot["token_symbol"],
+                snapshot.get("price_usd"), snapshot.get("liquidity_usd"),
+                snapshot.get("market_cap_usd"), snapshot.get("fdv_usd"),
+                snapshot.get("volume_h1_usd"), snapshot.get("volume_h24_usd"),
+                snapshot.get("buys_h1"), snapshot.get("sells_h1"),
+                snapshot.get("buys_h24"), snapshot.get("sells_h24"),
+                snapshot.get("price_change_h1_pct"), snapshot.get("price_change_h24_pct"),
+                snapshot.get("holder_count"), snapshot.get("pair_address"),
+                snapshot.get("dex_id"), snapshot["data_quality"],
+                json.dumps(snapshot.get("provider_errors") or []),
+            ))
+            snapshot_id = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO evm_token_signals (
+                    chain, token_address, token_symbol, status, momentum_score,
+                    risk_score, reasons, holder_change_pct, liquidity_change_pct,
+                    volume_liquidity_ratio, buy_sell_ratio, latest_snapshot_id,
+                    data_quality, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (chain, token_address) DO UPDATE SET
+                    token_symbol = EXCLUDED.token_symbol, status = EXCLUDED.status,
+                    momentum_score = EXCLUDED.momentum_score,
+                    risk_score = EXCLUDED.risk_score, reasons = EXCLUDED.reasons,
+                    holder_change_pct = EXCLUDED.holder_change_pct,
+                    liquidity_change_pct = EXCLUDED.liquidity_change_pct,
+                    volume_liquidity_ratio = EXCLUDED.volume_liquidity_ratio,
+                    buy_sell_ratio = EXCLUDED.buy_sell_ratio,
+                    latest_snapshot_id = EXCLUDED.latest_snapshot_id,
+                    data_quality = EXCLUDED.data_quality, updated_at = NOW()
+            """, (
+                snapshot["chain"], snapshot["token_address"], snapshot["token_symbol"],
+                classification["status"], classification["momentum_score"],
+                classification["risk_score"], json.dumps(classification["reasons"]),
+                classification["holder_change_pct"], classification["liquidity_change_pct"],
+                classification["volume_liquidity_ratio"], classification["buy_sell_ratio"],
+                snapshot_id, snapshot["data_quality"],
+            ))
+            history_id = None
+            if previous_status != classification["status"]:
+                cur.execute("""
+                    INSERT INTO evm_signal_history (
+                        chain, token_address, token_symbol, previous_status, status,
+                        momentum_score, risk_score, details
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+                """, (
+                    snapshot["chain"], snapshot["token_address"], snapshot["token_symbol"],
+                    previous_status, classification["status"], classification["momentum_score"],
+                    classification["risk_score"], json.dumps({
+                        **classification, "snapshot_id": snapshot_id,
+                        "data_quality": snapshot["data_quality"],
+                        "provider_errors": snapshot.get("provider_errors") or [],
+                    }),
+                ))
+                history_id = cur.fetchone()[0]
+            cur.execute("""
+                UPDATE token_watchlist SET monitoring_status = %s, updated_at = NOW()
+                WHERE chain = %s AND token_address = %s
+            """, (
+                "live_evm_monitoring" if snapshot["data_quality"] == "complete"
+                else "partial_evm_monitoring",
+                snapshot["chain"], snapshot["token_address"],
+            ))
+        conn.commit()
+
+    result = {**classification, **snapshot, "snapshot_id": snapshot_id,
+              "previous_status": previous_status, "history_id": history_id}
+    if previous_status and history_id and classification["status"] in EVM_ALERT_STATUSES:
+        try:
+            notification = queue_and_deliver_evm_notification(
+                result, f"evm-signal-history:{history_id}"
+            )
+            result["notification_status"] = notification.get("status")
+        except Exception:
+            diagnostic_increment("telegram_failures")
+            result["notification_status"] = "failed_without_blocking_refresh"
+    else:
+        result["notification_status"] = "baseline_or_no_alert_transition"
+    return result
+
+
+def refresh_evm_watchlist(limit=6, offset=0):
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT chain, token_address, token_symbol, token_name
+                FROM token_watchlist
+                WHERE active = TRUE AND chain = 'robinhood'
+                    AND token_address LIKE '0x%%'
+                ORDER BY token_symbol LIMIT %s OFFSET %s
+            """, (limit, offset))
+            tokens = cur.fetchall()
+            cur.execute("""
+                INSERT INTO evm_refresh_runs (tokens_selected)
+                VALUES (%s) RETURNING id
+            """, (len(tokens),))
+            run_id = cur.fetchone()[0]
+        conn.commit()
+
+    deadline = time.monotonic() + EVM_REFRESH_MAX_SECONDS
+    results = []
+    transitions = 0
+    stopped_reason = None
+    for token in tokens:
+        if time.monotonic() >= deadline:
+            stopped_reason = "deadline_guard"
+            break
+        try:
+            snapshot = fetch_robinhood_token_snapshot(token)
+            if snapshot["data_quality"] == "unavailable":
+                diagnostic_increment("evm_refresh_failures")
+            result = persist_evm_snapshot(snapshot)
+            transitions += int(result.get("history_id") is not None)
+            results.append(result)
+        except Exception as exc:
+            diagnostic_increment("evm_refresh_failures")
+            results.append({
+                "chain": token[0], "token_address": token[1],
+                "token_symbol": token[2], "success": False,
+                "error": type(exc).__name__,
+            })
+    status = "complete" if len(results) == len(tokens) else "partial"
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE evm_refresh_runs SET completed_at = NOW(),
+                    snapshots_created = %s, transitions_created = %s,
+                    status = %s, details = %s WHERE id = %s
+            """, (
+                sum(1 for item in results if item.get("snapshot_id")), transitions,
+                status, json.dumps({"stopped_reason": stopped_reason}), run_id,
+            ))
+        conn.commit()
+    diagnostic_increment("evm_refreshes")
+    return {
+        "success": status == "complete", "run_id": run_id,
+        "selected": len(tokens), "processed": len(results),
+        "transitions": transitions, "stopped_reason": stopped_reason,
+        "results": results,
+    }
+
+
 def parse_helius_activity(payload, tracked_wallets):
     """Convert enhanced Helius SWAP transactions into bounded wallet-token deltas."""
     transactions = payload if isinstance(payload, list) else [payload]
@@ -3184,7 +3667,7 @@ def watchlist_endpoint():
         })
     return jsonify({
         "success": True, "count": len(items), "tokens": items,
-        "note": "Robinhood Chain assets are registered now; live EVM analytics arrive in the planned EVM module.",
+        "note": "V4.8 contract monitoring is live for Robinhood Chain ERC-20 assets; native ETH remains the benchmark.",
         "paper_mode": True, "actionable": False,
     })
 
@@ -3213,19 +3696,226 @@ def add_watchlist_token_endpoint():
                 INSERT INTO token_watchlist (
                     chain, token_address, token_symbol, token_name, source,
                     monitoring_status, active, updated_at
-                ) VALUES (%s, %s, %s, %s, 'manual', 'pending_evm_module', TRUE, NOW())
+                ) VALUES (%s, %s, %s, %s, 'manual', 'evm_monitoring_ready', TRUE, NOW())
                 ON CONFLICT (chain, token_address) DO UPDATE SET
                     token_symbol = EXCLUDED.token_symbol,
                     token_name = EXCLUDED.token_name,
-                    source = 'manual', monitoring_status = 'pending_evm_module',
+                    source = 'manual', monitoring_status = 'evm_monitoring_ready',
                     active = TRUE, updated_at = NOW()
             """, (chain, address, symbol, name))
         conn.commit()
     return jsonify({
         "success": True, "chain": chain, "token_address": address,
-        "token_symbol": symbol, "monitoring_status": "pending_evm_module",
+        "token_symbol": symbol, "monitoring_status": "evm_monitoring_ready",
         "paper_mode": True, "actionable": False,
     })
+
+
+EVM_SIGNAL_SELECT = """
+    SELECT s.chain, s.token_address, s.token_symbol, s.status,
+        s.momentum_score, s.risk_score, s.reasons,
+        s.holder_change_pct, s.liquidity_change_pct,
+        s.volume_liquidity_ratio, s.buy_sell_ratio,
+        s.data_quality, s.updated_at, p.price_usd, p.liquidity_usd,
+        p.market_cap_usd, p.volume_h1_usd, p.price_change_h1_pct,
+        p.holder_count, p.pair_address, p.captured_at
+    FROM evm_token_signals s
+    LEFT JOIN evm_token_snapshots p ON p.id = s.latest_snapshot_id
+"""
+
+
+def serialize_evm_signal(row):
+    try:
+        reasons = json.loads(row[6] or "[]")
+    except (TypeError, ValueError):
+        reasons = []
+    return {
+        "chain": row[0], "chain_id": ROBINHOOD_CHAIN_ID,
+        "token_address": row[1], "token_symbol": row[2], "status": row[3],
+        "momentum_score": row[4], "risk_score": row[5], "reasons": reasons,
+        "holder_change_pct": row[7], "liquidity_change_pct": row[8],
+        "volume_liquidity_ratio": row[9], "buy_sell_ratio": row[10],
+        "data_quality": row[11], "updated_at": row[12], "price_usd": row[13],
+        "liquidity_usd": row[14], "market_cap_usd": row[15],
+        "volume_h1_usd": row[16], "price_change_h1_pct": row[17],
+        "holder_count": row[18], "pair_address": row[19],
+        "captured_at": row[20], "paper_mode": True, "actionable": False,
+    }
+
+
+@app.post("/refresh-evm-watchlist")
+def refresh_evm_watchlist_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    try:
+        limit = min(max(int(request.args.get("limit", 6)), 1), 10)
+        offset = max(int(request.args.get("offset", 0)), 0)
+    except ValueError:
+        return jsonify({"success": False, "error": "limit and offset must be integers"}), 400
+    result = refresh_evm_watchlist(limit=limit, offset=offset)
+    return jsonify({
+        **result, "version": VERSION, "deadline_seconds": EVM_REFRESH_MAX_SECONDS,
+        "paper_mode": True, "actionable": False,
+        "note": "First observations establish a baseline; alerts require a later state change.",
+    }), 200 if result["success"] else 207
+
+
+@app.get("/evm-status")
+def evm_status_endpoint():
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT status, COUNT(*) FROM evm_token_signals GROUP BY status
+            """)
+            counts = {row[0]: row[1] for row in cur.fetchall()}
+            cur.execute("""
+                SELECT id, started_at, completed_at, tokens_selected,
+                    snapshots_created, transitions_created, status, details
+                FROM evm_refresh_runs ORDER BY id DESC LIMIT 1
+            """)
+            row = cur.fetchone()
+            cur.execute("""
+                SELECT COUNT(*) FROM token_watchlist
+                WHERE active = TRUE AND chain = 'robinhood'
+                    AND token_address LIKE '0x%%'
+            """)
+            tracked_contracts = cur.fetchone()[0]
+    latest_run = None if not row else {
+        "id": row[0], "started_at": row[1], "completed_at": row[2],
+        "tokens_selected": row[3], "snapshots_created": row[4],
+        "transitions_created": row[5], "status": row[6],
+        "details": json.loads(row[7] or "{}"),
+    }
+    return jsonify({
+        "success": True, "version": VERSION, "chain": "robinhood",
+        "chain_id": ROBINHOOD_CHAIN_ID, "tracked_contracts": tracked_contracts,
+        "signal_counts": counts, "latest_refresh": latest_run,
+        "providers": {"market": "DexScreener", "holders": "Blockscout"},
+        "paper_mode": True, "actionable": False,
+    })
+
+
+@app.get("/evm-signals")
+def evm_signals_endpoint():
+    initialise_database()
+    status = str(request.args.get("status") or "").strip().upper()
+    with db() as conn:
+        with conn.cursor() as cur:
+            if status:
+                cur.execute(EVM_SIGNAL_SELECT + " WHERE s.status = %s ORDER BY s.updated_at DESC", (status,))
+            else:
+                cur.execute(EVM_SIGNAL_SELECT + " ORDER BY s.updated_at DESC")
+            rows = cur.fetchall()
+    return jsonify({
+        "success": True, "count": len(rows),
+        "signals": [serialize_evm_signal(row) for row in rows],
+        "paper_mode": True, "actionable": False,
+        "warning": "Contract analytics are observations, not buy or sell instructions.",
+    })
+
+
+@app.get("/evm-token/<token_address>")
+def evm_token_detail_endpoint(token_address):
+    valid_address = (
+        len(token_address) == 42 and token_address.startswith("0x")
+        and all(character in "0123456789abcdefABCDEF" for character in token_address[2:])
+    )
+    if not valid_address:
+        return jsonify({"success": False, "error": "Invalid EVM token address"}), 400
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                EVM_SIGNAL_SELECT + " WHERE LOWER(s.token_address) = LOWER(%s)",
+                (token_address,),
+            )
+            row = cur.fetchone()
+            cur.execute("""
+                SELECT id, price_usd, liquidity_usd, market_cap_usd,
+                    volume_h1_usd, price_change_h1_pct, holder_count,
+                    data_quality, provider_errors, captured_at
+                FROM evm_token_snapshots
+                WHERE LOWER(token_address) = LOWER(%s)
+                ORDER BY captured_at DESC LIMIT 48
+            """, (token_address,))
+            snapshots = cur.fetchall()
+    if not row:
+        return jsonify({"success": False, "error": "EVM token has no snapshot yet"}), 404
+    return jsonify({
+        "success": True, "signal": serialize_evm_signal(row),
+        "snapshots": [{
+            "id": item[0], "price_usd": item[1], "liquidity_usd": item[2],
+            "market_cap_usd": item[3], "volume_h1_usd": item[4],
+            "price_change_h1_pct": item[5], "holder_count": item[6],
+            "data_quality": item[7],
+            "provider_errors": json.loads(item[8] or "[]"), "captured_at": item[9],
+        } for item in snapshots],
+        "paper_mode": True, "actionable": False,
+    })
+
+
+@app.get("/evm-snapshots")
+def evm_snapshots_endpoint():
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+    except ValueError:
+        limit = 100
+    symbol = str(request.args.get("symbol") or "").strip().upper()
+    with db() as conn:
+        with conn.cursor() as cur:
+            if symbol:
+                cur.execute("""
+                    SELECT id, chain, token_address, token_symbol, price_usd,
+                        liquidity_usd, market_cap_usd, volume_h1_usd,
+                        price_change_h1_pct, holder_count, data_quality,
+                        provider_errors, captured_at
+                    FROM evm_token_snapshots WHERE token_symbol = %s
+                    ORDER BY captured_at DESC LIMIT %s
+                """, (symbol, limit))
+            else:
+                cur.execute("""
+                    SELECT id, chain, token_address, token_symbol, price_usd,
+                        liquidity_usd, market_cap_usd, volume_h1_usd,
+                        price_change_h1_pct, holder_count, data_quality,
+                        provider_errors, captured_at
+                    FROM evm_token_snapshots ORDER BY captured_at DESC LIMIT %s
+                """, (limit,))
+            rows = cur.fetchall()
+    return jsonify({"success": True, "count": len(rows), "snapshots": [{
+        "id": row[0], "chain": row[1], "token_address": row[2],
+        "token_symbol": row[3], "price_usd": row[4], "liquidity_usd": row[5],
+        "market_cap_usd": row[6], "volume_h1_usd": row[7],
+        "price_change_h1_pct": row[8], "holder_count": row[9],
+        "data_quality": row[10], "provider_errors": json.loads(row[11] or "[]"),
+        "captured_at": row[12], "actionable": False,
+    } for row in rows], "paper_mode": True})
+
+
+@app.post("/test-evm-notification")
+def test_evm_notification_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    signal = {
+        "token_address": None, "token_symbol": "EVM-TEST",
+        "status": "EVM_MOMENTUM", "momentum_score": 65, "risk_score": 10,
+        "data_quality": "test", "reasons": ["notification_pipeline_test"],
+    }
+    result = queue_and_deliver_evm_notification(
+        signal, f"evm-test:{time.time_ns()}:{random.randint(1000, 9999)}", test=True
+    )
+    return jsonify({
+        "success": bool(result.get("success")), "delivery_status": result.get("status"),
+        "notification_id": result.get("notification_id"),
+        "telegram_configured": telegram_configured(), "paper_mode": True,
+        "actionable": False,
+    }), 200 if result.get("success") else 503
 
 
 @app.get("/wallet-clusters")
