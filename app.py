@@ -9,12 +9,12 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template_string, request
 
 
 app = Flask(__name__)
 
-VERSION = "4.8.1-paper-evm-cron"
+VERSION = "4.8.2-paper-dashboard"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -4234,6 +4234,151 @@ def notification_deliveries_endpoint():
         } for row in rows],
         "paper_mode": True, "actionable": False,
     })
+
+
+def dashboard_change(current, baseline):
+    return percentage_change(current, baseline)
+
+
+def build_dashboard_payload():
+    """Assemble read-only EVM/Solana monitoring data and rolling comparisons."""
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(EVM_SIGNAL_SELECT + " ORDER BY s.token_symbol")
+            evm_rows = cur.fetchall()
+            cur.execute("""
+                SELECT chain, token_address, price_usd, liquidity_usd,
+                    holder_count, captured_at
+                FROM evm_token_snapshots
+                WHERE captured_at >= NOW() - INTERVAL '26 hours'
+                ORDER BY chain, token_address, captured_at DESC
+            """)
+            snapshot_rows = cur.fetchall()
+            cur.execute(SIGNAL_SELECT + " ORDER BY updated_at DESC LIMIT 50")
+            solana_rows = cur.fetchall()
+            cur.execute("""
+                SELECT id, completed_at, snapshots_created, transitions_created,
+                    status FROM evm_refresh_runs ORDER BY id DESC LIMIT 1
+            """)
+            refresh_row = cur.fetchone()
+
+    grouped = {}
+    for row in snapshot_rows:
+        grouped.setdefault((row[0], row[1]), []).append({
+            "price_usd": row[2], "liquidity_usd": row[3],
+            "holder_count": row[4], "captured_at": row[5],
+        })
+
+    now = datetime.now(timezone.utc)
+    evm_signals = []
+    for row in evm_rows:
+        item = serialize_evm_signal(row)
+        samples = grouped.get((row[0], row[1]), [])
+        latest = samples[0] if samples else None
+        trends = {}
+        for hours in (1, 6, 24):
+            target = now - timedelta(hours=hours)
+            baseline = next(
+                (sample for sample in samples if sample["captured_at"] <= target),
+                None,
+            )
+            trends[f"{hours}h"] = {
+                "available": bool(latest and baseline),
+                "price_change_pct": dashboard_change(
+                    latest.get("price_usd") if latest else None,
+                    baseline.get("price_usd") if baseline else None,
+                ),
+                "liquidity_change_pct": dashboard_change(
+                    latest.get("liquidity_usd") if latest else None,
+                    baseline.get("liquidity_usd") if baseline else None,
+                ),
+                "holder_change": (
+                    latest["holder_count"] - baseline["holder_count"]
+                    if latest and baseline and latest.get("holder_count") is not None
+                    and baseline.get("holder_count") is not None else None
+                ),
+                "baseline_at": baseline.get("captured_at") if baseline else None,
+            }
+        item["trends"] = trends
+        evm_signals.append(item)
+
+    solana_signals = [serialize_signal_row(row) for row in solana_rows]
+    latest_refresh = None if not refresh_row else {
+        "id": refresh_row[0], "completed_at": refresh_row[1],
+        "snapshots_created": refresh_row[2],
+        "transitions_created": refresh_row[3], "status": refresh_row[4],
+    }
+    return {
+        "success": True, "version": VERSION,
+        "generated_at": now, "latest_refresh": latest_refresh,
+        "evm_signals": evm_signals, "solana_signals": solana_signals,
+        "summary": {
+            "evm_tokens": len(evm_signals),
+            "evm_alert_states": sum(
+                1 for item in evm_signals if item["status"] in EVM_ALERT_STATUSES
+            ),
+            "solana_signals": len(solana_signals),
+            "solana_active": sum(
+                1 for item in solana_signals if item["status"] != "EXPIRED"
+            ),
+        },
+        "paper_mode": True, "actionable": False,
+    }
+
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Wallet Monitor Dashboard</title>
+  <style>
+    :root{--bg:#07111f;--panel:#101d2e;--panel2:#13243a;--line:#24364d;--text:#e7eef8;--muted:#8fa3bb;--blue:#55a7ff;--green:#37d49b;--amber:#ffbd59;--red:#ff6577}
+    *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at 15% 0,#122c48 0,transparent 38%),var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
+    .wrap{max-width:1460px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:22px}.eyebrow{color:var(--blue);font-weight:700;letter-spacing:.14em;text-transform:uppercase;font-size:11px}h1{font-size:30px;margin:5px 0 4px}.sub,.muted{color:var(--muted)}.live{display:flex;align-items:center;gap:8px;background:#102d2a;border:1px solid #1d5d4d;color:#77e4bd;padding:9px 13px;border-radius:999px}.dot{width:8px;height:8px;background:var(--green);border-radius:50%;box-shadow:0 0 12px var(--green)}
+    .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}.card,.section{background:linear-gradient(145deg,rgba(19,36,58,.96),rgba(12,25,42,.96));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 40px rgba(0,0,0,.16)}.card{padding:18px}.card b{display:block;font-size:25px;margin-top:4px}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+    .section{padding:18px;margin-bottom:20px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.section h2{font-size:18px;margin:0}.links a{color:var(--blue);text-decoration:none;margin-left:14px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1040px}th{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:11px 10px;border-bottom:1px solid var(--line)}td{padding:13px 10px;border-bottom:1px solid rgba(36,54,77,.7);white-space:nowrap}tbody tr:hover{background:rgba(85,167,255,.04)}.token{font-weight:750}.address{font:11px ui-monospace,SFMono-Regular,Consolas;color:var(--muted)}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:700;font-size:11px}.observe{background:#19304b;color:#9ecbff}.momentum{background:#123b31;color:#67e6b8}.high{background:#294320;color:#b4ef79}.risk{background:#4a2028;color:#ff9aaa}.expired{background:#29313d;color:#aab5c3}.pos{color:var(--green)}.neg{color:var(--red)}.neutral{color:var(--muted)}.warning{margin-top:18px;padding:12px 15px;border:1px solid #54421f;background:#2a2415;color:#f2cf82;border-radius:12px}.empty{text-align:center;color:var(--muted);padding:24px}.error{border-color:#68303a;background:#321820;color:#ff9aaa}.footer{color:var(--muted);font-size:12px;text-align:center;padding:8px}
+    @media(max-width:800px){.wrap{padding:18px}.top{display:block}.live{margin-top:14px;width:max-content}.cards{grid-template-columns:repeat(2,1fr)}h1{font-size:25px}.section-head{align-items:flex-start;flex-direction:column}.links a{margin:0 14px 0 0}}
+  </style>
+</head>
+<body><main class="wrap">
+  <header class="top"><div><div class="eyebrow">V4.8 Premium · Research Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + Robinhood Chain contract monitoring</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <section class="cards">
+    <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain</span></div>
+    <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Momentum or risk</span></div>
+    <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
+    <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
+  </section>
+  <section class="section"><div class="section-head"><div><h2>Robinhood Chain watchlist</h2><div class="muted">Current contract state and rolling snapshot changes</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-snapshots?limit=100">Snapshots</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>State</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Solana paper signals</h2><div class="muted">Relationship-aware wallet consensus; execution remains disabled</div></div><div class="links"><a href="/signals">JSON signals</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Status</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Updated</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <div class="warning">Paper research only. Signals are observations—not trade instructions—and token safety remains unverified.</div><div class="footer" id="footer">Auto-refreshes every 60 seconds.</div>
+</main><script>
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money=v=>v==null?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',notation:Math.abs(v)>=1e6?'compact':'standard',maximumFractionDigits:Math.abs(v)<1?8:2}).format(v);
+const num=v=>v==null?'—':new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(v);
+const trend=v=>v==null?'<span class="neutral">collecting</span>':`<span class="${v>0?'pos':v<0?'neg':'neutral'}">${v>0?'+':''}${num(v)}%</span>`;
+const when=v=>v?new Date(v).toLocaleString():'—';
+const badge=s=>{const c=s==='EVM_RISK'?'risk':s==='EVM_HIGH_MOMENTUM'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
+async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
+document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
+document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></td><td>${badge(x.status)}</td><td>${money(x.price_usd)}</td><td>${money(x.liquidity_usd)}</td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No EVM snapshots yet.</td></tr>';
+document.getElementById('solBody').innerHTML=d.solana_signals.length?d.solana_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol||'Unknown')}</div><div class="address">${esc((x.token_address||'').slice(0,10))}…</div></td><td>${badge(x.status)}</td><td>${num(x.buy_score)}</td><td>${num(x.sell_score)}</td><td>${num(x.independent_buy_clusters)}</td><td>${num(x.independent_sell_clusters)}</td><td>${esc(x.safety_status)}</td><td>${when(x.updated_at)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">No Solana paper signals yet.</td></tr>';
+document.getElementById('footer').textContent=`${esc(d.version)} · generated ${when(d.generated_at)} · auto-refreshes every 60 seconds.`;
+}catch(e){document.getElementById('refreshState').textContent='Dashboard data unavailable';document.querySelector('.warning').classList.add('error');document.querySelector('.warning').textContent='Could not load dashboard data. The monitoring APIs continue running independently.';}}
+load();setInterval(load,60000);
+</script></body></html>"""
+
+
+@app.get("/dashboard-data")
+def dashboard_data_endpoint():
+    return jsonify(build_dashboard_payload())
+
+
+@app.get("/dashboard")
+def dashboard_endpoint():
+    return render_template_string(DASHBOARD_HTML)
 
 
 @app.get("/premium-funnel")
