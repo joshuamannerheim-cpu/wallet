@@ -13,7 +13,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.7.1-paper-notifications"
+VERSION = "4.7.2-paper-sync-watchlist"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -35,6 +35,22 @@ DISCOVERY_PAGE_SIZE = 10
 DISCOVERY_WALLETS_PER_TOKEN = 5
 PIPELINE_MAX_SECONDS = min(max(int(os.getenv("PIPELINE_MAX_SECONDS", "75")), 15), 90)
 HELIUS_HISTORY_LIMIT = 100
+HELIUS_WEBHOOKS_URL = "https://mainnet.helius-rpc.com/v0/webhooks"
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL", "https://wallet-production-3b7b.up.railway.app"
+).rstrip("/")
+HELIUS_TARGET_WEBHOOK_URL = os.getenv(
+    "HELIUS_TARGET_WEBHOOK_URL", f"{PUBLIC_BASE_URL}/helius-webhook"
+)
+HELIUS_AUTO_SYNC = os.getenv("HELIUS_AUTO_SYNC", "true").lower() in {
+    "1", "true", "yes", "on",
+}
+HELIUS_MIN_SYNC_WALLETS = min(
+    max(int(os.getenv("HELIUS_MIN_SYNC_WALLETS", "1")), 1), 100
+)
+HELIUS_MAX_REMOVAL_FRACTION = min(
+    max(float(os.getenv("HELIUS_MAX_REMOVAL_FRACTION", "0.50")), 0.0), 1.0
+)
 SIGNAL_WINDOW_MINUTES = min(max(int(os.getenv("SIGNAL_WINDOW_MINUTES", "60")), 15), 360)
 TELEGRAM_ALERT_STATUSES = {
     value.strip().upper()
@@ -50,6 +66,14 @@ WATCH_WEIGHT = 1.0
 ASYMMETRIC_WEIGHT = 0.35
 CONFIDENCE_MULTIPLIERS = {"HIGH": 1.0, "MEDIUM": 0.75, "LOW": 0.5}
 HARD_RELATIONSHIP_STRENGTHS = {"high", "moderate"}
+DEFAULT_TOKEN_WATCHLIST = (
+    ("robinhood", "native:ETH", "ETH", "Ether", "portfolio", "benchmark"),
+    ("robinhood", "0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1", "IF", "What IF", "portfolio", "pending_evm_module"),
+    ("robinhood", "0xe934e36A439C94017B64a3FecE66AF12099aBF50", "STONKBROKER", "StonkBroker", "portfolio", "pending_evm_module"),
+    ("robinhood", "0x020bfC650A365f8BB26819deAAbF3E21291018b4", "CASHCAT", "Cash Cat", "portfolio", "pending_evm_module"),
+    ("robinhood", "0xfd181632e1F2335DaB74535E6dD29082d3191bb2", "RFLX", "RFLIX", "portfolio", "pending_evm_module"),
+    ("robinhood", "0xeC45C6C413b498Cf5aCF5a1a889F1a95cA9b6bB3", "PORTLY", "PORTLY", "existing_test_case", "pending_evm_module"),
+)
 BASE58_ALPHABET = (
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
     "abcdefghijkmnopqrstuvwxyz"
@@ -59,6 +83,7 @@ _rate_lock = threading.Lock()
 _next_birdeye_request = 0.0
 _diagnostic_lock = threading.Lock()
 _diagnostics = {"birdeye_requests": 0, "helius_requests": 0,
+                "helius_syncs": 0, "helius_sync_failures": 0,
                 "telegram_requests": 0, "telegram_deliveries": 0,
                 "telegram_failures": 0, "retries": 0, "rate_limits": 0,
                 "timeouts": 0, "upstream_errors": 0}
@@ -318,9 +343,39 @@ def initialise_database():
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS helius_sync_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    webhook_id TEXT,
+                    dry_run BOOLEAN NOT NULL,
+                    sync_status TEXT NOT NULL,
+                    desired_wallet_count INTEGER NOT NULL DEFAULT 0,
+                    current_wallet_count INTEGER NOT NULL DEFAULT 0,
+                    addresses_added TEXT NOT NULL DEFAULT '[]',
+                    addresses_removed TEXT NOT NULL DEFAULT '[]',
+                    response_code INTEGER,
+                    error_message TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS token_watchlist (
+                    chain TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT NOT NULL,
+                    token_name TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    monitoring_status TEXT NOT NULL,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (chain, token_address)
+                )
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_token_time_idx ON wallet_activity (token_address, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_wallet_time_idx ON wallet_activity (wallet, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS notification_delivery_status_idx ON notification_deliveries (delivery_status, created_at)")
+            cur.execute("CREATE INDEX IF NOT EXISTS helius_sync_created_idx ON helius_sync_history (created_at DESC)")
 
             # These are idempotent and preserve databases created by earlier V4 builds.
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS total_pnl_30d DOUBLE PRECISION")
@@ -338,6 +393,19 @@ def initialise_database():
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAULT 'unvalidated'")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ")
             cur.execute("ALTER TABLE discovery_observations ADD COLUMN IF NOT EXISTS token_symbol TEXT")
+            for chain, address, symbol, name, source, monitoring_status in DEFAULT_TOKEN_WATCHLIST:
+                cur.execute("""
+                    INSERT INTO token_watchlist (
+                        chain, token_address, token_symbol, token_name,
+                        source, monitoring_status, active, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, TRUE, NOW())
+                    ON CONFLICT (chain, token_address) DO UPDATE SET
+                        token_symbol = EXCLUDED.token_symbol,
+                        token_name = EXCLUDED.token_name,
+                        source = EXCLUDED.source,
+                        monitoring_status = EXCLUDED.monitoring_status,
+                        updated_at = NOW()
+                """, (chain, address, symbol, name, source, monitoring_status))
         conn.commit()
 
 
@@ -990,6 +1058,9 @@ def diagnostics():
                     "pipeline_max_seconds": PIPELINE_MAX_SECONDS,
                     "signal_window_minutes": SIGNAL_WINDOW_MINUTES,
                     "helius_webhook_configured": bool(os.getenv("HELIUS_WEBHOOK_SECRET")),
+                    "helius_webhook_sync_configured": bool(os.getenv("HELIUS_API_KEY")),
+                    "helius_auto_sync": HELIUS_AUTO_SYNC,
+                    "helius_target_webhook_url_configured": bool(HELIUS_TARGET_WEBHOOK_URL),
                     "admin_key_configured": bool(os.getenv("ADMIN_API_KEY")),
                     "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
                     "telegram_alert_statuses": sorted(TELEGRAM_ALERT_STATUSES),
@@ -2255,6 +2326,175 @@ def load_tracked_wallet_map():
     }
 
 
+def helius_webhook_headers():
+    return {
+        "Authorization": f"Bearer {os.getenv('HELIUS_API_KEY', '')}",
+        "Content-Type": "application/json",
+    }
+
+
+def helius_webhook_id(webhook):
+    return webhook.get("webhookID") or webhook.get("webhookId") or webhook.get("id")
+
+
+def normalise_helius_webhook_list(payload):
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("data", "webhooks", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def record_helius_sync(result):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO helius_sync_history (
+                    webhook_id, dry_run, sync_status, desired_wallet_count,
+                    current_wallet_count, addresses_added, addresses_removed,
+                    response_code, error_message
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                result.get("webhook_id"), bool(result.get("dry_run")),
+                result.get("sync_status", "unknown"),
+                result.get("desired_wallet_count", 0),
+                result.get("current_wallet_count", 0),
+                json.dumps(result.get("addresses_added") or []),
+                json.dumps(result.get("addresses_removed") or []),
+                result.get("response_code"), result.get("error_message"),
+            ))
+            sync_id = cur.fetchone()[0]
+        conn.commit()
+    result["sync_id"] = sync_id
+    return result
+
+
+def synchronise_helius_webhook(*, dry_run=True, force=False):
+    """Compare eligible Solana wallets with Helius and update only on drift."""
+    desired = sorted(load_tracked_wallet_map())
+    base_result = {
+        "success": False, "dry_run": bool(dry_run), "webhook_id": None,
+        "sync_status": "configuration_required",
+        "desired_wallet_count": len(desired), "current_wallet_count": 0,
+        "addresses_added": [], "addresses_removed": [],
+        "response_code": None, "error_message": None,
+    }
+    if not os.getenv("HELIUS_API_KEY"):
+        base_result["error_message"] = "HELIUS_API_KEY is not configured"
+        return record_helius_sync(base_result)
+    if not os.getenv("HELIUS_WEBHOOK_SECRET"):
+        base_result["error_message"] = "HELIUS_WEBHOOK_SECRET is not configured"
+        return record_helius_sync(base_result)
+    if len(desired) < HELIUS_MIN_SYNC_WALLETS:
+        base_result["sync_status"] = "blocked_minimum_wallet_guard"
+        base_result["error_message"] = "Desired wallet count is below the configured safety minimum"
+        return record_helius_sync(base_result)
+
+    try:
+        response = upstream_request(
+            "GET", HELIUS_WEBHOOKS_URL, headers=helius_webhook_headers(),
+            timeout=20, retries=1, provider="helius",
+        )
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        diagnostic_increment("helius_sync_failures")
+        base_result["sync_status"] = "helius_unavailable"
+        base_result["error_message"] = type(exc).__name__
+        return record_helius_sync(base_result)
+
+    base_result["response_code"] = response.status_code
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if response.status_code != 200:
+        diagnostic_increment("helius_sync_failures")
+        base_result["sync_status"] = "helius_get_failed"
+        base_result["error_message"] = "Helius rejected the webhook-list request"
+        return record_helius_sync(base_result)
+
+    configured_id = os.getenv("HELIUS_WEBHOOK_ID", "").strip()
+    webhooks = normalise_helius_webhook_list(payload)
+    selected = None
+    for webhook in webhooks:
+        candidate_id = str(helius_webhook_id(webhook) or "")
+        candidate_url = str(webhook.get("webhookURL") or "").rstrip("/")
+        if configured_id and candidate_id == configured_id:
+            selected = webhook
+            break
+        if not configured_id and candidate_url == HELIUS_TARGET_WEBHOOK_URL.rstrip("/"):
+            selected = webhook
+            break
+    if not selected:
+        base_result["sync_status"] = "webhook_not_found"
+        base_result["error_message"] = "No Helius webhook matched the configured ID or target URL"
+        return record_helius_sync(base_result)
+
+    webhook_id = str(helius_webhook_id(selected) or "")
+    current = sorted(set(selected.get("accountAddresses") or []))
+    desired_set, current_set = set(desired), set(current)
+    added = sorted(desired_set - current_set)
+    removed = sorted(current_set - desired_set)
+    base_result.update({
+        "webhook_id": webhook_id,
+        "current_wallet_count": len(current),
+        "addresses_added": added,
+        "addresses_removed": removed,
+    })
+    if not webhook_id:
+        base_result["sync_status"] = "invalid_helius_response"
+        base_result["error_message"] = "Matched webhook did not contain an identifier"
+        return record_helius_sync(base_result)
+    if not added and not removed:
+        base_result.update({"success": True, "sync_status": "already_synchronised"})
+        return record_helius_sync(base_result)
+
+    removal_fraction = len(removed) / max(len(current), 1)
+    base_result["removal_fraction"] = round(removal_fraction, 4)
+    if removal_fraction > HELIUS_MAX_REMOVAL_FRACTION and not force:
+        base_result["sync_status"] = "blocked_removal_guard"
+        base_result["error_message"] = "Proposed removal exceeds the configured safety limit"
+        return record_helius_sync(base_result)
+    if dry_run:
+        base_result.update({"success": True, "sync_status": "dry_run_changes_detected"})
+        return record_helius_sync(base_result)
+
+    update_body = {
+        "webhookURL": HELIUS_TARGET_WEBHOOK_URL,
+        "transactionTypes": selected.get("transactionTypes") or ["SWAP"],
+        "accountAddresses": desired,
+        "webhookType": selected.get("webhookType") or "enhanced",
+        "authHeader": f"Bearer {os.getenv('HELIUS_WEBHOOK_SECRET', '')}",
+    }
+    for optional_key in ("encoding", "txnStatus"):
+        if selected.get(optional_key):
+            update_body[optional_key] = selected[optional_key]
+    try:
+        update_response = upstream_request(
+            "PUT", f"{HELIUS_WEBHOOKS_URL}/{webhook_id}",
+            headers=helius_webhook_headers(), json_body=update_body,
+            timeout=25, retries=1, provider="helius",
+        )
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        diagnostic_increment("helius_sync_failures")
+        base_result["sync_status"] = "helius_update_unavailable"
+        base_result["error_message"] = type(exc).__name__
+        return record_helius_sync(base_result)
+
+    base_result["response_code"] = update_response.status_code
+    if update_response.status_code not in {200, 201}:
+        diagnostic_increment("helius_sync_failures")
+        base_result["sync_status"] = "helius_update_failed"
+        base_result["error_message"] = "Helius rejected the webhook update"
+        return record_helius_sync(base_result)
+    diagnostic_increment("helius_syncs")
+    base_result.update({"success": True, "sync_status": "synchronised"})
+    return record_helius_sync(base_result)
+
+
 def webhook_authorized():
     configured = os.getenv("HELIUS_WEBHOOK_SECRET", "")
     supplied = (
@@ -2851,11 +3091,58 @@ def refresh_wallet_clusters_endpoint():
         return jsonify({"success": False, "error": "Unauthorized"}), 401
     initialise_database()
     eligible, clusters, edges, infrastructure_count = compute_and_persist_wallet_clusters()
+    sync_result = None
+    if HELIUS_AUTO_SYNC:
+        sync_result = synchronise_helius_webhook(dry_run=False, force=False)
     return jsonify({
         "success": True, "version": VERSION, "eligible_wallets": len(eligible),
         "independent_clusters": len(clusters), "material_relationships": len(edges),
         "infrastructure_addresses_excluded": infrastructure_count,
+        "helius_sync": sync_result,
         "paper_mode": True, "actionable": False,
+    })
+
+
+@app.post("/sync-helius-webhook")
+def sync_helius_webhook_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    dry_run = request.args.get("dry_run", "true").lower() not in {
+        "0", "false", "no", "off",
+    }
+    force = request.args.get("force", "false").lower() in {
+        "1", "true", "yes", "on",
+    }
+    result = synchronise_helius_webhook(dry_run=dry_run, force=force)
+    return jsonify({**result, "paper_mode": True, "actionable": False}), (
+        200 if result.get("success") else 409
+    )
+
+
+@app.get("/helius-sync-status")
+def helius_sync_status_endpoint():
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT dry_run, sync_status, desired_wallet_count,
+                    current_wallet_count, response_code, error_message, created_at
+                FROM helius_sync_history ORDER BY id DESC LIMIT 1
+            """)
+            row = cur.fetchone()
+    last_sync = None if not row else {
+        "dry_run": row[0], "sync_status": row[1],
+        "desired_wallet_count": row[2], "current_wallet_count": row[3],
+        "response_code": row[4], "error_message": row[5], "created_at": row[6],
+    }
+    return jsonify({
+        "success": True, "auto_sync": HELIUS_AUTO_SYNC,
+        "minimum_wallet_guard": HELIUS_MIN_SYNC_WALLETS,
+        "maximum_removal_fraction": HELIUS_MAX_REMOVAL_FRACTION,
+        "last_sync": last_sync, "paper_mode": True,
     })
 
 
@@ -2867,6 +3154,77 @@ def tracked_wallets_endpoint():
     return jsonify({
         "success": True, "count": len(items), "wallets": items,
         "refresh_required": not bool(items), "paper_mode": True,
+    })
+
+
+@app.get("/watchlist")
+def watchlist_endpoint():
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT chain, token_address, token_symbol, token_name, source,
+                    monitoring_status, active, added_at, updated_at
+                FROM token_watchlist
+                WHERE active = TRUE
+                ORDER BY chain, token_symbol
+            """)
+            rows = cur.fetchall()
+    items = []
+    for row in rows:
+        explorer_url = None
+        if row[0] == "robinhood" and row[1].startswith("0x"):
+            explorer_url = f"https://robinhoodchain.blockscout.com/token/{row[1]}"
+        items.append({
+            "chain": row[0], "chain_id": 4663 if row[0] == "robinhood" else None,
+            "token_address": row[1], "token_symbol": row[2],
+            "token_name": row[3], "source": row[4],
+            "monitoring_status": row[5], "active": row[6],
+            "explorer_url": explorer_url, "added_at": row[7], "updated_at": row[8],
+        })
+    return jsonify({
+        "success": True, "count": len(items), "tokens": items,
+        "note": "Robinhood Chain assets are registered now; live EVM analytics arrive in the planned EVM module.",
+        "paper_mode": True, "actionable": False,
+    })
+
+
+@app.post("/watchlist")
+def add_watchlist_token_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    body = request.get_json(silent=True) or {}
+    chain = str(body.get("chain") or "").strip().lower()
+    address = str(body.get("token_address") or "").strip()
+    symbol = str(body.get("token_symbol") or "").strip().upper()
+    name = str(body.get("token_name") or symbol).strip()
+    valid_evm_address = (
+        len(address) == 42 and address.startswith("0x")
+        and all(character in "0123456789abcdefABCDEF" for character in address[2:])
+    )
+    if not chain or not symbol or not (valid_evm_address or address.startswith("native:")):
+        return jsonify({"success": False, "error": "Valid chain, token symbol and token address are required"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO token_watchlist (
+                    chain, token_address, token_symbol, token_name, source,
+                    monitoring_status, active, updated_at
+                ) VALUES (%s, %s, %s, %s, 'manual', 'pending_evm_module', TRUE, NOW())
+                ON CONFLICT (chain, token_address) DO UPDATE SET
+                    token_symbol = EXCLUDED.token_symbol,
+                    token_name = EXCLUDED.token_name,
+                    source = 'manual', monitoring_status = 'pending_evm_module',
+                    active = TRUE, updated_at = NOW()
+            """, (chain, address, symbol, name))
+        conn.commit()
+    return jsonify({
+        "success": True, "chain": chain, "token_address": address,
+        "token_symbol": symbol, "monitoring_status": "pending_evm_module",
+        "paper_mode": True, "actionable": False,
     })
 
 
