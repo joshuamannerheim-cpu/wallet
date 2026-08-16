@@ -2,6 +2,7 @@ import json
 import hmac
 import os
 import random
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -13,7 +14,7 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERSION = "4.8.0-paper-evm"
+VERSION = "4.8.1-paper-evm-cron"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -49,6 +50,15 @@ EVM_ALERT_STATUSES = {
     ).split(",")
     if value.strip()
 }
+EVM_MIN_MOMENTUM_LIQUIDITY_USD = max(
+    float(os.getenv("EVM_MIN_MOMENTUM_LIQUIDITY_USD", "25000")), 0
+)
+EVM_MIN_MOMENTUM_H1_VOLUME_USD = max(
+    float(os.getenv("EVM_MIN_MOMENTUM_H1_VOLUME_USD", "1000")), 0
+)
+EVM_MIN_MOMENTUM_H1_TRANSACTIONS = max(
+    int(os.getenv("EVM_MIN_MOMENTUM_H1_TRANSACTIONS", "10")), 1
+)
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://wallet-production-3b7b.up.railway.app"
 ).rstrip("/")
@@ -1161,6 +1171,9 @@ def diagnostics():
                     "evm_chain_id": ROBINHOOD_CHAIN_ID,
                     "evm_refresh_max_seconds": EVM_REFRESH_MAX_SECONDS,
                     "evm_alert_statuses": sorted(EVM_ALERT_STATUSES),
+                    "evm_min_momentum_liquidity_usd": EVM_MIN_MOMENTUM_LIQUIDITY_USD,
+                    "evm_min_momentum_h1_volume_usd": EVM_MIN_MOMENTUM_H1_VOLUME_USD,
+                    "evm_min_momentum_h1_transactions": EVM_MIN_MOMENTUM_H1_TRANSACTIONS,
                     "counters": counters})
 
 
@@ -2878,6 +2891,10 @@ def classify_evm_snapshot(snapshot, previous):
         buys / sells if buys is not None and sells not in {None, 0}
         else 3.0 if buys and sells == 0 else None
     )
+    transaction_count = (
+        (buys or 0) + (sells or 0)
+        if buys is not None or sells is not None else None
+    )
 
     momentum_score = 0
     risk_score = 0
@@ -2920,11 +2937,22 @@ def classify_evm_snapshot(snapshot, previous):
         risk_score += 20
         reasons.append("providers_unavailable")
 
+    momentum_eligible = True
+    if liquidity is None or liquidity < EVM_MIN_MOMENTUM_LIQUIDITY_USD:
+        momentum_eligible = False
+        reasons.append("momentum_gate_low_liquidity")
+    if volume_h1 is None or volume_h1 < EVM_MIN_MOMENTUM_H1_VOLUME_USD:
+        momentum_eligible = False
+        reasons.append("momentum_gate_low_hourly_volume")
+    if transaction_count is None or transaction_count < EVM_MIN_MOMENTUM_H1_TRANSACTIONS:
+        momentum_eligible = False
+        reasons.append("momentum_gate_small_transaction_sample")
+
     if risk_score >= 50:
         status = "EVM_RISK"
-    elif previous and momentum_score >= 70 and holder_change is not None:
+    elif momentum_eligible and previous and momentum_score >= 70 and holder_change is not None:
         status = "EVM_HIGH_MOMENTUM"
-    elif momentum_score >= 45:
+    elif momentum_eligible and momentum_score >= 45:
         status = "EVM_MOMENTUM"
     else:
         status = "EVM_OBSERVE"
@@ -2935,6 +2963,8 @@ def classify_evm_snapshot(snapshot, previous):
         "liquidity_change_pct": liquidity_change,
         "volume_liquidity_ratio": volume_liquidity,
         "buy_sell_ratio": buy_sell,
+        "transaction_count_h1": transaction_count,
+        "momentum_eligible": momentum_eligible,
     }
 
 
@@ -4332,6 +4362,27 @@ def premium_funnel():
                     "note": "Repeat this idempotent endpoint to continue incomplete work."})
 
 
+def run_evm_refresh_once():
+    """Railway cron entrypoint: perform one refresh, print a summary, then exit."""
+    try:
+        result = refresh_evm_watchlist(limit=10, offset=0)
+    except Exception as exc:
+        print(json.dumps({
+            "success": False, "version": VERSION,
+            "error": type(exc).__name__, "mode": "evm_cron_once",
+        }))
+        return 1
+    print(json.dumps({
+        "success": result["success"], "version": VERSION,
+        "run_id": result["run_id"], "selected": result["selected"],
+        "processed": result["processed"], "transitions": result["transitions"],
+        "stopped_reason": result["stopped_reason"], "mode": "evm_cron_once",
+    }))
+    return 0 if result["success"] else 1
+
+
 if __name__ == "__main__":
+    if "--evm-refresh-once" in sys.argv:
+        raise SystemExit(run_evm_refresh_once())
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
