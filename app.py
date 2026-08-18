@@ -2,6 +2,7 @@ import json
 import hmac
 import os
 import random
+import statistics
 import sys
 import threading
 import time
@@ -14,7 +15,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.8.2-paper-dashboard"
+VERSION = "4.9.0-paper-evidence"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -46,7 +47,7 @@ EVM_REFRESH_MAX_SECONDS = min(
 EVM_ALERT_STATUSES = {
     value.strip().upper()
     for value in os.getenv(
-        "EVM_ALERT_STATUSES", "EVM_MOMENTUM,EVM_HIGH_MOMENTUM,EVM_RISK"
+        "EVM_ALERT_STATUSES", "EVM_MOMENTUM,EVM_HIGH_MOMENTUM,EVM_RISK,EVM_DISTRIBUTION,EVM_CONFIRMED_BREAKOUT,EVM_CONFIRMED_BREAKDOWN"
     ).split(",")
     if value.strip()
 }
@@ -436,6 +437,12 @@ def initialise_database():
                     liquidity_change_pct DOUBLE PRECISION,
                     volume_liquidity_ratio DOUBLE PRECISION,
                     buy_sell_ratio DOUBLE PRECISION,
+                    liquidity_tier TEXT NOT NULL DEFAULT 'UNKNOWN',
+                    structure_state TEXT NOT NULL DEFAULT 'COLLECTING',
+                    structure_confidence INTEGER NOT NULL DEFAULT 0,
+                    structure_details TEXT NOT NULL DEFAULT '{}',
+                    horizon_metrics TEXT NOT NULL DEFAULT '{}',
+                    wallet_quality TEXT NOT NULL DEFAULT '{}',
                     latest_snapshot_id BIGINT REFERENCES evm_token_snapshots(id),
                     data_quality TEXT NOT NULL DEFAULT 'partial',
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -492,6 +499,12 @@ def initialise_database():
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAULT 'unvalidated'")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ")
             cur.execute("ALTER TABLE discovery_observations ADD COLUMN IF NOT EXISTS token_symbol TEXT")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS liquidity_tier TEXT NOT NULL DEFAULT 'UNKNOWN'")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS structure_state TEXT NOT NULL DEFAULT 'COLLECTING'")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS structure_confidence INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS structure_details TEXT NOT NULL DEFAULT '{}'")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS horizon_metrics TEXT NOT NULL DEFAULT '{}'")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS wallet_quality TEXT NOT NULL DEFAULT '{}'")
             for chain, address, symbol, name, source, monitoring_status in DEFAULT_TOKEN_WATCHLIST:
                 cur.execute("""
                     INSERT INTO token_watchlist (
@@ -2767,7 +2780,7 @@ def queue_and_deliver_signal_notification(signal, event_key, *, test=False):
 
 
 # =========================================================
-# V4.8 ROBINHOOD CHAIN CONTRACT MONITORING
+# V4.9 ROBINHOOD CHAIN EVIDENCE MONITORING
 # =========================================================
 
 def safe_float(value):
@@ -2871,8 +2884,172 @@ def fetch_robinhood_token_snapshot(token):
     return snapshot
 
 
-def classify_evm_snapshot(snapshot, previous):
-    """Conservative research state; never an execution recommendation."""
+def evm_liquidity_tier(liquidity):
+    if liquidity is None:
+        return "UNKNOWN"
+    if liquidity < 10000:
+        return "CRITICAL"
+    if liquidity < EVM_MIN_MOMENTUM_LIQUIDITY_USD:
+        return "THIN"
+    if liquidity < 100000:
+        return "LIMITED"
+    if liquidity < 1000000:
+        return "HEALTHY"
+    return "DEEP"
+
+
+def _snapshot_baseline(history, target):
+    candidates = [
+        item for item in history
+        if item.get("captured_at") and item["captured_at"] <= target
+    ]
+    return max(candidates, key=lambda item: item["captured_at"]) if candidates else None
+
+
+def calculate_evm_horizons(snapshot, history):
+    """Compare the current point with persisted 1h/6h/24h baselines."""
+    captured_at = snapshot.get("captured_at") or datetime.now(timezone.utc)
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=timezone.utc)
+    result = {}
+    for hours in (1, 6, 24):
+        baseline = _snapshot_baseline(history, captured_at - timedelta(hours=hours))
+        result[f"{hours}h"] = {
+            "available": baseline is not None,
+            "price_change_pct": percentage_change(
+                snapshot.get("price_usd"), baseline.get("price_usd") if baseline else None
+            ),
+            "liquidity_change_pct": percentage_change(
+                snapshot.get("liquidity_usd"),
+                baseline.get("liquidity_usd") if baseline else None,
+            ),
+            "holder_change": (
+                snapshot["holder_count"] - baseline["holder_count"]
+                if baseline and snapshot.get("holder_count") is not None
+                and baseline.get("holder_count") is not None else None
+            ),
+            "baseline_at": baseline["captured_at"].isoformat() if baseline else None,
+        }
+    return result
+
+
+def analyse_evm_structure(snapshot, history):
+    """Snapshot-proxy structure detection; this is deliberately not OHLC analysis."""
+    points = [
+        item for item in reversed(history)
+        if item.get("price_usd") is not None and item.get("price_usd") > 0
+    ]
+    current = {
+        "price_usd": snapshot.get("price_usd"),
+        "volume_h1_usd": snapshot.get("volume_h1_usd"),
+        "captured_at": snapshot.get("captured_at") or datetime.now(timezone.utc),
+    }
+    if current["price_usd"] is not None and current["price_usd"] > 0:
+        points.append(current)
+    points = points[-32:]
+    if len(points) < 12:
+        return {
+            "state": "COLLECTING", "confidence": 0, "developing": True,
+            "sample_count": len(points), "method": "15m_snapshot_proxy",
+            "volume_confirmed": False, "support": None, "resistance": None,
+            "signals": ["minimum_12_samples_required"],
+        }
+
+    prices = [item["price_usd"] for item in points]
+    prior_prices = prices[:-1]
+    ordered = sorted(prior_prices)
+    support = ordered[max(int(len(ordered) * 0.10) - 1, 0)]
+    resistance = ordered[min(int(len(ordered) * 0.90), len(ordered) - 1)]
+    midpoint = (support + resistance) / 2 if support and resistance else None
+    range_pct = ((resistance - support) / midpoint * 100) if midpoint else None
+    tolerance = 0.02
+    support_tests = sum(abs(price - support) / support <= tolerance for price in prior_prices)
+    resistance_tests = sum(
+        abs(price - resistance) / resistance <= tolerance for price in prior_prices
+    )
+
+    thirds = [prices[index::3] for index in range(3)]
+    # Contiguous thirds are more useful than alternating observations.
+    size = max(len(prices) // 3, 1)
+    thirds = [prices[:size], prices[size:2 * size], prices[2 * size:]]
+    lows = [min(group) for group in thirds if group]
+    highs = [max(group) for group in thirds if group]
+    higher_lows = len(lows) == 3 and lows[1] > lows[0] * 1.003 and lows[2] > lows[1] * 1.003
+    lower_highs = len(highs) == 3 and highs[1] < highs[0] * 0.997 and highs[2] < highs[1] * 0.997
+
+    local_highs = []
+    local_lows = []
+    for index in range(1, len(prices) - 1):
+        if prices[index] >= prices[index - 1] and prices[index] >= prices[index + 1]:
+            local_highs.append((index, prices[index]))
+        if prices[index] <= prices[index - 1] and prices[index] <= prices[index + 1]:
+            local_lows.append((index, prices[index]))
+    double_top = any(
+        right[0] - left[0] >= 4 and abs(right[1] - left[1]) / left[1] <= 0.025
+        for left, right in zip(local_highs, local_highs[1:])
+    )
+    double_bottom = any(
+        right[0] - left[0] >= 4 and abs(right[1] - left[1]) / left[1] <= 0.025
+        for left, right in zip(local_lows, local_lows[1:])
+    )
+
+    prior_volumes = [
+        item.get("volume_h1_usd") for item in points[:-1]
+        if item.get("volume_h1_usd") is not None
+    ]
+    median_volume = statistics.median(prior_volumes) if prior_volumes else None
+    current_volume = current.get("volume_h1_usd")
+    volume_confirmed = bool(
+        median_volume and current_volume is not None and current_volume >= median_volume * 1.5
+    )
+    breakout = prices[-1] >= resistance * 1.02
+    breakdown = prices[-1] <= support * 0.98
+
+    signals = []
+    state = "NO_CLEAR_STRUCTURE"
+    confidence = 20
+    developing = True
+    if breakout and volume_confirmed:
+        state, confidence, developing = "CONFIRMED_BREAKOUT", 85, False
+        signals.append("price_above_resistance_with_volume")
+    elif breakdown and volume_confirmed:
+        state, confidence, developing = "CONFIRMED_BREAKDOWN", 85, False
+        signals.append("price_below_support_with_volume")
+    elif higher_lows and resistance_tests >= 2:
+        state, confidence = "DEVELOPING_ASCENDING_TRIANGLE", 65
+        signals.extend(["higher_lows", "repeated_resistance_tests"])
+    elif lower_highs and support_tests >= 2:
+        state, confidence = "DEVELOPING_DESCENDING_TRIANGLE", 65
+        signals.extend(["lower_highs", "repeated_support_tests"])
+    elif double_bottom:
+        state, confidence = "DEVELOPING_DOUBLE_BOTTOM", 55
+        signals.append("two_similar_local_lows")
+    elif double_top:
+        state, confidence = "DEVELOPING_DOUBLE_TOP", 55
+        signals.append("two_similar_local_highs")
+    elif range_pct is not None and range_pct <= 12 and support_tests >= 2 and resistance_tests >= 2:
+        state, confidence = "DEVELOPING_RANGE", 55
+        signals.extend(["repeated_support_tests", "repeated_resistance_tests"])
+    elif higher_lows:
+        state, confidence = "DEVELOPING_HIGHER_LOWS", 45
+        signals.append("higher_lows")
+    elif lower_highs:
+        state, confidence = "DEVELOPING_LOWER_HIGHS", 45
+        signals.append("lower_highs")
+
+    return {
+        "state": state, "confidence": confidence, "developing": developing,
+        "sample_count": len(points), "method": "15m_snapshot_proxy",
+        "volume_confirmed": volume_confirmed, "support": support,
+        "resistance": resistance, "range_pct": range_pct,
+        "support_tests": support_tests, "resistance_tests": resistance_tests,
+        "signals": signals,
+    }
+
+
+def classify_evm_snapshot(snapshot, previous=None, history=None):
+    """Conservative multi-horizon research state; never an execution recommendation."""
+    history = history or ([previous] if previous else [])
     liquidity = snapshot.get("liquidity_usd")
     volume_h1 = snapshot.get("volume_h1_usd")
     buys = snapshot.get("buys_h1")
@@ -2895,6 +3072,15 @@ def classify_evm_snapshot(snapshot, previous):
         (buys or 0) + (sells or 0)
         if buys is not None or sells is not None else None
     )
+    horizons = calculate_evm_horizons(snapshot, history)
+    structure = analyse_evm_structure(snapshot, history)
+    liquidity_tier = evm_liquidity_tier(liquidity)
+    wallet_quality = {
+        "coverage": "holder_count_only",
+        "classification": "unresolved",
+        "excluded_wallet_types": [],
+        "note": "Address-level holder data is required for router, pool, bridge and deployer filtering.",
+    }
 
     momentum_score = 0
     risk_score = 0
@@ -2936,6 +3122,15 @@ def classify_evm_snapshot(snapshot, previous):
     if snapshot.get("data_quality") == "unavailable":
         risk_score += 20
         reasons.append("providers_unavailable")
+    if liquidity_tier == "THIN":
+        risk_score += 30
+        reasons.append("thin_liquidity")
+    if structure["state"] == "CONFIRMED_BREAKOUT":
+        momentum_score += 25
+        reasons.append("snapshot_proxy_breakout_with_volume")
+    elif structure["state"] == "CONFIRMED_BREAKDOWN":
+        risk_score += 40
+        reasons.append("snapshot_proxy_breakdown_with_volume")
 
     momentum_eligible = True
     if liquidity is None or liquidity < EVM_MIN_MOMENTUM_LIQUIDITY_USD:
@@ -2948,12 +3143,49 @@ def classify_evm_snapshot(snapshot, previous):
         momentum_eligible = False
         reasons.append("momentum_gate_small_transaction_sample")
 
-    if risk_score >= 50:
+    price_1h = horizons["1h"]["price_change_pct"]
+    price_6h = horizons["6h"]["price_change_pct"]
+    price_24h = horizons["24h"]["price_change_pct"]
+    holders_24h = horizons["24h"]["holder_change"]
+    liquidity_24h = horizons["24h"]["liquidity_change_pct"]
+    rebound = bool(
+        price_1h is not None and price_24h is not None
+        and price_1h >= 5 and price_24h <= -10
+    )
+    distribution = bool(
+        (price_24h is not None and price_24h <= -8 and holders_24h is not None and holders_24h < 0)
+        or (liquidity_24h is not None and liquidity_24h <= -15)
+    )
+    holder_growth_floor = max(
+        10, int((snapshot.get("holder_count") or 0) * 0.001)
+    )
+    accumulation_watch = bool(
+        momentum_eligible and holders_24h is not None
+        and holders_24h >= holder_growth_floor
+        and price_24h is not None and -15 <= price_24h <= 8
+    )
+
+    if risk_score >= 50 and structure["state"] != "CONFIRMED_BREAKDOWN":
         status = "EVM_RISK"
+    elif structure["state"] == "CONFIRMED_BREAKDOWN":
+        status = "EVM_CONFIRMED_BREAKDOWN"
+    elif liquidity_tier == "THIN":
+        status = "EVM_THIN_LIQUIDITY"
+    elif distribution:
+        status = "EVM_DISTRIBUTION"
+        reasons.append("multi_horizon_distribution_evidence")
+    elif rebound:
+        status = "EVM_REBOUND"
+        reasons.append("short_rebound_inside_24h_decline")
+    elif structure["state"] == "CONFIRMED_BREAKOUT" and momentum_eligible:
+        status = "EVM_CONFIRMED_BREAKOUT"
     elif momentum_eligible and previous and momentum_score >= 70 and holder_change is not None:
         status = "EVM_HIGH_MOMENTUM"
     elif momentum_eligible and momentum_score >= 45:
         status = "EVM_MOMENTUM"
+    elif accumulation_watch:
+        status = "EVM_ACCUMULATION_WATCH"
+        reasons.extend(["holder_growth_with_non_extended_price", "wallet_validation_required"])
     else:
         status = "EVM_OBSERVE"
     return {
@@ -2965,17 +3197,25 @@ def classify_evm_snapshot(snapshot, previous):
         "buy_sell_ratio": buy_sell,
         "transaction_count_h1": transaction_count,
         "momentum_eligible": momentum_eligible,
+        "liquidity_tier": liquidity_tier,
+        "structure_state": structure["state"],
+        "structure_confidence": structure["confidence"],
+        "structure_details": structure,
+        "horizon_metrics": horizons,
+        "wallet_quality": wallet_quality,
     }
 
 
 def format_evm_notification(signal, *, test=False):
-    heading = "TEST — V4.8 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
+    heading = "TEST — V4.9 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
     return "\n".join([
         heading,
         f"Token: {signal.get('token_symbol') or 'Unknown'}",
         f"Address: {signal.get('token_address') or 'test-only'}",
         f"Momentum score: {signal.get('momentum_score', 0)}/100",
         f"Risk score: {signal.get('risk_score', 0)}/100",
+        f"Liquidity tier: {signal.get('liquidity_tier', 'UNKNOWN')}",
+        f"Structure: {signal.get('structure_state', 'COLLECTING')} ({signal.get('structure_confidence', 0)}%)",
         f"Data quality: {signal.get('data_quality', 'partial')}",
         f"Reasons: {', '.join(signal.get('reasons') or ['baseline observation'])}",
         "ROBINHOOD CHAIN — PAPER RESEARCH ONLY; not a trade instruction.",
@@ -2992,21 +3232,30 @@ def queue_and_deliver_evm_notification(signal, event_key, *, test=False):
     return result
 
 
-def previous_evm_snapshot(chain, address):
+def evm_snapshot_history(chain, address, hours=26):
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT liquidity_usd, holder_count FROM evm_token_snapshots
+                SELECT price_usd, liquidity_usd, volume_h1_usd, buys_h1,
+                    sells_h1, holder_count, captured_at
+                FROM evm_token_snapshots
                 WHERE chain = %s AND token_address = %s
-                ORDER BY captured_at DESC LIMIT 1
-            """, (chain, address))
-            row = cur.fetchone()
-    return None if not row else {"liquidity_usd": row[0], "holder_count": row[1]}
+                    AND captured_at >= NOW() - (%s * INTERVAL '1 hour')
+                ORDER BY captured_at DESC LIMIT 192
+            """, (chain, address, hours))
+            rows = cur.fetchall()
+    return [{
+        "price_usd": row[0], "liquidity_usd": row[1],
+        "volume_h1_usd": row[2], "buys_h1": row[3], "sells_h1": row[4],
+        "holder_count": row[5], "captured_at": row[6],
+    } for row in rows]
 
 
 def persist_evm_snapshot(snapshot):
-    previous = previous_evm_snapshot(snapshot["chain"], snapshot["token_address"])
-    classification = classify_evm_snapshot(snapshot, previous)
+    snapshot["captured_at"] = snapshot.get("captured_at") or datetime.now(timezone.utc)
+    history = evm_snapshot_history(snapshot["chain"], snapshot["token_address"])
+    previous = history[0] if history else None
+    classification = classify_evm_snapshot(snapshot, previous, history)
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -3043,9 +3292,14 @@ def persist_evm_snapshot(snapshot):
                 INSERT INTO evm_token_signals (
                     chain, token_address, token_symbol, status, momentum_score,
                     risk_score, reasons, holder_change_pct, liquidity_change_pct,
-                    volume_liquidity_ratio, buy_sell_ratio, latest_snapshot_id,
+                    volume_liquidity_ratio, buy_sell_ratio, liquidity_tier,
+                    structure_state, structure_confidence, structure_details,
+                    horizon_metrics, wallet_quality, latest_snapshot_id,
                     data_quality, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                )
                 ON CONFLICT (chain, token_address) DO UPDATE SET
                     token_symbol = EXCLUDED.token_symbol, status = EXCLUDED.status,
                     momentum_score = EXCLUDED.momentum_score,
@@ -3054,6 +3308,12 @@ def persist_evm_snapshot(snapshot):
                     liquidity_change_pct = EXCLUDED.liquidity_change_pct,
                     volume_liquidity_ratio = EXCLUDED.volume_liquidity_ratio,
                     buy_sell_ratio = EXCLUDED.buy_sell_ratio,
+                    liquidity_tier = EXCLUDED.liquidity_tier,
+                    structure_state = EXCLUDED.structure_state,
+                    structure_confidence = EXCLUDED.structure_confidence,
+                    structure_details = EXCLUDED.structure_details,
+                    horizon_metrics = EXCLUDED.horizon_metrics,
+                    wallet_quality = EXCLUDED.wallet_quality,
                     latest_snapshot_id = EXCLUDED.latest_snapshot_id,
                     data_quality = EXCLUDED.data_quality, updated_at = NOW()
             """, (
@@ -3062,6 +3322,11 @@ def persist_evm_snapshot(snapshot):
                 classification["risk_score"], json.dumps(classification["reasons"]),
                 classification["holder_change_pct"], classification["liquidity_change_pct"],
                 classification["volume_liquidity_ratio"], classification["buy_sell_ratio"],
+                classification["liquidity_tier"], classification["structure_state"],
+                classification["structure_confidence"],
+                json.dumps(classification["structure_details"]),
+                json.dumps(classification["horizon_metrics"]),
+                json.dumps(classification["wallet_quality"]),
                 snapshot_id, snapshot["data_quality"],
             ))
             history_id = None
@@ -3697,7 +3962,7 @@ def watchlist_endpoint():
         })
     return jsonify({
         "success": True, "count": len(items), "tokens": items,
-        "note": "V4.8 contract monitoring is live for Robinhood Chain ERC-20 assets; native ETH remains the benchmark.",
+        "note": "V4.9 evidence monitoring is live for Robinhood Chain ERC-20 assets; native ETH remains the benchmark.",
         "paper_mode": True, "actionable": False,
     })
 
@@ -3748,7 +4013,9 @@ EVM_SIGNAL_SELECT = """
         s.volume_liquidity_ratio, s.buy_sell_ratio,
         s.data_quality, s.updated_at, p.price_usd, p.liquidity_usd,
         p.market_cap_usd, p.volume_h1_usd, p.price_change_h1_pct,
-        p.holder_count, p.pair_address, p.captured_at
+        p.holder_count, p.pair_address, p.captured_at,
+        s.liquidity_tier, s.structure_state, s.structure_confidence,
+        s.structure_details, s.horizon_metrics, s.wallet_quality
     FROM evm_token_signals s
     LEFT JOIN evm_token_snapshots p ON p.id = s.latest_snapshot_id
 """
@@ -3759,6 +4026,11 @@ def serialize_evm_signal(row):
         reasons = json.loads(row[6] or "[]")
     except (TypeError, ValueError):
         reasons = []
+    def parsed_json(index, fallback):
+        try:
+            return json.loads(row[index] or json.dumps(fallback))
+        except (TypeError, ValueError):
+            return fallback
     return {
         "chain": row[0], "chain_id": ROBINHOOD_CHAIN_ID,
         "token_address": row[1], "token_symbol": row[2], "status": row[3],
@@ -3770,6 +4042,12 @@ def serialize_evm_signal(row):
         "volume_h1_usd": row[16], "price_change_h1_pct": row[17],
         "holder_count": row[18], "pair_address": row[19],
         "captured_at": row[20], "paper_mode": True, "actionable": False,
+        "liquidity_tier": row[21] or "UNKNOWN",
+        "structure_state": row[22] or "COLLECTING",
+        "structure_confidence": row[23] or 0,
+        "structure_details": parsed_json(24, {}),
+        "horizon_metrics": parsed_json(25, {}),
+        "wallet_quality": parsed_json(26, {}),
     }
 
 
@@ -3847,6 +4125,33 @@ def evm_signals_endpoint():
     })
 
 
+@app.get("/evm-evidence")
+def evm_evidence_endpoint():
+    """Read-only V4.9 evidence summary for calibration and review."""
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(EVM_SIGNAL_SELECT + " ORDER BY s.token_symbol")
+            signals = [serialize_evm_signal(row) for row in cur.fetchall()]
+    status_counts = {}
+    tier_counts = {}
+    structure_counts = {}
+    for signal in signals:
+        status_counts[signal["status"]] = status_counts.get(signal["status"], 0) + 1
+        tier = signal["liquidity_tier"]
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        structure = signal["structure_state"]
+        structure_counts[structure] = structure_counts.get(structure, 0) + 1
+    return jsonify({
+        "success": True, "version": VERSION, "generated_at": datetime.now(timezone.utc),
+        "status_counts": status_counts, "liquidity_tier_counts": tier_counts,
+        "structure_counts": structure_counts, "signals": signals,
+        "wallet_quality_coverage": "holder_count_only",
+        "chart_method": "15-minute snapshot proxy; not OHLC candles",
+        "paper_mode": True, "actionable": False,
+    })
+
+
 @app.get("/evm-token/<token_address>")
 def evm_token_detail_endpoint(token_address):
     valid_address = (
@@ -3866,10 +4171,11 @@ def evm_token_detail_endpoint(token_address):
             cur.execute("""
                 SELECT id, price_usd, liquidity_usd, market_cap_usd,
                     volume_h1_usd, price_change_h1_pct, holder_count,
-                    data_quality, provider_errors, captured_at
+                    data_quality, provider_errors, captured_at,
+                    buys_h1, sells_h1, volume_h24_usd, price_change_h24_pct
                 FROM evm_token_snapshots
                 WHERE LOWER(token_address) = LOWER(%s)
-                ORDER BY captured_at DESC LIMIT 48
+                ORDER BY captured_at DESC LIMIT 192
             """, (token_address,))
             snapshots = cur.fetchall()
     if not row:
@@ -3882,6 +4188,8 @@ def evm_token_detail_endpoint(token_address):
             "price_change_h1_pct": item[5], "holder_count": item[6],
             "data_quality": item[7],
             "provider_errors": json.loads(item[8] or "[]"), "captured_at": item[9],
+            "buys_h1": item[10], "sells_h1": item[11],
+            "volume_h24_usd": item[12], "price_change_h24_pct": item[13],
         } for item in snapshots],
         "paper_mode": True, "actionable": False,
     })
@@ -4339,19 +4647,19 @@ DASHBOARD_HTML = r"""<!doctype html>
     .wrap{max-width:1460px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:22px}.eyebrow{color:var(--blue);font-weight:700;letter-spacing:.14em;text-transform:uppercase;font-size:11px}h1{font-size:30px;margin:5px 0 4px}.sub,.muted{color:var(--muted)}.live{display:flex;align-items:center;gap:8px;background:#102d2a;border:1px solid #1d5d4d;color:#77e4bd;padding:9px 13px;border-radius:999px}.dot{width:8px;height:8px;background:var(--green);border-radius:50%;box-shadow:0 0 12px var(--green)}
     .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}.card,.section{background:linear-gradient(145deg,rgba(19,36,58,.96),rgba(12,25,42,.96));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 40px rgba(0,0,0,.16)}.card{padding:18px}.card b{display:block;font-size:25px;margin-top:4px}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
     .section{padding:18px;margin-bottom:20px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.section h2{font-size:18px;margin:0}.links a{color:var(--blue);text-decoration:none;margin-left:14px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1040px}th{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:11px 10px;border-bottom:1px solid var(--line)}td{padding:13px 10px;border-bottom:1px solid rgba(36,54,77,.7);white-space:nowrap}tbody tr:hover{background:rgba(85,167,255,.04)}.token{font-weight:750}.address{font:11px ui-monospace,SFMono-Regular,Consolas;color:var(--muted)}
-    .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:700;font-size:11px}.observe{background:#19304b;color:#9ecbff}.momentum{background:#123b31;color:#67e6b8}.high{background:#294320;color:#b4ef79}.risk{background:#4a2028;color:#ff9aaa}.expired{background:#29313d;color:#aab5c3}.pos{color:var(--green)}.neg{color:var(--red)}.neutral{color:var(--muted)}.warning{margin-top:18px;padding:12px 15px;border:1px solid #54421f;background:#2a2415;color:#f2cf82;border-radius:12px}.empty{text-align:center;color:var(--muted);padding:24px}.error{border-color:#68303a;background:#321820;color:#ff9aaa}.footer{color:var(--muted);font-size:12px;text-align:center;padding:8px}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:700;font-size:11px}.observe{background:#19304b;color:#9ecbff}.momentum,.accumulation{background:#123b31;color:#67e6b8}.high{background:#294320;color:#b4ef79}.risk,.distribution{background:#4a2028;color:#ff9aaa}.thin,.rebound{background:#4a381d;color:#ffd27d}.expired{background:#29313d;color:#aab5c3}.pos{color:var(--green)}.neg{color:var(--red)}.neutral{color:var(--muted)}.warning{margin-top:18px;padding:12px 15px;border:1px solid #54421f;background:#2a2415;color:#f2cf82;border-radius:12px}.empty{text-align:center;color:var(--muted);padding:24px}.error{border-color:#68303a;background:#321820;color:#ff9aaa}.footer{color:var(--muted);font-size:12px;text-align:center;padding:8px}
     @media(max-width:800px){.wrap{padding:18px}.top{display:block}.live{margin-top:14px;width:max-content}.cards{grid-template-columns:repeat(2,1fr)}h1{font-size:25px}.section-head{align-items:flex-start;flex-direction:column}.links a{margin:0 14px 0 0}}
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.8 Premium · Research Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + Robinhood Chain contract monitoring</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.9 Premium · Evidence Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + multi-horizon Robinhood Chain evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain</span></div>
-    <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Momentum or risk</span></div>
+    <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
     <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
   </section>
-  <section class="section"><div class="section-head"><div><h2>Robinhood Chain watchlist</h2><div class="muted">Current contract state and rolling snapshot changes</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-snapshots?limit=100">Snapshots</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>State</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Robinhood Chain watchlist</h2><div class="muted">Liquidity tiers, multi-horizon evidence and snapshot-proxy chart structure</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-snapshots?limit=100">Snapshots</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="12" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana paper signals</h2><div class="muted">Relationship-aware wallet consensus; execution remains disabled</div></div><div class="links"><a href="/signals">JSON signals</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Status</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Updated</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <div class="warning">Paper research only. Signals are observations—not trade instructions—and token safety remains unverified.</div><div class="footer" id="footer">Auto-refreshes every 60 seconds.</div>
 </main><script>
@@ -4360,10 +4668,10 @@ const money=v=>v==null?'—':new Intl.NumberFormat('en-US',{style:'currency',cur
 const num=v=>v==null?'—':new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(v);
 const trend=v=>v==null?'<span class="neutral">collecting</span>':`<span class="${v>0?'pos':v<0?'neg':'neutral'}">${v>0?'+':''}${num(v)}%</span>`;
 const when=v=>v?new Date(v).toLocaleString():'—';
-const badge=s=>{const c=s==='EVM_RISK'?'risk':s==='EVM_HIGH_MOMENTUM'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
+const badge=s=>{const c=s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
 document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
-document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></td><td>${badge(x.status)}</td><td>${money(x.price_usd)}</td><td>${money(x.liquidity_usd)}</td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No EVM snapshots yet.</td></tr>';
+document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="12" class="empty">No EVM snapshots yet.</td></tr>';
 document.getElementById('solBody').innerHTML=d.solana_signals.length?d.solana_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol||'Unknown')}</div><div class="address">${esc((x.token_address||'').slice(0,10))}…</div></td><td>${badge(x.status)}</td><td>${num(x.buy_score)}</td><td>${num(x.sell_score)}</td><td>${num(x.independent_buy_clusters)}</td><td>${num(x.independent_sell_clusters)}</td><td>${esc(x.safety_status)}</td><td>${when(x.updated_at)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">No Solana paper signals yet.</td></tr>';
 document.getElementById('footer').textContent=`${esc(d.version)} · generated ${when(d.generated_at)} · auto-refreshes every 60 seconds.`;
 }catch(e){document.getElementById('refreshState').textContent='Dashboard data unavailable';document.querySelector('.warning').classList.add('error');document.querySelector('.warning').textContent='Could not load dashboard data. The monitoring APIs continue running independently.';}}
