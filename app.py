@@ -15,7 +15,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.9.0-paper-evidence"
+VERSION = "4.10.0-paper-multichain"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -41,6 +41,23 @@ HELIUS_WEBHOOKS_URL = "https://mainnet.helius-rpc.com/v0/webhooks"
 ROBINHOOD_CHAIN_ID = 4663
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 ROBINHOOD_BLOCKSCOUT_URL = "https://robinhoodchain.blockscout.com/api/v2"
+EVM_CHAIN_CONFIG = {
+    "robinhood": {
+        "chain_id": ROBINHOOD_CHAIN_ID,
+        "label": "Robinhood Chain",
+        "dex_chain_ids": {"robinhood", str(ROBINHOOD_CHAIN_ID)},
+        "blockscout_url": ROBINHOOD_BLOCKSCOUT_URL,
+        "explorer_url": "https://robinhoodchain.blockscout.com/token/{address}",
+    },
+    "base": {
+        "chain_id": 8453,
+        "label": "Base",
+        "dex_chain_ids": {"base", "8453"},
+        "blockscout_url": "https://base.blockscout.com/api/v2",
+        "explorer_url": "https://base.blockscout.com/token/{address}",
+    },
+}
+SUPPORTED_EVM_CHAINS = tuple(EVM_CHAIN_CONFIG)
 EVM_REFRESH_MAX_SECONDS = min(
     max(int(os.getenv("EVM_REFRESH_MAX_SECONDS", "55")), 15), 75
 )
@@ -97,6 +114,8 @@ DEFAULT_TOKEN_WATCHLIST = (
     ("robinhood", "0x020bfC650A365f8BB26819deAAbF3E21291018b4", "CASHCAT", "Cash Cat", "portfolio", "evm_monitoring_ready"),
     ("robinhood", "0xfd181632e1F2335DaB74535E6dD29082d3191bb2", "RFLX", "RFLIX", "portfolio", "evm_monitoring_ready"),
     ("robinhood", "0xeC45C6C413b498Cf5aCF5a1a889F1a95cA9b6bB3", "PORTLY", "PORTLY", "existing_test_case", "evm_monitoring_ready"),
+    ("robinhood", "0x298348d5b2e45C774E3ee4f1a0924071DfbDC8C7", "SWAPPY", "Swappy", "research_test_case", "evm_monitoring_ready"),
+    ("base", "0xA4A2E2ca3fBfE21aed83471D28b6f65A233C6e00", "TIBBIR", "Ribbita by Virtuals", "research_test_case", "evm_monitoring_ready"),
 )
 BASE58_ALPHABET = (
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -1132,7 +1151,7 @@ def persist_token_validation(wallet, rows):
 @app.get("/")
 def home():
     return jsonify({
-        "service": "Solana Smart Wallet + Robinhood Chain Contract Monitor",
+        "service": "Solana Smart Wallet + Multi-chain EVM Evidence Monitor",
         "status": "online",
         "version": VERSION,
         "mode": "relationship-aware Solana consensus plus EVM contract paper tracking",
@@ -1181,7 +1200,10 @@ def diagnostics():
                     "admin_key_configured": bool(os.getenv("ADMIN_API_KEY")),
                     "telegram_configured": bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID")),
                     "telegram_alert_statuses": sorted(TELEGRAM_ALERT_STATUSES),
-                    "evm_chain_id": ROBINHOOD_CHAIN_ID,
+                    "evm_chain_ids": {
+                        chain: config["chain_id"] for chain, config in EVM_CHAIN_CONFIG.items()
+                    },
+                    "evm_supported_chains": list(SUPPORTED_EVM_CHAINS),
                     "evm_refresh_max_seconds": EVM_REFRESH_MAX_SECONDS,
                     "evm_alert_statuses": sorted(EVM_ALERT_STATUSES),
                     "evm_min_momentum_liquidity_usd": EVM_MIN_MOMENTUM_LIQUIDITY_USD,
@@ -2780,7 +2802,7 @@ def queue_and_deliver_signal_notification(signal, event_key, *, test=False):
 
 
 # =========================================================
-# V4.9 ROBINHOOD CHAIN EVIDENCE MONITORING
+# V4.10 MULTI-CHAIN EVM EVIDENCE MONITORING
 # =========================================================
 
 def safe_float(value):
@@ -2803,11 +2825,15 @@ def percentage_change(current, previous):
     return ((current - previous) / abs(previous)) * 100.0
 
 
-def fetch_robinhood_token_snapshot(token):
-    """Fetch one bounded market/holder snapshot without wallet custody access."""
+def fetch_evm_token_snapshot(token):
+    """Fetch one bounded market/holder snapshot for a configured EVM chain."""
     address = token[1]
+    chain = str(token[0]).lower()
+    config = EVM_CHAIN_CONFIG.get(chain)
+    if not config:
+        raise ValueError("unsupported_evm_chain")
     snapshot = {
-        "chain": token[0], "token_address": address,
+        "chain": chain, "token_address": address,
         "token_symbol": token[2], "provider_errors": [],
     }
     market_ok = False
@@ -2822,15 +2848,16 @@ def fetch_robinhood_token_snapshot(token):
             payload = response.json()
             pairs = payload.get("pairs") if isinstance(payload, dict) else []
             pairs = pairs if isinstance(pairs, list) else []
-            robinhood_pairs = [
-                pair for pair in pairs if isinstance(pair, dict) and (
-                    "robinhood" in str(pair.get("chainId") or "").lower()
-                    or str(pair.get("chainId") or "") == str(ROBINHOOD_CHAIN_ID)
-                )
+            chain_pairs = [
+                pair for pair in pairs
+                if isinstance(pair, dict)
+                and str(pair.get("chainId") or "").lower() in config["dex_chain_ids"]
+                and str((pair.get("baseToken") or {}).get("address") or "").lower()
+                == address.lower()
             ]
-            if robinhood_pairs:
+            if chain_pairs:
                 pair = max(
-                    robinhood_pairs,
+                    chain_pairs,
                     key=lambda item: safe_float((item.get("liquidity") or {}).get("usd")) or 0,
                 )
                 transactions = pair.get("txns") or {}
@@ -2852,7 +2879,7 @@ def fetch_robinhood_token_snapshot(token):
                 })
                 market_ok = True
             else:
-                snapshot["provider_errors"].append("dexscreener_no_robinhood_pair")
+                snapshot["provider_errors"].append(f"dexscreener_no_{chain}_base_pair")
         else:
             snapshot["provider_errors"].append(f"dexscreener_http_{response.status_code}")
     except (requests.RequestException, ValueError, TypeError) as exc:
@@ -2860,7 +2887,7 @@ def fetch_robinhood_token_snapshot(token):
 
     try:
         response = upstream_request(
-            "GET", f"{ROBINHOOD_BLOCKSCOUT_URL}/tokens/{address}",
+            "GET", f"{config['blockscout_url']}/tokens/{address}",
             timeout=10, retries=0, provider="blockscout",
         )
         if response.status_code == 200:
@@ -3207,10 +3234,13 @@ def classify_evm_snapshot(snapshot, previous=None, history=None):
 
 
 def format_evm_notification(signal, *, test=False):
-    heading = "TEST — V4.9 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
+    heading = "TEST — V4.10 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
+    chain = str(signal.get("chain") or "robinhood").lower()
+    chain_label = EVM_CHAIN_CONFIG.get(chain, {}).get("label", chain.title())
     return "\n".join([
         heading,
         f"Token: {signal.get('token_symbol') or 'Unknown'}",
+        f"Chain: {chain_label}",
         f"Address: {signal.get('token_address') or 'test-only'}",
         f"Momentum score: {signal.get('momentum_score', 0)}/100",
         f"Risk score: {signal.get('risk_score', 0)}/100",
@@ -3218,7 +3248,7 @@ def format_evm_notification(signal, *, test=False):
         f"Structure: {signal.get('structure_state', 'COLLECTING')} ({signal.get('structure_confidence', 0)}%)",
         f"Data quality: {signal.get('data_quality', 'partial')}",
         f"Reasons: {', '.join(signal.get('reasons') or ['baseline observation'])}",
-        "ROBINHOOD CHAIN — PAPER RESEARCH ONLY; not a trade instruction.",
+        "MULTI-CHAIN EVM — PAPER RESEARCH ONLY; not a trade instruction.",
     ])
 
 
@@ -3372,16 +3402,16 @@ def persist_evm_snapshot(snapshot):
     return result
 
 
-def refresh_evm_watchlist(limit=6, offset=0):
+def refresh_evm_watchlist(limit=10, offset=0):
     initialise_database()
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT chain, token_address, token_symbol, token_name
                 FROM token_watchlist
-                WHERE active = TRUE AND chain = 'robinhood'
+                WHERE active = TRUE AND chain IN ('robinhood', 'base')
                     AND token_address LIKE '0x%%'
-                ORDER BY token_symbol LIMIT %s OFFSET %s
+                ORDER BY chain, token_symbol LIMIT %s OFFSET %s
             """, (limit, offset))
             tokens = cur.fetchall()
             cur.execute("""
@@ -3400,7 +3430,7 @@ def refresh_evm_watchlist(limit=6, offset=0):
             stopped_reason = "deadline_guard"
             break
         try:
-            snapshot = fetch_robinhood_token_snapshot(token)
+            snapshot = fetch_evm_token_snapshot(token)
             if snapshot["data_quality"] == "unavailable":
                 diagnostic_increment("evm_refresh_failures")
             result = persist_evm_snapshot(snapshot)
@@ -3426,10 +3456,15 @@ def refresh_evm_watchlist(limit=6, offset=0):
             ))
         conn.commit()
     diagnostic_increment("evm_refreshes")
+    chain_counts = {}
+    for item in results:
+        chain = item.get("chain") or "unknown"
+        chain_counts[chain] = chain_counts.get(chain, 0) + 1
     return {
         "success": status == "complete", "run_id": run_id,
         "selected": len(tokens), "processed": len(results),
         "transitions": transitions, "stopped_reason": stopped_reason,
+        "chain_counts": chain_counts,
         "results": results,
     }
 
@@ -3951,10 +3986,12 @@ def watchlist_endpoint():
     items = []
     for row in rows:
         explorer_url = None
-        if row[0] == "robinhood" and row[1].startswith("0x"):
-            explorer_url = f"https://robinhoodchain.blockscout.com/token/{row[1]}"
+        config = EVM_CHAIN_CONFIG.get(row[0])
+        if config and row[1].startswith("0x"):
+            explorer_url = config["explorer_url"].format(address=row[1])
         items.append({
-            "chain": row[0], "chain_id": 4663 if row[0] == "robinhood" else None,
+            "chain": row[0], "chain_id": config["chain_id"] if config else None,
+            "chain_label": config["label"] if config else row[0].title(),
             "token_address": row[1], "token_symbol": row[2],
             "token_name": row[3], "source": row[4],
             "monitoring_status": row[5], "active": row[6],
@@ -3962,7 +3999,7 @@ def watchlist_endpoint():
         })
     return jsonify({
         "success": True, "count": len(items), "tokens": items,
-        "note": "V4.9 evidence monitoring is live for Robinhood Chain ERC-20 assets; native ETH remains the benchmark.",
+        "note": "V4.10 evidence monitoring supports Robinhood Chain and Base ERC-20 assets; native ETH remains a benchmark.",
         "paper_mode": True, "actionable": False,
     })
 
@@ -3983,7 +4020,12 @@ def add_watchlist_token_endpoint():
         len(address) == 42 and address.startswith("0x")
         and all(character in "0123456789abcdefABCDEF" for character in address[2:])
     )
-    if not chain or not symbol or not (valid_evm_address or address.startswith("native:")):
+    if chain not in EVM_CHAIN_CONFIG:
+        return jsonify({
+            "success": False, "error": "Unsupported EVM chain",
+            "supported_chains": list(SUPPORTED_EVM_CHAINS),
+        }), 400
+    if not symbol or not (valid_evm_address or address.startswith("native:")):
         return jsonify({"success": False, "error": "Valid chain, token symbol and token address are required"}), 400
     with db() as conn:
         with conn.cursor() as cur:
@@ -4031,8 +4073,10 @@ def serialize_evm_signal(row):
             return json.loads(row[index] or json.dumps(fallback))
         except (TypeError, ValueError):
             return fallback
+    config = EVM_CHAIN_CONFIG.get(row[0], {})
     return {
-        "chain": row[0], "chain_id": ROBINHOOD_CHAIN_ID,
+        "chain": row[0], "chain_id": config.get("chain_id"),
+        "chain_label": config.get("label", str(row[0]).title()),
         "token_address": row[1], "token_symbol": row[2], "status": row[3],
         "momentum_score": row[4], "risk_score": row[5], "reasons": reasons,
         "holder_change_pct": row[7], "liquidity_change_pct": row[8],
@@ -4058,7 +4102,7 @@ def refresh_evm_watchlist_endpoint():
     if not admin_authorized():
         return jsonify({"success": False, "error": "Unauthorized"}), 401
     try:
-        limit = min(max(int(request.args.get("limit", 6)), 1), 10)
+        limit = min(max(int(request.args.get("limit", 10)), 1), 10)
         offset = max(int(request.args.get("offset", 0)), 0)
     except ValueError:
         return jsonify({"success": False, "error": "limit and offset must be integers"}), 400
@@ -4080,17 +4124,26 @@ def evm_status_endpoint():
             """)
             counts = {row[0]: row[1] for row in cur.fetchall()}
             cur.execute("""
+                SELECT chain, status, COUNT(*) FROM evm_token_signals
+                GROUP BY chain, status ORDER BY chain, status
+            """)
+            chain_signal_counts = {}
+            for chain, status, count in cur.fetchall():
+                chain_signal_counts.setdefault(chain, {})[status] = count
+            cur.execute("""
                 SELECT id, started_at, completed_at, tokens_selected,
                     snapshots_created, transitions_created, status, details
                 FROM evm_refresh_runs ORDER BY id DESC LIMIT 1
             """)
             row = cur.fetchone()
             cur.execute("""
-                SELECT COUNT(*) FROM token_watchlist
-                WHERE active = TRUE AND chain = 'robinhood'
+                SELECT chain, COUNT(*) FROM token_watchlist
+                WHERE active = TRUE AND chain IN ('robinhood', 'base')
                     AND token_address LIKE '0x%%'
+                GROUP BY chain
             """)
-            tracked_contracts = cur.fetchone()[0]
+            tracked_by_chain = {chain: count for chain, count in cur.fetchall()}
+            tracked_contracts = sum(tracked_by_chain.values())
     latest_run = None if not row else {
         "id": row[0], "started_at": row[1], "completed_at": row[2],
         "tokens_selected": row[3], "snapshots_created": row[4],
@@ -4098,8 +4151,19 @@ def evm_status_endpoint():
         "details": json.loads(row[7] or "{}"),
     }
     return jsonify({
-        "success": True, "version": VERSION, "chain": "robinhood",
-        "chain_id": ROBINHOOD_CHAIN_ID, "tracked_contracts": tracked_contracts,
+        "success": True, "version": VERSION, "chain": "multi", "chain_id": None,
+        "chain_ids": {
+            chain: config["chain_id"] for chain, config in EVM_CHAIN_CONFIG.items()
+        },
+        "chains": {
+            chain: {
+                "chain_id": config["chain_id"], "label": config["label"],
+                "tracked_contracts": tracked_by_chain.get(chain, 0),
+                "signal_counts": chain_signal_counts.get(chain, {}),
+            }
+            for chain, config in EVM_CHAIN_CONFIG.items()
+        },
+        "tracked_contracts": tracked_contracts,
         "signal_counts": counts, "latest_refresh": latest_run,
         "providers": {"market": "DexScreener", "holders": "Blockscout"},
         "paper_mode": True, "actionable": False,
@@ -4110,12 +4174,27 @@ def evm_status_endpoint():
 def evm_signals_endpoint():
     initialise_database()
     status = str(request.args.get("status") or "").strip().upper()
+    chain = str(request.args.get("chain") or "").strip().lower()
+    if chain and chain not in EVM_CHAIN_CONFIG:
+        return jsonify({
+            "success": False, "error": "Unsupported EVM chain",
+            "supported_chains": list(SUPPORTED_EVM_CHAINS),
+        }), 400
+    clauses = []
+    params = []
+    if status:
+        clauses.append("s.status = %s")
+        params.append(status)
+    if chain:
+        clauses.append("s.chain = %s")
+        params.append(chain)
+    query = EVM_SIGNAL_SELECT
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY s.updated_at DESC"
     with db() as conn:
         with conn.cursor() as cur:
-            if status:
-                cur.execute(EVM_SIGNAL_SELECT + " WHERE s.status = %s ORDER BY s.updated_at DESC", (status,))
-            else:
-                cur.execute(EVM_SIGNAL_SELECT + " ORDER BY s.updated_at DESC")
+            cur.execute(query, tuple(params))
             rows = cur.fetchall()
     return jsonify({
         "success": True, "count": len(rows),
@@ -4127,7 +4206,7 @@ def evm_signals_endpoint():
 
 @app.get("/evm-evidence")
 def evm_evidence_endpoint():
-    """Read-only V4.9 evidence summary for calibration and review."""
+    """Read-only V4.10 multi-chain evidence summary for calibration and review."""
     initialise_database()
     with db() as conn:
         with conn.cursor() as cur:
@@ -4136,16 +4215,20 @@ def evm_evidence_endpoint():
     status_counts = {}
     tier_counts = {}
     structure_counts = {}
+    chain_counts = {}
     for signal in signals:
         status_counts[signal["status"]] = status_counts.get(signal["status"], 0) + 1
         tier = signal["liquidity_tier"]
         tier_counts[tier] = tier_counts.get(tier, 0) + 1
         structure = signal["structure_state"]
         structure_counts[structure] = structure_counts.get(structure, 0) + 1
+        chain = signal["chain"]
+        chain_counts[chain] = chain_counts.get(chain, 0) + 1
     return jsonify({
         "success": True, "version": VERSION, "generated_at": datetime.now(timezone.utc),
         "status_counts": status_counts, "liquidity_tier_counts": tier_counts,
-        "structure_counts": structure_counts, "signals": signals,
+        "structure_counts": structure_counts, "chain_counts": chain_counts,
+        "signals": signals,
         "wallet_quality_coverage": "holder_count_only",
         "chart_method": "15-minute snapshot proxy; not OHLC candles",
         "paper_mode": True, "actionable": False,
@@ -4160,23 +4243,40 @@ def evm_token_detail_endpoint(token_address):
     )
     if not valid_address:
         return jsonify({"success": False, "error": "Invalid EVM token address"}), 400
+    chain = str(request.args.get("chain") or "").strip().lower()
+    if chain and chain not in EVM_CHAIN_CONFIG:
+        return jsonify({
+            "success": False, "error": "Unsupported EVM chain",
+            "supported_chains": list(SUPPORTED_EVM_CHAINS),
+        }), 400
     initialise_database()
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                EVM_SIGNAL_SELECT + " WHERE LOWER(s.token_address) = LOWER(%s)",
-                (token_address,),
-            )
+            signal_query = EVM_SIGNAL_SELECT + " WHERE LOWER(s.token_address) = LOWER(%s)"
+            signal_params = [token_address]
+            if chain:
+                signal_query += " AND s.chain = %s"
+                signal_params.append(chain)
+            signal_query += " ORDER BY s.updated_at DESC LIMIT 1"
+            cur.execute(signal_query, tuple(signal_params))
             row = cur.fetchone()
-            cur.execute("""
+            snapshot_query = """
                 SELECT id, price_usd, liquidity_usd, market_cap_usd,
                     volume_h1_usd, price_change_h1_pct, holder_count,
                     data_quality, provider_errors, captured_at,
                     buys_h1, sells_h1, volume_h24_usd, price_change_h24_pct
                 FROM evm_token_snapshots
                 WHERE LOWER(token_address) = LOWER(%s)
-                ORDER BY captured_at DESC LIMIT 192
-            """, (token_address,))
+            """
+            snapshot_params = [token_address]
+            if chain:
+                snapshot_query += " AND chain = %s"
+                snapshot_params.append(chain)
+            elif row:
+                snapshot_query += " AND chain = %s"
+                snapshot_params.append(row[0])
+            snapshot_query += " ORDER BY captured_at DESC LIMIT 192"
+            cur.execute(snapshot_query, tuple(snapshot_params))
             snapshots = cur.fetchall()
     if not row:
         return jsonify({"success": False, "error": "EVM token has no snapshot yet"}), 404
@@ -4203,28 +4303,39 @@ def evm_snapshots_endpoint():
     except ValueError:
         limit = 100
     symbol = str(request.args.get("symbol") or "").strip().upper()
+    chain = str(request.args.get("chain") or "").strip().lower()
+    if chain and chain not in EVM_CHAIN_CONFIG:
+        return jsonify({
+            "success": False, "error": "Unsupported EVM chain",
+            "supported_chains": list(SUPPORTED_EVM_CHAINS),
+        }), 400
+    clauses = []
+    params = []
+    if symbol:
+        clauses.append("token_symbol = %s")
+        params.append(symbol)
+    if chain:
+        clauses.append("chain = %s")
+        params.append(chain)
+    snapshot_query = """
+        SELECT id, chain, token_address, token_symbol, price_usd,
+            liquidity_usd, market_cap_usd, volume_h1_usd,
+            price_change_h1_pct, holder_count, data_quality,
+            provider_errors, captured_at
+        FROM evm_token_snapshots
+    """
+    if clauses:
+        snapshot_query += " WHERE " + " AND ".join(clauses)
+    snapshot_query += " ORDER BY captured_at DESC LIMIT %s"
+    params.append(limit)
     with db() as conn:
         with conn.cursor() as cur:
-            if symbol:
-                cur.execute("""
-                    SELECT id, chain, token_address, token_symbol, price_usd,
-                        liquidity_usd, market_cap_usd, volume_h1_usd,
-                        price_change_h1_pct, holder_count, data_quality,
-                        provider_errors, captured_at
-                    FROM evm_token_snapshots WHERE token_symbol = %s
-                    ORDER BY captured_at DESC LIMIT %s
-                """, (symbol, limit))
-            else:
-                cur.execute("""
-                    SELECT id, chain, token_address, token_symbol, price_usd,
-                        liquidity_usd, market_cap_usd, volume_h1_usd,
-                        price_change_h1_pct, holder_count, data_quality,
-                        provider_errors, captured_at
-                    FROM evm_token_snapshots ORDER BY captured_at DESC LIMIT %s
-                """, (limit,))
+            cur.execute(snapshot_query, tuple(params))
             rows = cur.fetchall()
     return jsonify({"success": True, "count": len(rows), "snapshots": [{
         "id": row[0], "chain": row[1], "token_address": row[2],
+        "chain_id": EVM_CHAIN_CONFIG.get(row[1], {}).get("chain_id"),
+        "chain_label": EVM_CHAIN_CONFIG.get(row[1], {}).get("label", str(row[1]).title()),
         "token_symbol": row[3], "price_usd": row[4], "liquidity_usd": row[5],
         "market_cap_usd": row[6], "volume_h1_usd": row[7],
         "price_change_h1_pct": row[8], "holder_count": row[9],
@@ -4623,6 +4734,7 @@ def build_dashboard_payload():
         "evm_signals": evm_signals, "solana_signals": solana_signals,
         "summary": {
             "evm_tokens": len(evm_signals),
+            "evm_chains": len({item["chain"] for item in evm_signals}),
             "evm_alert_states": sum(
                 1 for item in evm_signals if item["status"] in EVM_ALERT_STATUSES
             ),
@@ -4652,14 +4764,14 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.9 Premium · Evidence Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + multi-horizon Robinhood Chain evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.10 Premium · Multi-chain Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + Robinhood Chain and Base evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
-    <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain</span></div>
+    <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
     <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
   </section>
-  <section class="section"><div class="section-head"><div><h2>Robinhood Chain watchlist</h2><div class="muted">Liquidity tiers, multi-horizon evidence and snapshot-proxy chart structure</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-snapshots?limit=100">Snapshots</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="12" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Liquidity tiers, multi-horizon evidence and snapshot-proxy chart structure</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-snapshots?limit=100">Snapshots</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="12" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana paper signals</h2><div class="muted">Relationship-aware wallet consensus; execution remains disabled</div></div><div class="links"><a href="/signals">JSON signals</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Status</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Updated</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <div class="warning">Paper research only. Signals are observations—not trade instructions—and token safety remains unverified.</div><div class="footer" id="footer">Auto-refreshes every 60 seconds.</div>
 </main><script>
@@ -4671,7 +4783,7 @@ const when=v=>v?new Date(v).toLocaleString():'—';
 const badge=s=>{const c=s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
 document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
-document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="12" class="empty">No EVM snapshots yet.</td></tr>';
+document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="12" class="empty">No EVM snapshots yet.</td></tr>';
 document.getElementById('solBody').innerHTML=d.solana_signals.length?d.solana_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol||'Unknown')}</div><div class="address">${esc((x.token_address||'').slice(0,10))}…</div></td><td>${badge(x.status)}</td><td>${num(x.buy_score)}</td><td>${num(x.sell_score)}</td><td>${num(x.independent_buy_clusters)}</td><td>${num(x.independent_sell_clusters)}</td><td>${esc(x.safety_status)}</td><td>${when(x.updated_at)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">No Solana paper signals yet.</td></tr>';
 document.getElementById('footer').textContent=`${esc(d.version)} · generated ${when(d.generated_at)} · auto-refreshes every 60 seconds.`;
 }catch(e){document.getElementById('refreshState').textContent='Dashboard data unavailable';document.querySelector('.warning').classList.add('error');document.querySelector('.warning').textContent='Could not load dashboard data. The monitoring APIs continue running independently.';}}
@@ -4829,6 +4941,7 @@ def run_evm_refresh_once():
         "success": result["success"], "version": VERSION,
         "run_id": result["run_id"], "selected": result["selected"],
         "processed": result["processed"], "transitions": result["transitions"],
+        "chain_counts": result.get("chain_counts", {}),
         "stopped_reason": result["stopped_reason"], "mode": "evm_cron_once",
     }))
     return 0 if result["success"] else 1
