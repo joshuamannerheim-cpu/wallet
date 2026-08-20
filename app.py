@@ -15,7 +15,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.10.0-paper-multichain"
+VERSION = "4.10.1-paper-data-integrity"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -77,6 +77,12 @@ EVM_MIN_MOMENTUM_H1_VOLUME_USD = max(
 EVM_MIN_MOMENTUM_H1_TRANSACTIONS = max(
     int(os.getenv("EVM_MIN_MOMENTUM_H1_TRANSACTIONS", "10")), 1
 )
+EVM_ANOMALY_PRICE_RATIO = max(
+    float(os.getenv("EVM_ANOMALY_PRICE_RATIO", "5")), 2.0
+)
+EVM_ANOMALY_LIQUIDITY_RATIO = max(
+    float(os.getenv("EVM_ANOMALY_LIQUIDITY_RATIO", "4")), 2.0
+)
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL", "https://wallet-production-3b7b.up.railway.app"
 ).rstrip("/")
@@ -129,6 +135,7 @@ _diagnostics = {"birdeye_requests": 0, "helius_requests": 0,
                 "helius_syncs": 0, "helius_sync_failures": 0,
                 "dexscreener_requests": 0, "blockscout_requests": 0,
                 "evm_refreshes": 0, "evm_refresh_failures": 0,
+                "evm_anomalies": 0, "evm_canonical_pair_misses": 0,
                 "telegram_requests": 0, "telegram_deliveries": 0,
                 "telegram_failures": 0, "retries": 0, "rate_limits": 0,
                 "timeouts": 0, "upstream_errors": 0}
@@ -411,6 +418,9 @@ def initialise_database():
                     token_name TEXT NOT NULL,
                     source TEXT NOT NULL,
                     monitoring_status TEXT NOT NULL,
+                    canonical_pair_address TEXT,
+                    canonical_pair_dex_id TEXT,
+                    pair_locked_at TIMESTAMPTZ,
                     active BOOLEAN NOT NULL DEFAULT TRUE,
                     added_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -440,6 +450,9 @@ def initialise_database():
                     dex_id TEXT,
                     data_quality TEXT NOT NULL DEFAULT 'partial',
                     provider_errors TEXT NOT NULL DEFAULT '[]',
+                    is_anomaly BOOLEAN NOT NULL DEFAULT FALSE,
+                    anomaly_reasons TEXT NOT NULL DEFAULT '[]',
+                    pair_selection TEXT,
                     captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
@@ -462,6 +475,7 @@ def initialise_database():
                     structure_details TEXT NOT NULL DEFAULT '{}',
                     horizon_metrics TEXT NOT NULL DEFAULT '{}',
                     wallet_quality TEXT NOT NULL DEFAULT '{}',
+                    anomaly_details TEXT NOT NULL DEFAULT '{}',
                     latest_snapshot_id BIGINT REFERENCES evm_token_snapshots(id),
                     data_quality TEXT NOT NULL DEFAULT 'partial',
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -518,12 +532,20 @@ def initialise_database():
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAULT 'unvalidated'")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ")
             cur.execute("ALTER TABLE discovery_observations ADD COLUMN IF NOT EXISTS token_symbol TEXT")
+            cur.execute("ALTER TABLE token_watchlist ADD COLUMN IF NOT EXISTS canonical_pair_address TEXT")
+            cur.execute("ALTER TABLE token_watchlist ADD COLUMN IF NOT EXISTS canonical_pair_dex_id TEXT")
+            cur.execute("ALTER TABLE token_watchlist ADD COLUMN IF NOT EXISTS pair_locked_at TIMESTAMPTZ")
+            cur.execute("ALTER TABLE evm_token_snapshots ADD COLUMN IF NOT EXISTS is_anomaly BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("ALTER TABLE evm_token_snapshots ADD COLUMN IF NOT EXISTS anomaly_reasons TEXT NOT NULL DEFAULT '[]'")
+            cur.execute("ALTER TABLE evm_token_snapshots ADD COLUMN IF NOT EXISTS pair_selection TEXT")
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS liquidity_tier TEXT NOT NULL DEFAULT 'UNKNOWN'")
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS structure_state TEXT NOT NULL DEFAULT 'COLLECTING'")
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS structure_confidence INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS structure_details TEXT NOT NULL DEFAULT '{}'")
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS horizon_metrics TEXT NOT NULL DEFAULT '{}'")
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS wallet_quality TEXT NOT NULL DEFAULT '{}'")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS anomaly_details TEXT NOT NULL DEFAULT '{}'")
+            cur.execute("CREATE INDEX IF NOT EXISTS evm_snapshot_integrity_idx ON evm_token_snapshots (chain, token_address, is_anomaly, captured_at DESC)")
             for chain, address, symbol, name, source, monitoring_status in DEFAULT_TOKEN_WATCHLIST:
                 cur.execute("""
                     INSERT INTO token_watchlist (
@@ -536,12 +558,47 @@ def initialise_database():
                         source = EXCLUDED.source,
                         monitoring_status = CASE
                             WHEN token_watchlist.monitoring_status IN (
-                                'live_evm_monitoring', 'partial_evm_monitoring'
+                                'live_evm_monitoring', 'partial_evm_monitoring',
+                                'data_anomaly_quarantined'
                             ) THEN token_watchlist.monitoring_status
                             ELSE EXCLUDED.monitoring_status
                         END,
                         updated_at = NOW()
                 """, (chain, address, symbol, name, source, monitoring_status))
+
+            # Lock existing tokens to the historically active pair. This favours
+            # repeated observations with real trading over a new zero-activity
+            # pool that merely reports a larger liquidity number.
+            cur.execute("""
+                WITH pair_stats AS (
+                    SELECT chain, token_address, pair_address,
+                        COUNT(*) FILTER (
+                            WHERE COALESCE(volume_h1_usd, 0) > 0
+                                OR COALESCE(buys_h1, 0) + COALESCE(sells_h1, 0) > 0
+                        ) AS active_samples,
+                        COUNT(*) AS sample_count,
+                        MAX(captured_at) AS latest_sample
+                    FROM evm_token_snapshots
+                    WHERE pair_address IS NOT NULL AND is_anomaly = FALSE
+                    GROUP BY chain, token_address, pair_address
+                ), ranked AS (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY chain, token_address
+                        ORDER BY active_samples DESC, sample_count DESC,
+                            latest_sample DESC
+                    ) AS pair_rank
+                    FROM pair_stats
+                    WHERE active_samples > 0
+                )
+                UPDATE token_watchlist watchlist
+                SET canonical_pair_address = ranked.pair_address,
+                    pair_locked_at = COALESCE(watchlist.pair_locked_at, NOW())
+                FROM ranked
+                WHERE ranked.pair_rank = 1
+                    AND watchlist.chain = ranked.chain
+                    AND LOWER(watchlist.token_address) = LOWER(ranked.token_address)
+                    AND watchlist.canonical_pair_address IS NULL
+            """)
         conn.commit()
 
 
@@ -1209,6 +1266,13 @@ def diagnostics():
                     "evm_min_momentum_liquidity_usd": EVM_MIN_MOMENTUM_LIQUIDITY_USD,
                     "evm_min_momentum_h1_volume_usd": EVM_MIN_MOMENTUM_H1_VOLUME_USD,
                     "evm_min_momentum_h1_transactions": EVM_MIN_MOMENTUM_H1_TRANSACTIONS,
+                    "evm_data_integrity": {
+                        "canonical_pair_locking": True,
+                        "anomalies_excluded_from_trends": True,
+                        "anomalies_excluded_from_telegram": True,
+                        "price_ratio_threshold": EVM_ANOMALY_PRICE_RATIO,
+                        "liquidity_ratio_threshold": EVM_ANOMALY_LIQUIDITY_RATIO,
+                    },
                     "counters": counters})
 
 
@@ -2802,7 +2866,7 @@ def queue_and_deliver_signal_notification(signal, event_key, *, test=False):
 
 
 # =========================================================
-# V4.10 MULTI-CHAIN EVM EVIDENCE MONITORING
+# V4.10.1 MULTI-CHAIN EVM DATA-INTEGRITY MONITORING
 # =========================================================
 
 def safe_float(value):
@@ -2825,6 +2889,44 @@ def percentage_change(current, previous):
     return ((current - previous) / abs(previous)) * 100.0
 
 
+def _pair_activity(pair):
+    transactions = pair.get("txns") or {}
+    h1 = transactions.get("h1") or {}
+    h24 = transactions.get("h24") or {}
+    volume = pair.get("volume") or {}
+    return {
+        "transactions_h1": (safe_int(h1.get("buys")) or 0) + (safe_int(h1.get("sells")) or 0),
+        "transactions_h24": (safe_int(h24.get("buys")) or 0) + (safe_int(h24.get("sells")) or 0),
+        "volume_h1_usd": safe_float(volume.get("h1")) or 0.0,
+        "volume_h24_usd": safe_float(volume.get("h24")) or 0.0,
+    }
+
+
+def select_evm_pair(chain_pairs, canonical_pair=None):
+    """Use a locked pair, or choose an active initial pair before locking it."""
+    if canonical_pair:
+        for pair in chain_pairs:
+            if str(pair.get("pairAddress") or "").lower() == canonical_pair.lower():
+                return pair, "canonical_locked"
+        return None, "canonical_unavailable"
+
+    active_pairs = []
+    for pair in chain_pairs:
+        activity = _pair_activity(pair)
+        if activity["transactions_h24"] > 0 or activity["volume_h24_usd"] > 0:
+            active_pairs.append(pair)
+    eligible = active_pairs or chain_pairs
+    if not eligible:
+        return None, "no_pair"
+    return max(
+        eligible,
+        key=lambda item: (
+            safe_float((item.get("liquidity") or {}).get("usd")) or 0,
+            _pair_activity(item)["volume_h24_usd"],
+        ),
+    ), "initial_active_liquidity" if active_pairs else "initial_unverified_liquidity"
+
+
 def fetch_evm_token_snapshot(token):
     """Fetch one bounded market/holder snapshot for a configured EVM chain."""
     address = token[1]
@@ -2835,6 +2937,8 @@ def fetch_evm_token_snapshot(token):
     snapshot = {
         "chain": chain, "token_address": address,
         "token_symbol": token[2], "provider_errors": [],
+        "canonical_pair_address": token[4] if len(token) > 4 else None,
+        "canonical_pair_dex_id": token[5] if len(token) > 5 else None,
     }
     market_ok = False
     holders_ok = False
@@ -2856,28 +2960,37 @@ def fetch_evm_token_snapshot(token):
                 == address.lower()
             ]
             if chain_pairs:
-                pair = max(
-                    chain_pairs,
-                    key=lambda item: safe_float((item.get("liquidity") or {}).get("usd")) or 0,
+                pair, selection = select_evm_pair(
+                    chain_pairs, snapshot.get("canonical_pair_address")
                 )
-                transactions = pair.get("txns") or {}
-                snapshot.update({
-                    "price_usd": safe_float(pair.get("priceUsd")),
-                    "liquidity_usd": safe_float((pair.get("liquidity") or {}).get("usd")),
-                    "market_cap_usd": safe_float(pair.get("marketCap")),
-                    "fdv_usd": safe_float(pair.get("fdv")),
-                    "volume_h1_usd": safe_float((pair.get("volume") or {}).get("h1")),
-                    "volume_h24_usd": safe_float((pair.get("volume") or {}).get("h24")),
-                    "buys_h1": safe_int((transactions.get("h1") or {}).get("buys")),
-                    "sells_h1": safe_int((transactions.get("h1") or {}).get("sells")),
-                    "buys_h24": safe_int((transactions.get("h24") or {}).get("buys")),
-                    "sells_h24": safe_int((transactions.get("h24") or {}).get("sells")),
-                    "price_change_h1_pct": safe_float((pair.get("priceChange") or {}).get("h1")),
-                    "price_change_h24_pct": safe_float((pair.get("priceChange") or {}).get("h24")),
-                    "pair_address": pair.get("pairAddress"),
-                    "dex_id": pair.get("dexId"),
-                })
-                market_ok = True
+                snapshot["pair_selection"] = selection
+                if pair is None:
+                    diagnostic_increment("evm_canonical_pair_misses")
+                    snapshot["provider_errors"].append(
+                        f"dexscreener_{selection}"
+                    )
+                else:
+                    snapshot["pair_lock_candidate"] = not bool(
+                        snapshot.get("canonical_pair_address")
+                    )
+                    transactions = pair.get("txns") or {}
+                    snapshot.update({
+                        "price_usd": safe_float(pair.get("priceUsd")),
+                        "liquidity_usd": safe_float((pair.get("liquidity") or {}).get("usd")),
+                        "market_cap_usd": safe_float(pair.get("marketCap")),
+                        "fdv_usd": safe_float(pair.get("fdv")),
+                        "volume_h1_usd": safe_float((pair.get("volume") or {}).get("h1")),
+                        "volume_h24_usd": safe_float((pair.get("volume") or {}).get("h24")),
+                        "buys_h1": safe_int((transactions.get("h1") or {}).get("buys")),
+                        "sells_h1": safe_int((transactions.get("h1") or {}).get("sells")),
+                        "buys_h24": safe_int((transactions.get("h24") or {}).get("buys")),
+                        "sells_h24": safe_int((transactions.get("h24") or {}).get("sells")),
+                        "price_change_h1_pct": safe_float((pair.get("priceChange") or {}).get("h1")),
+                        "price_change_h24_pct": safe_float((pair.get("priceChange") or {}).get("h24")),
+                        "pair_address": pair.get("pairAddress"),
+                        "dex_id": pair.get("dexId"),
+                    })
+                    market_ok = True
             else:
                 snapshot["provider_errors"].append(f"dexscreener_no_{chain}_base_pair")
         else:
@@ -3234,7 +3347,7 @@ def classify_evm_snapshot(snapshot, previous=None, history=None):
 
 
 def format_evm_notification(signal, *, test=False):
-    heading = "TEST — V4.10 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
+    heading = "TEST — V4.10.1 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
     chain = str(signal.get("chain") or "robinhood").lower()
     chain_label = EVM_CHAIN_CONFIG.get(chain, {}).get("label", chain.title())
     return "\n".join([
@@ -3262,14 +3375,103 @@ def queue_and_deliver_evm_notification(signal, event_key, *, test=False):
     return result
 
 
+def _value_ratio(current, previous):
+    if current is None or previous is None or current <= 0 or previous <= 0:
+        return None
+    return current / previous
+
+
+def assess_evm_snapshot_integrity(snapshot, previous=None):
+    """Return quarantine reasons without confusing genuine traded moves with bad pools."""
+    reasons = []
+    canonical = str(snapshot.get("canonical_pair_address") or "").lower()
+    selected = str(snapshot.get("pair_address") or "").lower()
+    if snapshot.get("pair_selection") == "canonical_unavailable":
+        reasons.append("canonical_pair_unavailable")
+    if canonical and selected and canonical != selected:
+        reasons.append("canonical_pair_mismatch")
+    if snapshot.get("price_usd") is not None and snapshot["price_usd"] <= 0:
+        reasons.append("invalid_nonpositive_price")
+    if snapshot.get("liquidity_usd") is not None and snapshot["liquidity_usd"] < 0:
+        reasons.append("invalid_negative_liquidity")
+
+    metrics = {}
+    if previous:
+        if snapshot.get("price_usd") is None or snapshot.get("liquidity_usd") is None:
+            reasons.append("market_data_unavailable_preserving_last_trusted")
+        price_ratio = _value_ratio(snapshot.get("price_usd"), previous.get("price_usd"))
+        liquidity_ratio = _value_ratio(
+            snapshot.get("liquidity_usd"), previous.get("liquidity_usd")
+        )
+        market_cap_ratio = _value_ratio(
+            snapshot.get("market_cap_usd"), previous.get("market_cap_usd")
+        )
+        metrics = {
+            "price_ratio_to_last_trusted": price_ratio,
+            "liquidity_ratio_to_last_trusted": liquidity_ratio,
+            "market_cap_ratio_to_last_trusted": market_cap_ratio,
+        }
+        transactions_h1 = (snapshot.get("buys_h1") or 0) + (snapshot.get("sells_h1") or 0)
+        zero_activity = transactions_h1 == 0 and (snapshot.get("volume_h1_usd") or 0) == 0
+        extreme_price = bool(
+            price_ratio is not None and (
+                price_ratio >= EVM_ANOMALY_PRICE_RATIO
+                or price_ratio <= 1.0 / EVM_ANOMALY_PRICE_RATIO
+            )
+        )
+        explosive_liquidity = bool(
+            liquidity_ratio is not None
+            and liquidity_ratio >= EVM_ANOMALY_LIQUIDITY_RATIO
+        )
+        if extreme_price and zero_activity:
+            reasons.append("extreme_price_discontinuity_without_activity")
+        if explosive_liquidity and zero_activity:
+            reasons.append("liquidity_discontinuity_without_activity")
+        if extreme_price and explosive_liquidity:
+            reasons.append("correlated_price_liquidity_discontinuity")
+
+    return {
+        "is_anomaly": bool(reasons),
+        "reasons": list(dict.fromkeys(reasons)),
+        "metrics": metrics,
+        "policy": {
+            "price_ratio_threshold": EVM_ANOMALY_PRICE_RATIO,
+            "liquidity_ratio_threshold": EVM_ANOMALY_LIQUIDITY_RATIO,
+            "canonical_pair_locked": bool(canonical),
+        },
+    }
+
+
+def classify_evm_anomaly(integrity):
+    return {
+        "status": "EVM_DATA_ANOMALY", "momentum_score": 0,
+        "risk_score": 100, "reasons": integrity["reasons"],
+        "holder_change_pct": None, "liquidity_change_pct": None,
+        "volume_liquidity_ratio": None, "buy_sell_ratio": None,
+        "transaction_count_h1": None, "momentum_eligible": False,
+        "liquidity_tier": "QUARANTINED",
+        "structure_state": "DATA_QUARANTINED",
+        "structure_confidence": 0,
+        "structure_details": {"state": "DATA_QUARANTINED", **integrity},
+        "horizon_metrics": {},
+        "wallet_quality": {
+            "coverage": "quarantined",
+            "classification": "not_evaluated",
+            "note": "Wallet and market scoring skipped for an anomalous observation.",
+        },
+    }
+
+
 def evm_snapshot_history(chain, address, hours=26):
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT price_usd, liquidity_usd, volume_h1_usd, buys_h1,
-                    sells_h1, holder_count, captured_at
+                    sells_h1, holder_count, captured_at, pair_address,
+                    market_cap_usd
                 FROM evm_token_snapshots
                 WHERE chain = %s AND token_address = %s
+                    AND is_anomaly = FALSE
                     AND captured_at >= NOW() - (%s * INTERVAL '1 hour')
                 ORDER BY captured_at DESC LIMIT 192
             """, (chain, address, hours))
@@ -3278,6 +3480,7 @@ def evm_snapshot_history(chain, address, hours=26):
         "price_usd": row[0], "liquidity_usd": row[1],
         "volume_h1_usd": row[2], "buys_h1": row[3], "sells_h1": row[4],
         "holder_count": row[5], "captured_at": row[6],
+        "pair_address": row[7], "market_cap_usd": row[8],
     } for row in rows]
 
 
@@ -3285,7 +3488,15 @@ def persist_evm_snapshot(snapshot):
     snapshot["captured_at"] = snapshot.get("captured_at") or datetime.now(timezone.utc)
     history = evm_snapshot_history(snapshot["chain"], snapshot["token_address"])
     previous = history[0] if history else None
-    classification = classify_evm_snapshot(snapshot, previous, history)
+    integrity = assess_evm_snapshot_integrity(snapshot, previous)
+    snapshot["is_anomaly"] = integrity["is_anomaly"]
+    snapshot["anomaly_reasons"] = integrity["reasons"]
+    if snapshot["is_anomaly"]:
+        diagnostic_increment("evm_anomalies")
+        classification = classify_evm_anomaly(integrity)
+        snapshot["data_quality"] = "anomaly"
+    else:
+        classification = classify_evm_snapshot(snapshot, previous, history)
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -3300,10 +3511,12 @@ def persist_evm_snapshot(snapshot):
                     market_cap_usd, fdv_usd, volume_h1_usd, volume_h24_usd,
                     buys_h1, sells_h1, buys_h24, sells_h24,
                     price_change_h1_pct, price_change_h24_pct, holder_count,
-                    pair_address, dex_id, data_quality, provider_errors
+                    pair_address, dex_id, data_quality, provider_errors,
+                    is_anomaly, anomaly_reasons, pair_selection
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s
                 ) RETURNING id
             """, (
                 snapshot["chain"], snapshot["token_address"], snapshot["token_symbol"],
@@ -3316,6 +3529,9 @@ def persist_evm_snapshot(snapshot):
                 snapshot.get("holder_count"), snapshot.get("pair_address"),
                 snapshot.get("dex_id"), snapshot["data_quality"],
                 json.dumps(snapshot.get("provider_errors") or []),
+                snapshot["is_anomaly"],
+                json.dumps(snapshot.get("anomaly_reasons") or []),
+                snapshot.get("pair_selection"),
             ))
             snapshot_id = cur.fetchone()[0]
             cur.execute("""
@@ -3324,11 +3540,11 @@ def persist_evm_snapshot(snapshot):
                     risk_score, reasons, holder_change_pct, liquidity_change_pct,
                     volume_liquidity_ratio, buy_sell_ratio, liquidity_tier,
                     structure_state, structure_confidence, structure_details,
-                    horizon_metrics, wallet_quality, latest_snapshot_id,
-                    data_quality, updated_at
+                    horizon_metrics, wallet_quality, anomaly_details,
+                    latest_snapshot_id, data_quality, updated_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                 )
                 ON CONFLICT (chain, token_address) DO UPDATE SET
                     token_symbol = EXCLUDED.token_symbol, status = EXCLUDED.status,
@@ -3344,7 +3560,12 @@ def persist_evm_snapshot(snapshot):
                     structure_details = EXCLUDED.structure_details,
                     horizon_metrics = EXCLUDED.horizon_metrics,
                     wallet_quality = EXCLUDED.wallet_quality,
-                    latest_snapshot_id = EXCLUDED.latest_snapshot_id,
+                    anomaly_details = EXCLUDED.anomaly_details,
+                    latest_snapshot_id = CASE
+                        WHEN EXCLUDED.status = 'EVM_DATA_ANOMALY'
+                        THEN evm_token_signals.latest_snapshot_id
+                        ELSE EXCLUDED.latest_snapshot_id
+                    END,
                     data_quality = EXCLUDED.data_quality, updated_at = NOW()
             """, (
                 snapshot["chain"], snapshot["token_address"], snapshot["token_symbol"],
@@ -3357,7 +3578,9 @@ def persist_evm_snapshot(snapshot):
                 json.dumps(classification["structure_details"]),
                 json.dumps(classification["horizon_metrics"]),
                 json.dumps(classification["wallet_quality"]),
-                snapshot_id, snapshot["data_quality"],
+                json.dumps(integrity if snapshot["is_anomaly"] else {}),
+                None if snapshot["is_anomaly"] else snapshot_id,
+                snapshot["data_quality"],
             ))
             history_id = None
             if previous_status != classification["status"]:
@@ -3376,11 +3599,29 @@ def persist_evm_snapshot(snapshot):
                     }),
                 ))
                 history_id = cur.fetchone()[0]
+            if (
+                not snapshot["is_anomaly"]
+                and snapshot.get("pair_lock_candidate")
+                and snapshot.get("pair_address")
+            ):
+                cur.execute("""
+                    UPDATE token_watchlist
+                    SET canonical_pair_address = %s,
+                        canonical_pair_dex_id = %s,
+                        pair_locked_at = COALESCE(pair_locked_at, NOW()),
+                        updated_at = NOW()
+                    WHERE chain = %s AND LOWER(token_address) = LOWER(%s)
+                        AND canonical_pair_address IS NULL
+                """, (
+                    snapshot["pair_address"], snapshot.get("dex_id"),
+                    snapshot["chain"], snapshot["token_address"],
+                ))
             cur.execute("""
                 UPDATE token_watchlist SET monitoring_status = %s, updated_at = NOW()
                 WHERE chain = %s AND token_address = %s
             """, (
-                "live_evm_monitoring" if snapshot["data_quality"] == "complete"
+                "data_anomaly_quarantined" if snapshot["is_anomaly"]
+                else "live_evm_monitoring" if snapshot["data_quality"] == "complete"
                 else "partial_evm_monitoring",
                 snapshot["chain"], snapshot["token_address"],
             ))
@@ -3388,7 +3629,10 @@ def persist_evm_snapshot(snapshot):
 
     result = {**classification, **snapshot, "snapshot_id": snapshot_id,
               "previous_status": previous_status, "history_id": history_id}
-    if previous_status and history_id and classification["status"] in EVM_ALERT_STATUSES:
+    if (
+        not snapshot["is_anomaly"] and previous_status and history_id
+        and classification["status"] in EVM_ALERT_STATUSES
+    ):
         try:
             notification = queue_and_deliver_evm_notification(
                 result, f"evm-signal-history:{history_id}"
@@ -3407,7 +3651,8 @@ def refresh_evm_watchlist(limit=10, offset=0):
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT chain, token_address, token_symbol, token_name
+                SELECT chain, token_address, token_symbol, token_name,
+                    canonical_pair_address, canonical_pair_dex_id
                 FROM token_watchlist
                 WHERE active = TRUE AND chain IN ('robinhood', 'base')
                     AND token_address LIKE '0x%%'
@@ -3977,7 +4222,8 @@ def watchlist_endpoint():
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT chain, token_address, token_symbol, token_name, source,
-                    monitoring_status, active, added_at, updated_at
+                    monitoring_status, active, added_at, updated_at,
+                    canonical_pair_address, canonical_pair_dex_id, pair_locked_at
                 FROM token_watchlist
                 WHERE active = TRUE
                 ORDER BY chain, token_symbol
@@ -3996,10 +4242,12 @@ def watchlist_endpoint():
             "token_name": row[3], "source": row[4],
             "monitoring_status": row[5], "active": row[6],
             "explorer_url": explorer_url, "added_at": row[7], "updated_at": row[8],
+            "canonical_pair_address": row[9], "canonical_pair_dex_id": row[10],
+            "pair_locked_at": row[11],
         })
     return jsonify({
         "success": True, "count": len(items), "tokens": items,
-        "note": "V4.10 evidence monitoring supports Robinhood Chain and Base ERC-20 assets; native ETH remains a benchmark.",
+        "note": "V4.10.1 locks canonical EVM pairs and quarantines anomalous observations; native ETH remains a benchmark.",
         "paper_mode": True, "actionable": False,
     })
 
@@ -4048,6 +4296,60 @@ def add_watchlist_token_endpoint():
     })
 
 
+@app.post("/evm-canonical-pair")
+def set_evm_canonical_pair_endpoint():
+    """Admin-only pair lock/reset for a verified pool migration."""
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    body = request.get_json(silent=True) or {}
+    chain = str(body.get("chain") or "").strip().lower()
+    token_address = str(body.get("token_address") or "").strip()
+    pair_address = str(body.get("pair_address") or "").strip()
+    dex_id = str(body.get("dex_id") or "").strip() or None
+    reset = bool(body.get("reset"))
+    valid_token = (
+        len(token_address) == 42 and token_address.startswith("0x")
+        and all(character in "0123456789abcdefABCDEF" for character in token_address[2:])
+    )
+    valid_pair = (
+        pair_address.startswith("0x") and len(pair_address) in {42, 66}
+        and all(character in "0123456789abcdefABCDEF" for character in pair_address[2:])
+    )
+    if chain not in EVM_CHAIN_CONFIG or not valid_token:
+        return jsonify({"success": False, "error": "Valid chain and token_address are required"}), 400
+    if not reset and not valid_pair:
+        return jsonify({"success": False, "error": "A 20-byte or 32-byte pair_address is required"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE token_watchlist
+                SET canonical_pair_address = %s,
+                    canonical_pair_dex_id = %s,
+                    pair_locked_at = CASE WHEN %s IS NULL THEN NULL ELSE NOW() END,
+                    monitoring_status = 'evm_monitoring_ready', updated_at = NOW()
+                WHERE chain = %s AND LOWER(token_address) = LOWER(%s)
+                RETURNING token_symbol
+            """, (
+                None if reset else pair_address, None if reset else dex_id,
+                None if reset else pair_address, chain, token_address,
+            ))
+            row = cur.fetchone()
+        conn.commit()
+    if not row:
+        return jsonify({"success": False, "error": "Token is not on the active watchlist"}), 404
+    return jsonify({
+        "success": True, "chain": chain, "token_address": token_address,
+        "token_symbol": row[0],
+        "canonical_pair_address": None if reset else pair_address,
+        "canonical_pair_dex_id": None if reset else dex_id,
+        "pair_lock_status": "reset" if reset else "locked",
+        "paper_mode": True, "actionable": False,
+    })
+
+
 EVM_SIGNAL_SELECT = """
     SELECT s.chain, s.token_address, s.token_symbol, s.status,
         s.momentum_score, s.risk_score, s.reasons,
@@ -4057,7 +4359,8 @@ EVM_SIGNAL_SELECT = """
         p.market_cap_usd, p.volume_h1_usd, p.price_change_h1_pct,
         p.holder_count, p.pair_address, p.captured_at,
         s.liquidity_tier, s.structure_state, s.structure_confidence,
-        s.structure_details, s.horizon_metrics, s.wallet_quality
+        s.structure_details, s.horizon_metrics, s.wallet_quality,
+        s.anomaly_details
     FROM evm_token_signals s
     LEFT JOIN evm_token_snapshots p ON p.id = s.latest_snapshot_id
 """
@@ -4092,6 +4395,7 @@ def serialize_evm_signal(row):
         "structure_details": parsed_json(24, {}),
         "horizon_metrics": parsed_json(25, {}),
         "wallet_quality": parsed_json(26, {}),
+        "anomaly_details": parsed_json(27, {}),
     }
 
 
@@ -4206,7 +4510,7 @@ def evm_signals_endpoint():
 
 @app.get("/evm-evidence")
 def evm_evidence_endpoint():
-    """Read-only V4.10 multi-chain evidence summary for calibration and review."""
+    """Read-only V4.10.1 multi-chain evidence summary for calibration and review."""
     initialise_database()
     with db() as conn:
         with conn.cursor() as cur:
@@ -4264,7 +4568,8 @@ def evm_token_detail_endpoint(token_address):
                 SELECT id, price_usd, liquidity_usd, market_cap_usd,
                     volume_h1_usd, price_change_h1_pct, holder_count,
                     data_quality, provider_errors, captured_at,
-                    buys_h1, sells_h1, volume_h24_usd, price_change_h24_pct
+                    buys_h1, sells_h1, volume_h24_usd, price_change_h24_pct,
+                    pair_address, is_anomaly, anomaly_reasons, pair_selection
                 FROM evm_token_snapshots
                 WHERE LOWER(token_address) = LOWER(%s)
             """
@@ -4290,6 +4595,9 @@ def evm_token_detail_endpoint(token_address):
             "provider_errors": json.loads(item[8] or "[]"), "captured_at": item[9],
             "buys_h1": item[10], "sells_h1": item[11],
             "volume_h24_usd": item[12], "price_change_h24_pct": item[13],
+            "pair_address": item[14], "is_anomaly": item[15],
+            "anomaly_reasons": json.loads(item[16] or "[]"),
+            "pair_selection": item[17],
         } for item in snapshots],
         "paper_mode": True, "actionable": False,
     })
@@ -4321,7 +4629,8 @@ def evm_snapshots_endpoint():
         SELECT id, chain, token_address, token_symbol, price_usd,
             liquidity_usd, market_cap_usd, volume_h1_usd,
             price_change_h1_pct, holder_count, data_quality,
-            provider_errors, captured_at
+            provider_errors, captured_at, pair_address, is_anomaly,
+            anomaly_reasons, pair_selection
         FROM evm_token_snapshots
     """
     if clauses:
@@ -4340,8 +4649,47 @@ def evm_snapshots_endpoint():
         "market_cap_usd": row[6], "volume_h1_usd": row[7],
         "price_change_h1_pct": row[8], "holder_count": row[9],
         "data_quality": row[10], "provider_errors": json.loads(row[11] or "[]"),
-        "captured_at": row[12], "actionable": False,
+        "captured_at": row[12], "pair_address": row[13],
+        "is_anomaly": row[14], "anomaly_reasons": json.loads(row[15] or "[]"),
+        "pair_selection": row[16], "actionable": False,
     } for row in rows], "paper_mode": True})
+
+
+@app.get("/evm-anomalies")
+def evm_anomalies_endpoint():
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+    except ValueError:
+        limit = 100
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, chain, token_address, token_symbol, pair_address,
+                    price_usd, liquidity_usd, market_cap_usd, volume_h1_usd,
+                    data_quality, provider_errors, anomaly_reasons,
+                    pair_selection, captured_at
+                FROM evm_token_snapshots
+                WHERE is_anomaly = TRUE
+                ORDER BY captured_at DESC LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    return jsonify({
+        "success": True, "count": len(rows),
+        "anomalies": [{
+            "id": row[0], "chain": row[1], "token_address": row[2],
+            "token_symbol": row[3], "pair_address": row[4],
+            "price_usd": row[5], "liquidity_usd": row[6],
+            "market_cap_usd": row[7], "volume_h1_usd": row[8],
+            "data_quality": row[9],
+            "provider_errors": json.loads(row[10] or "[]"),
+            "anomaly_reasons": json.loads(row[11] or "[]"),
+            "pair_selection": row[12], "captured_at": row[13],
+            "excluded_from_trends": True,
+            "excluded_from_notifications": True,
+        } for row in rows],
+        "paper_mode": True, "actionable": False,
+    })
 
 
 @app.post("/test-evm-notification")
@@ -4671,6 +5019,7 @@ def build_dashboard_payload():
                     holder_count, captured_at
                 FROM evm_token_snapshots
                 WHERE captured_at >= NOW() - INTERVAL '26 hours'
+                    AND is_anomaly = FALSE
                 ORDER BY chain, token_address, captured_at DESC
             """)
             snapshot_rows = cur.fetchall()
@@ -4764,14 +5113,14 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.10 Premium · Multi-chain Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + Robinhood Chain and Base evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.10.1 Premium · Data-integrity Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + canonical-pair EVM evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
     <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
   </section>
-  <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Liquidity tiers, multi-horizon evidence and snapshot-proxy chart structure</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-snapshots?limit=100">Snapshots</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="12" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair evidence; anomalous observations are quarantined</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="12" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana paper signals</h2><div class="muted">Relationship-aware wallet consensus; execution remains disabled</div></div><div class="links"><a href="/signals">JSON signals</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Status</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Updated</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <div class="warning">Paper research only. Signals are observations—not trade instructions—and token safety remains unverified.</div><div class="footer" id="footer">Auto-refreshes every 60 seconds.</div>
 </main><script>
@@ -4780,7 +5129,7 @@ const money=v=>v==null?'—':new Intl.NumberFormat('en-US',{style:'currency',cur
 const num=v=>v==null?'—':new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(v);
 const trend=v=>v==null?'<span class="neutral">collecting</span>':`<span class="${v>0?'pos':v<0?'neg':'neutral'}">${v>0?'+':''}${num(v)}%</span>`;
 const when=v=>v?new Date(v).toLocaleString():'—';
-const badge=s=>{const c=s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
+const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
 document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
 document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="12" class="empty">No EVM snapshots yet.</td></tr>';
