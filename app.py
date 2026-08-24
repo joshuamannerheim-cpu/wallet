@@ -6,6 +6,7 @@ import statistics
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -15,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.10.1-paper-data-integrity"
+VERSION = "4.10.2-paper-cron-reliability"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -61,6 +62,7 @@ SUPPORTED_EVM_CHAINS = tuple(EVM_CHAIN_CONFIG)
 EVM_REFRESH_MAX_SECONDS = min(
     max(int(os.getenv("EVM_REFRESH_MAX_SECONDS", "55")), 15), 75
 )
+EVM_FETCH_WORKERS = min(max(int(os.getenv("EVM_FETCH_WORKERS", "4")), 1), 4)
 EVM_ALERT_STATUSES = {
     value.strip().upper()
     for value in os.getenv(
@@ -1262,6 +1264,7 @@ def diagnostics():
                     },
                     "evm_supported_chains": list(SUPPORTED_EVM_CHAINS),
                     "evm_refresh_max_seconds": EVM_REFRESH_MAX_SECONDS,
+                    "evm_fetch_workers": EVM_FETCH_WORKERS,
                     "evm_alert_statuses": sorted(EVM_ALERT_STATUSES),
                     "evm_min_momentum_liquidity_usd": EVM_MIN_MOMENTUM_LIQUIDITY_USD,
                     "evm_min_momentum_h1_volume_usd": EVM_MIN_MOMENTUM_H1_VOLUME_USD,
@@ -2866,7 +2869,7 @@ def queue_and_deliver_signal_notification(signal, event_key, *, test=False):
 
 
 # =========================================================
-# V4.10.1 MULTI-CHAIN EVM DATA-INTEGRITY MONITORING
+# V4.10.2 MULTI-CHAIN EVM DATA-INTEGRITY + CRON RELIABILITY
 # =========================================================
 
 def safe_float(value):
@@ -3347,7 +3350,7 @@ def classify_evm_snapshot(snapshot, previous=None, history=None):
 
 
 def format_evm_notification(signal, *, test=False):
-    heading = "TEST — V4.10.1 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
+    heading = "TEST — V4.10.2 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
     chain = str(signal.get("chain") or "robinhood").lower()
     chain_label = EVM_CHAIN_CONFIG.get(chain, {}).get("label", chain.title())
     return "\n".join([
@@ -3651,12 +3654,19 @@ def refresh_evm_watchlist(limit=10, offset=0):
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT chain, token_address, token_symbol, token_name,
-                    canonical_pair_address, canonical_pair_dex_id
-                FROM token_watchlist
-                WHERE active = TRUE AND chain IN ('robinhood', 'base')
-                    AND token_address LIKE '0x%%'
-                ORDER BY chain, token_symbol LIMIT %s OFFSET %s
+                SELECT w.chain, w.token_address, w.token_symbol, w.token_name,
+                    w.canonical_pair_address, w.canonical_pair_dex_id
+                FROM token_watchlist w
+                WHERE w.active = TRUE AND w.chain IN ('robinhood', 'base')
+                    AND w.token_address LIKE '0x%%'
+                ORDER BY (
+                    SELECT MAX(snapshot.captured_at)
+                    FROM evm_token_snapshots snapshot
+                    WHERE snapshot.chain = w.chain
+                        AND LOWER(snapshot.token_address) = LOWER(w.token_address)
+                        AND snapshot.is_anomaly = FALSE
+                ) ASC NULLS FIRST, w.chain, w.token_symbol
+                LIMIT %s OFFSET %s
             """, (limit, offset))
             tokens = cur.fetchall()
             cur.execute("""
@@ -3670,25 +3680,45 @@ def refresh_evm_watchlist(limit=10, offset=0):
     results = []
     transitions = 0
     stopped_reason = None
-    for token in tokens:
-        if time.monotonic() >= deadline:
-            stopped_reason = "deadline_guard"
-            break
-        try:
-            snapshot = fetch_evm_token_snapshot(token)
-            if snapshot["data_quality"] == "unavailable":
+    executor = ThreadPoolExecutor(max_workers=min(EVM_FETCH_WORKERS, len(tokens) or 1))
+    futures = {executor.submit(fetch_evm_token_snapshot, token): token for token in tokens}
+    try:
+        for future in as_completed(futures):
+            token = futures[future]
+            if time.monotonic() >= deadline:
+                stopped_reason = "deadline_guard"
+                break
+            try:
+                snapshot = future.result()
+                if snapshot["data_quality"] == "unavailable":
+                    diagnostic_increment("evm_refresh_failures")
+                # Database writes remain single-threaded even though provider
+                # reads are concurrent.
+                result = persist_evm_snapshot(snapshot)
+                transitions += int(result.get("history_id") is not None)
+                results.append(result)
+            except Exception as exc:
                 diagnostic_increment("evm_refresh_failures")
-            result = persist_evm_snapshot(snapshot)
-            transitions += int(result.get("history_id") is not None)
-            results.append(result)
-        except Exception as exc:
-            diagnostic_increment("evm_refresh_failures")
-            results.append({
-                "chain": token[0], "token_address": token[1],
-                "token_symbol": token[2], "success": False,
-                "error": type(exc).__name__,
-            })
-    status = "complete" if len(results) == len(tokens) else "partial"
+                results.append({
+                    "chain": token[0], "token_address": token[1],
+                    "token_symbol": token[2], "success": False,
+                    "error": type(exc).__name__,
+                })
+    finally:
+        for future in futures:
+            if not future.done():
+                future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    deferred = max(len(tokens) - len(results), 0)
+    failures = sum(item.get("success") is False for item in results)
+    if deferred:
+        status = "partial_deadline"
+        stopped_reason = stopped_reason or "deadline_guard"
+    elif failures:
+        status = "partial_error"
+    else:
+        status = "complete"
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -3697,7 +3727,12 @@ def refresh_evm_watchlist(limit=10, offset=0):
                     status = %s, details = %s WHERE id = %s
             """, (
                 sum(1 for item in results if item.get("snapshot_id")), transitions,
-                status, json.dumps({"stopped_reason": stopped_reason}), run_id,
+                status, json.dumps({
+                    "stopped_reason": stopped_reason,
+                    "processed": len(results), "deferred": deferred,
+                    "failures": failures, "fetch_workers": EVM_FETCH_WORKERS,
+                    "deferred_tokens_are_prioritised_next_run": True,
+                }), run_id,
             ))
         conn.commit()
     diagnostic_increment("evm_refreshes")
@@ -3708,6 +3743,7 @@ def refresh_evm_watchlist(limit=10, offset=0):
     return {
         "success": status == "complete", "run_id": run_id,
         "selected": len(tokens), "processed": len(results),
+        "deferred": deferred, "failures": failures, "status": status,
         "transitions": transitions, "stopped_reason": stopped_reason,
         "chain_counts": chain_counts,
         "results": results,
@@ -4247,7 +4283,7 @@ def watchlist_endpoint():
         })
     return jsonify({
         "success": True, "count": len(items), "tokens": items,
-        "note": "V4.10.1 locks canonical EVM pairs and quarantines anomalous observations; native ETH remains a benchmark.",
+        "note": "V4.10.2 locks canonical EVM pairs, quarantines anomalies and uses resilient concurrent refreshes; native ETH remains a benchmark.",
         "paper_mode": True, "actionable": False,
     })
 
@@ -4377,6 +4413,9 @@ def serialize_evm_signal(row):
         except (TypeError, ValueError):
             return fallback
     config = EVM_CHAIN_CONFIG.get(row[0], {})
+    dexscreener_url = (
+        f"https://dexscreener.com/{row[0]}/{row[19]}" if row[19] else None
+    )
     return {
         "chain": row[0], "chain_id": config.get("chain_id"),
         "chain_label": config.get("label", str(row[0]).title()),
@@ -4388,6 +4427,7 @@ def serialize_evm_signal(row):
         "liquidity_usd": row[14], "market_cap_usd": row[15],
         "volume_h1_usd": row[16], "price_change_h1_pct": row[17],
         "holder_count": row[18], "pair_address": row[19],
+        "dexscreener_url": dexscreener_url,
         "captured_at": row[20], "paper_mode": True, "actionable": False,
         "liquidity_tier": row[21] or "UNKNOWN",
         "structure_state": row[22] or "COLLECTING",
@@ -4510,7 +4550,7 @@ def evm_signals_endpoint():
 
 @app.get("/evm-evidence")
 def evm_evidence_endpoint():
-    """Read-only V4.10.1 multi-chain evidence summary for calibration and review."""
+    """Read-only V4.10.2 multi-chain evidence summary for calibration and review."""
     initialise_database()
     with db() as conn:
         with conn.cursor() as cur:
@@ -5107,13 +5147,13 @@ DASHBOARD_HTML = r"""<!doctype html>
     *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at 15% 0,#122c48 0,transparent 38%),var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
     .wrap{max-width:1460px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:22px}.eyebrow{color:var(--blue);font-weight:700;letter-spacing:.14em;text-transform:uppercase;font-size:11px}h1{font-size:30px;margin:5px 0 4px}.sub,.muted{color:var(--muted)}.live{display:flex;align-items:center;gap:8px;background:#102d2a;border:1px solid #1d5d4d;color:#77e4bd;padding:9px 13px;border-radius:999px}.dot{width:8px;height:8px;background:var(--green);border-radius:50%;box-shadow:0 0 12px var(--green)}
     .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}.card,.section{background:linear-gradient(145deg,rgba(19,36,58,.96),rgba(12,25,42,.96));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 40px rgba(0,0,0,.16)}.card{padding:18px}.card b{display:block;font-size:25px;margin-top:4px}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
-    .section{padding:18px;margin-bottom:20px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.section h2{font-size:18px;margin:0}.links a{color:var(--blue);text-decoration:none;margin-left:14px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1040px}th{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:11px 10px;border-bottom:1px solid var(--line)}td{padding:13px 10px;border-bottom:1px solid rgba(36,54,77,.7);white-space:nowrap}tbody tr:hover{background:rgba(85,167,255,.04)}.token{font-weight:750}.address{font:11px ui-monospace,SFMono-Regular,Consolas;color:var(--muted)}
+    .section{padding:18px;margin-bottom:20px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.section h2{font-size:18px;margin:0}.links a{color:var(--blue);text-decoration:none;margin-left:14px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1040px}th{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:11px 10px;border-bottom:1px solid var(--line)}td{padding:13px 10px;border-bottom:1px solid rgba(36,54,77,.7);white-space:nowrap}tbody tr:hover{background:rgba(85,167,255,.04)}.token{font-weight:750}.address{font:11px ui-monospace,SFMono-Regular,Consolas;color:var(--muted)}.token-link{color:inherit;text-decoration:none;display:inline-block}.token-link:hover .token{color:var(--blue)}.external{color:var(--blue);font-size:11px;margin-left:4px}
     .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:700;font-size:11px}.observe{background:#19304b;color:#9ecbff}.momentum,.accumulation{background:#123b31;color:#67e6b8}.high{background:#294320;color:#b4ef79}.risk,.distribution{background:#4a2028;color:#ff9aaa}.thin,.rebound{background:#4a381d;color:#ffd27d}.expired{background:#29313d;color:#aab5c3}.pos{color:var(--green)}.neg{color:var(--red)}.neutral{color:var(--muted)}.warning{margin-top:18px;padding:12px 15px;border:1px solid #54421f;background:#2a2415;color:#f2cf82;border-radius:12px}.empty{text-align:center;color:var(--muted);padding:24px}.error{border-color:#68303a;background:#321820;color:#ff9aaa}.footer{color:var(--muted);font-size:12px;text-align:center;padding:8px}
     @media(max-width:800px){.wrap{padding:18px}.top{display:block}.live{margin-top:14px;width:max-content}.cards{grid-template-columns:repeat(2,1fr)}h1{font-size:25px}.section-head{align-items:flex-start;flex-direction:column}.links a{margin:0 14px 0 0}}
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.10.1 Premium · Data-integrity Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + canonical-pair EVM evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.10.2 Premium · Reliable Multi-chain Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + canonical-pair EVM evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
@@ -5132,7 +5172,7 @@ const when=v=>v?new Date(v).toLocaleString():'—';
 const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
 document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
-document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="12" class="empty">No EVM snapshots yet.</td></tr>';
+document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="12" class="empty">No EVM snapshots yet.</td></tr>';
 document.getElementById('solBody').innerHTML=d.solana_signals.length?d.solana_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol||'Unknown')}</div><div class="address">${esc((x.token_address||'').slice(0,10))}…</div></td><td>${badge(x.status)}</td><td>${num(x.buy_score)}</td><td>${num(x.sell_score)}</td><td>${num(x.independent_buy_clusters)}</td><td>${num(x.independent_sell_clusters)}</td><td>${esc(x.safety_status)}</td><td>${when(x.updated_at)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">No Solana paper signals yet.</td></tr>';
 document.getElementById('footer').textContent=`${esc(d.version)} · generated ${when(d.generated_at)} · auto-refreshes every 60 seconds.`;
 }catch(e){document.getElementById('refreshState').textContent='Dashboard data unavailable';document.querySelector('.warning').classList.add('error');document.querySelector('.warning').textContent='Could not load dashboard data. The monitoring APIs continue running independently.';}}
@@ -5277,7 +5317,7 @@ def premium_funnel():
 
 
 def run_evm_refresh_once():
-    """Railway cron entrypoint: perform one refresh, print a summary, then exit."""
+    """Railway cron entrypoint with controlled partial-run semantics."""
     try:
         result = refresh_evm_watchlist(limit=10, offset=0)
     except Exception as exc:
@@ -5286,14 +5326,23 @@ def run_evm_refresh_once():
             "error": type(exc).__name__, "mode": "evm_cron_once",
         }))
         return 1
+    controlled_partial = bool(
+        result.get("stopped_reason") == "deadline_guard"
+        and result.get("processed", 0) > 0
+        and result.get("failures", 0) == 0
+    )
+    cron_success = bool(result["success"] or controlled_partial)
     print(json.dumps({
-        "success": result["success"], "version": VERSION,
+        "success": cron_success, "refresh_complete": result["success"],
+        "version": VERSION,
         "run_id": result["run_id"], "selected": result["selected"],
         "processed": result["processed"], "transitions": result["transitions"],
+        "deferred": result.get("deferred", 0),
+        "failures": result.get("failures", 0), "status": result.get("status"),
         "chain_counts": result.get("chain_counts", {}),
         "stopped_reason": result["stopped_reason"], "mode": "evm_cron_once",
     }))
-    return 0 if result["success"] else 1
+    return 0 if cron_success else 1
 
 
 if __name__ == "__main__":
