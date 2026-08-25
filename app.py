@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.10.3-paper-provider-resilience"
+VERSION = "4.11.0-paper-benchmark-expansion"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -63,6 +63,9 @@ EVM_REFRESH_MAX_SECONDS = min(
     max(int(os.getenv("EVM_REFRESH_MAX_SECONDS", "55")), 15), 75
 )
 EVM_FETCH_WORKERS = min(max(int(os.getenv("EVM_FETCH_WORKERS", "4")), 1), 4)
+EVM_PROVIDER_TIMEOUT_SECONDS = min(
+    max(int(os.getenv("EVM_PROVIDER_TIMEOUT_SECONDS", "7")), 3), 10
+)
 EVM_ALERT_STATUSES = {
     value.strip().upper()
     for value in os.getenv(
@@ -116,7 +119,7 @@ ASYMMETRIC_WEIGHT = 0.35
 CONFIDENCE_MULTIPLIERS = {"HIGH": 1.0, "MEDIUM": 0.75, "LOW": 0.5}
 HARD_RELATIONSHIP_STRENGTHS = {"high", "moderate"}
 DEFAULT_TOKEN_WATCHLIST = (
-    ("robinhood", "native:ETH", "ETH", "Ether", "portfolio", "benchmark"),
+    ("base", "0x4200000000000000000000000000000000000006", "ETH", "Ether / WETH", "benchmark", "evm_monitoring_ready"),
     ("robinhood", "0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1", "IF", "What IF", "portfolio", "evm_monitoring_ready"),
     ("robinhood", "0xe934e36A439C94017B64a3FecE66AF12099aBF50", "STONKBROKER", "StonkBroker", "portfolio", "evm_monitoring_ready"),
     ("robinhood", "0x020bfC650A365f8BB26819deAAbF3E21291018b4", "CASHCAT", "Cash Cat", "portfolio", "evm_monitoring_ready"),
@@ -124,6 +127,8 @@ DEFAULT_TOKEN_WATCHLIST = (
     ("robinhood", "0xeC45C6C413b498Cf5aCF5a1a889F1a95cA9b6bB3", "PORTLY", "PORTLY", "existing_test_case", "evm_monitoring_ready"),
     ("robinhood", "0x298348d5b2e45C774E3ee4f1a0924071DfbDC8C7", "SWAPPY", "Swappy", "research_test_case", "evm_monitoring_ready"),
     ("base", "0xA4A2E2ca3fBfE21aed83471D28b6f65A233C6e00", "TIBBIR", "Ribbita by Virtuals", "research_test_case", "evm_monitoring_ready"),
+    ("robinhood", "0x5f62c57e5c537887117eef828b7e3ad41c009feb", "GOOD", "Good In The Hood", "research_watchlist", "evm_monitoring_ready"),
+    ("base", "0x0F61Edbfe6Cd86024C0f210c0695B08df55fdfc9", "BSTONK", "BaseStonk", "research_watchlist", "evm_monitoring_ready"),
 )
 BASE58_ALPHABET = (
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -483,6 +488,7 @@ def initialise_database():
                     anomaly_details TEXT NOT NULL DEFAULT '{}',
                     availability_details TEXT NOT NULL DEFAULT '{}',
                     last_trusted_status TEXT,
+                    is_benchmark BOOLEAN NOT NULL DEFAULT FALSE,
                     latest_snapshot_id BIGINT REFERENCES evm_token_snapshots(id),
                     data_quality TEXT NOT NULL DEFAULT 'partial',
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -556,6 +562,7 @@ def initialise_database():
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS anomaly_details TEXT NOT NULL DEFAULT '{}'")
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS availability_details TEXT NOT NULL DEFAULT '{}'")
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS last_trusted_status TEXT")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS is_benchmark BOOLEAN NOT NULL DEFAULT FALSE")
             cur.execute("CREATE INDEX IF NOT EXISTS evm_snapshot_integrity_idx ON evm_token_snapshots (chain, token_address, is_anomaly, captured_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS evm_snapshot_availability_idx ON evm_token_snapshots (chain, token_address, is_provider_unavailable, captured_at DESC)")
             for chain, address, symbol, name, source, monitoring_status in DEFAULT_TOKEN_WATCHLIST:
@@ -578,6 +585,17 @@ def initialise_database():
                         END,
                         updated_at = NOW()
                 """, (chain, address, symbol, name, source, monitoring_status))
+
+            # The original native marker was metadata-only and never entered
+            # the EVM refresh. V4.11 replaces it with Base WETH so ETH becomes
+            # a real, non-actionable benchmark with the same evidence cadence.
+            cur.execute("""
+                UPDATE token_watchlist
+                SET active = FALSE,
+                    monitoring_status = 'replaced_by_base_weth_benchmark',
+                    updated_at = NOW()
+                WHERE token_address = 'native:ETH'
+            """)
 
             # Reclassify the V4.10.1/2 timeout-only observations. Their market
             # values were already excluded from trends, so this is a semantic
@@ -1320,6 +1338,7 @@ def diagnostics():
                     "evm_supported_chains": list(SUPPORTED_EVM_CHAINS),
                     "evm_refresh_max_seconds": EVM_REFRESH_MAX_SECONDS,
                     "evm_fetch_workers": EVM_FETCH_WORKERS,
+                    "evm_provider_timeout_seconds": EVM_PROVIDER_TIMEOUT_SECONDS,
                     "evm_alert_statuses": sorted(EVM_ALERT_STATUSES),
                     "evm_min_momentum_liquidity_usd": EVM_MIN_MOMENTUM_LIQUIDITY_USD,
                     "evm_min_momentum_h1_volume_usd": EVM_MIN_MOMENTUM_H1_VOLUME_USD,
@@ -2927,7 +2946,7 @@ def queue_and_deliver_signal_notification(signal, event_key, *, test=False):
 
 
 # =========================================================
-# V4.10.3 MULTI-CHAIN EVM PROVIDER RESILIENCE
+# V4.11 MULTI-CHAIN EVM BENCHMARK EXPANSION
 # =========================================================
 
 def safe_float(value):
@@ -3000,6 +3019,8 @@ def fetch_evm_token_snapshot(token):
         "token_symbol": token[2], "provider_errors": [],
         "canonical_pair_address": token[4] if len(token) > 4 else None,
         "canonical_pair_dex_id": token[5] if len(token) > 5 else None,
+        "source": token[6] if len(token) > 6 else None,
+        "is_benchmark": bool(len(token) > 6 and token[6] == "benchmark"),
     }
     market_ok = False
     holders_ok = False
@@ -3007,7 +3028,8 @@ def fetch_evm_token_snapshot(token):
     try:
         response = upstream_request(
             "GET", DEXSCREENER_TOKEN_URL.format(address=address),
-            timeout=10, retries=1, provider="dexscreener",
+            timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=0,
+            provider="dexscreener",
         )
         if response.status_code == 200:
             payload = response.json()
@@ -3062,7 +3084,8 @@ def fetch_evm_token_snapshot(token):
     try:
         response = upstream_request(
             "GET", f"{config['blockscout_url']}/tokens/{address}",
-            timeout=10, retries=0, provider="blockscout",
+            timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=0,
+            provider="blockscout",
         )
         if response.status_code == 200:
             payload = response.json()
@@ -3407,8 +3430,26 @@ def classify_evm_snapshot(snapshot, previous=None, history=None):
     }
 
 
+def classify_evm_benchmark(snapshot, previous=None, history=None):
+    """Retain market/structure evidence without treating ETH as a meme signal."""
+    evidence = classify_evm_snapshot(snapshot, previous, history)
+    return {
+        **evidence,
+        "status": "EVM_BENCHMARK",
+        "momentum_score": 0,
+        "risk_score": 0,
+        "reasons": ["market_benchmark", "excluded_from_token_alert_scoring"],
+        "momentum_eligible": False,
+        "wallet_quality": {
+            "coverage": "benchmark_only",
+            "classification": "not_applicable",
+            "note": "ETH provides market context and never generates token alerts.",
+        },
+    }
+
+
 def format_evm_notification(signal, *, test=False):
-    heading = "TEST — V4.10.3 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
+    heading = "TEST — V4.11 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
     chain = str(signal.get("chain") or "robinhood").lower()
     chain_label = EVM_CHAIN_CONFIG.get(chain, {}).get("label", chain.title())
     return "\n".join([
@@ -3612,6 +3653,8 @@ def persist_evm_snapshot(snapshot):
         diagnostic_increment("evm_provider_unavailable")
         classification = classify_evm_provider_unavailable(integrity)
         snapshot["data_quality"] = "provider_unavailable"
+    elif snapshot.get("is_benchmark"):
+        classification = classify_evm_benchmark(snapshot, previous, history)
     else:
         classification = classify_evm_snapshot(snapshot, previous, history)
     with db() as conn:
@@ -3669,10 +3712,10 @@ def persist_evm_snapshot(snapshot):
                     structure_state, structure_confidence, structure_details,
                     horizon_metrics, wallet_quality, anomaly_details,
                     availability_details, last_trusted_status,
-                    latest_snapshot_id, data_quality, updated_at
+                    is_benchmark, latest_snapshot_id, data_quality, updated_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                 )
                 ON CONFLICT (chain, token_address) DO UPDATE SET
                     token_symbol = EXCLUDED.token_symbol, status = EXCLUDED.status,
@@ -3690,6 +3733,7 @@ def persist_evm_snapshot(snapshot):
                     wallet_quality = EXCLUDED.wallet_quality,
                     anomaly_details = EXCLUDED.anomaly_details,
                     availability_details = EXCLUDED.availability_details,
+                    is_benchmark = EXCLUDED.is_benchmark,
                     last_trusted_status = CASE
                         WHEN EXCLUDED.status IN (
                             'EVM_DATA_ANOMALY', 'EVM_PROVIDER_UNAVAILABLE'
@@ -3724,6 +3768,7 @@ def persist_evm_snapshot(snapshot):
                 json.dumps(integrity if snapshot["is_provider_unavailable"] else {}),
                 None if (snapshot["is_anomaly"] or snapshot["is_provider_unavailable"])
                 else classification["status"],
+                bool(snapshot.get("is_benchmark")),
                 None if (snapshot["is_anomaly"] or snapshot["is_provider_unavailable"])
                 else snapshot_id,
                 snapshot["data_quality"],
@@ -3814,7 +3859,7 @@ def refresh_evm_watchlist(limit=10, offset=0):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT w.chain, w.token_address, w.token_symbol, w.token_name,
-                    w.canonical_pair_address, w.canonical_pair_dex_id
+                    w.canonical_pair_address, w.canonical_pair_dex_id, w.source
                 FROM token_watchlist w
                 WHERE w.active = TRUE AND w.chain IN ('robinhood', 'base')
                     AND w.token_address LIKE '0x%%'
@@ -4443,7 +4488,7 @@ def watchlist_endpoint():
         })
     return jsonify({
         "success": True, "count": len(items), "tokens": items,
-        "note": "V4.10.3 separates temporary provider outages from genuine data anomalies while retaining canonical-pair evidence.",
+        "note": "V4.11 adds ETH benchmark context plus GOOD and BSTONK while retaining provider-resilient canonical-pair evidence.",
         "paper_mode": True, "actionable": False,
     })
 
@@ -4556,7 +4601,8 @@ EVM_SIGNAL_SELECT = """
         p.holder_count, p.pair_address, p.captured_at,
         s.liquidity_tier, s.structure_state, s.structure_confidence,
         s.structure_details, s.horizon_metrics, s.wallet_quality,
-        s.anomaly_details, s.availability_details, s.last_trusted_status
+        s.anomaly_details, s.availability_details, s.last_trusted_status,
+        s.is_benchmark
     FROM evm_token_signals s
     LEFT JOIN evm_token_snapshots p ON p.id = s.latest_snapshot_id
 """
@@ -4606,6 +4652,7 @@ def serialize_evm_signal(row):
         "anomaly_details": parsed_json(27, {}),
         "availability_details": parsed_json(28, {}),
         "last_trusted_status": row[29],
+        "is_benchmark": bool(row[30]),
         "using_last_trusted_snapshot": row[3] in {
             "EVM_DATA_ANOMALY", "EVM_PROVIDER_UNAVAILABLE",
         },
@@ -4724,7 +4771,7 @@ def evm_signals_endpoint():
 
 @app.get("/evm-evidence")
 def evm_evidence_endpoint():
-    """Read-only V4.10.3 multi-chain evidence summary for calibration and review."""
+    """Read-only V4.11 multi-chain evidence summary for calibration and review."""
     initialise_database()
     with db() as conn:
         with conn.cursor() as cur:
@@ -5362,12 +5409,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     .wrap{max-width:1460px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:22px}.eyebrow{color:var(--blue);font-weight:700;letter-spacing:.14em;text-transform:uppercase;font-size:11px}h1{font-size:30px;margin:5px 0 4px}.sub,.muted{color:var(--muted)}.live{display:flex;align-items:center;gap:8px;background:#102d2a;border:1px solid #1d5d4d;color:#77e4bd;padding:9px 13px;border-radius:999px}.dot{width:8px;height:8px;background:var(--green);border-radius:50%;box-shadow:0 0 12px var(--green)}
     .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}.card,.section{background:linear-gradient(145deg,rgba(19,36,58,.96),rgba(12,25,42,.96));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 40px rgba(0,0,0,.16)}.card{padding:18px}.card b{display:block;font-size:25px;margin-top:4px}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
     .section{padding:18px;margin-bottom:20px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.section h2{font-size:18px;margin:0}.links a{color:var(--blue);text-decoration:none;margin-left:14px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1040px}th{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:11px 10px;border-bottom:1px solid var(--line)}td{padding:13px 10px;border-bottom:1px solid rgba(36,54,77,.7);white-space:nowrap}tbody tr:hover{background:rgba(85,167,255,.04)}.token{font-weight:750}.address{font:11px ui-monospace,SFMono-Regular,Consolas;color:var(--muted)}.token-link{color:inherit;text-decoration:none;display:inline-block}.token-link:hover .token{color:var(--blue)}.external{color:var(--blue);font-size:11px;margin-left:4px}
-    .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:700;font-size:11px}.observe{background:#19304b;color:#9ecbff}.momentum,.accumulation{background:#123b31;color:#67e6b8}.high{background:#294320;color:#b4ef79}.risk,.distribution{background:#4a2028;color:#ff9aaa}.thin,.rebound,.provider{background:#4a381d;color:#ffd27d}.expired{background:#29313d;color:#aab5c3}.pos{color:var(--green)}.neg{color:var(--red)}.neutral{color:var(--muted)}.warning{margin-top:18px;padding:12px 15px;border:1px solid #54421f;background:#2a2415;color:#f2cf82;border-radius:12px}.empty{text-align:center;color:var(--muted);padding:24px}.error{border-color:#68303a;background:#321820;color:#ff9aaa}.footer{color:var(--muted);font-size:12px;text-align:center;padding:8px}
+    .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:700;font-size:11px}.observe{background:#19304b;color:#9ecbff}.benchmark{background:#252e58;color:#b7c7ff}.momentum,.accumulation{background:#123b31;color:#67e6b8}.high{background:#294320;color:#b4ef79}.risk,.distribution{background:#4a2028;color:#ff9aaa}.thin,.rebound,.provider{background:#4a381d;color:#ffd27d}.expired{background:#29313d;color:#aab5c3}.pos{color:var(--green)}.neg{color:var(--red)}.neutral{color:var(--muted)}.warning{margin-top:18px;padding:12px 15px;border:1px solid #54421f;background:#2a2415;color:#f2cf82;border-radius:12px}.empty{text-align:center;color:var(--muted);padding:24px}.error{border-color:#68303a;background:#321820;color:#ff9aaa}.footer{color:var(--muted);font-size:12px;text-align:center;padding:8px}
     @media(max-width:800px){.wrap{padding:18px}.top{display:block}.live{margin-top:14px;width:max-content}.cards{grid-template-columns:repeat(2,1fr)}h1{font-size:25px}.section-head{align-items:flex-start;flex-direction:column}.links a{margin:0 14px 0 0}}
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.10.3 Premium · Provider-resilient Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + canonical-pair EVM evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.11 Premium · Benchmark-expanded Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + ETH-relative multi-chain EVM evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
@@ -5384,10 +5431,10 @@ const num=v=>v==null?'—':new Intl.NumberFormat('en-US',{maximumFractionDigits:
 const trend=v=>v==null?'<span class="neutral">collecting</span>':`<span class="${v>0?'pos':v<0?'neg':'neutral'}">${v>0?'+':''}${num(v)}%</span>`;
 const when=v=>v?new Date(v).toLocaleString():'—';
 const age=s=>s==null?'unknown age':s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m`:s<86400?`${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`:`${Math.floor(s/86400)}d ${Math.floor((s%86400)/3600)}h`;
-const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
+const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_BENCHMARK'?'benchmark':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
 document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
-document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="12" class="empty">No EVM snapshots yet.</td></tr>';
+document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="12" class="empty">No EVM snapshots yet.</td></tr>';
 document.getElementById('solBody').innerHTML=d.solana_signals.length?d.solana_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol||'Unknown')}</div><div class="address">${esc((x.token_address||'').slice(0,10))}…</div></td><td>${badge(x.status)}</td><td>${num(x.buy_score)}</td><td>${num(x.sell_score)}</td><td>${num(x.independent_buy_clusters)}</td><td>${num(x.independent_sell_clusters)}</td><td>${esc(x.safety_status)}</td><td>${when(x.updated_at)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">No Solana paper signals yet.</td></tr>';
 document.getElementById('footer').textContent=`${esc(d.version)} · generated ${when(d.generated_at)} · auto-refreshes every 60 seconds.`;
 }catch(e){document.getElementById('refreshState').textContent='Dashboard data unavailable';document.querySelector('.warning').classList.add('error');document.querySelector('.warning').textContent='Could not load dashboard data. The monitoring APIs continue running independently.';}}
