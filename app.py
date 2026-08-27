@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.12.1-paper-signal-expiry"
+VERSION = "4.12.2-paper-solana-evidence-quality"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -2840,17 +2840,31 @@ def telegram_configured():
     return bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
 
 
-def solana_status_label(status, buy_clusters=0):
+def solana_status_label(status, buy_clusters=0, sell_clusters=0):
     """Human-readable labels; internal codes remain stable for compatibility."""
     status = str(status or "UNKNOWN").upper()
-    if status == "OBSERVE":
-        return "1 BUYER"
-    if status == "BUILDING":
-        return "2 BUYERS"
-    if status == "PAPER_CONFIRMED":
-        return "3+ BUYERS"
     if status == "EXPIRED":
         return f"NO ACTIVITY FOR {SIGNAL_WINDOW_MINUTES} MINUTES"
+    buy_clusters = max(int(buy_clusters or 0), 0)
+    sell_clusters = max(int(sell_clusters or 0), 0)
+    if buy_clusters == 0 and sell_clusters > 0:
+        return "INVALIDATED · SELL-ONLY" if status == "INVALIDATED" else "SELL-ONLY"
+    if buy_clusters == 0:
+        return "NO BUYERS"
+    buyer_label = (
+        "3+ BUYERS" if buy_clusters >= 3 else
+        "2 BUYERS" if buy_clusters == 2 else
+        "1 BUYER"
+    )
+    if sell_clusters > 0:
+        seller_label = f"{sell_clusters} SELLER" + ("S" if sell_clusters != 1 else "")
+        if status == "INVALIDATED":
+            return f"INVALIDATED · MIXED: {buyer_label} / {seller_label}"
+        return f"{buyer_label} · MIXED WITH {seller_label}"
+    if status == "INVALIDATED":
+        return "INVALIDATED"
+    if status in {"OBSERVE", "BUILDING", "PAPER_CONFIRMED"}:
+        return buyer_label
     return status.replace("_", " ")
 
 
@@ -2973,11 +2987,21 @@ def enrich_solana_token_metadata(token_addresses, limit=None):
     return cached
 
 
+def prioritise_solana_metadata(grouped):
+    """Put active multi-buyer signals first, then the freshest observations."""
+    return sorted(grouped, key=lambda token: (
+        -len(grouped[token].get("BUY") or {}),
+        -grouped[token]["last_activity_at"].timestamp(),
+        token,
+    ))
+
+
 def format_signal_notification(signal, *, test=False):
     symbol = signal.get("token_symbol") or "Unknown token"
     status = signal.get("status") or "UNKNOWN"
     display_status = solana_status_label(
-        status, signal.get("independent_buy_clusters", 0)
+        status, signal.get("independent_buy_clusters", 0),
+        signal.get("independent_sell_clusters", 0)
     )
     heading = "TEST — Wallet Monitor notification pipeline" if test else f"Paper signal: {display_status}"
     return "\n".join([
@@ -4360,7 +4384,8 @@ def refresh_paper_signals():
         prior = item[side].get(cluster_id, 0)
         item[side][cluster_id] = max(prior, float(weight or 0))
 
-    metadata = enrich_solana_token_metadata(grouped.keys())
+    metadata_priority = prioritise_solana_metadata(grouped)
+    metadata = enrich_solana_token_metadata(metadata_priority)
     for token, item in grouped.items():
         enriched = metadata.get(token) or {}
         if not item.get("token_symbol") and enriched.get("token_symbol"):
@@ -4444,7 +4469,9 @@ def refresh_paper_signals():
                     "status": status, "buy_score": buy_score, "sell_score": sell_score,
                     "independent_buy_clusters": buy_clusters,
                     "independent_sell_clusters": sell_clusters,
-                    "display_status": solana_status_label(status, buy_clusters),
+                    "display_status": solana_status_label(
+                        status, buy_clusters, sell_clusters
+                    ),
                     "actionable": False,
                     "safety_status": item.get("safety_status", "unverified"),
                 })
@@ -5448,11 +5475,14 @@ def build_solana_activity_diagnostics():
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT wallet, cluster_id, token_address, token_symbol, side,
-                    occurred_at
-                FROM wallet_activity
-                WHERE occurred_at >= NOW() - INTERVAL '24 hours'
-                ORDER BY occurred_at DESC
+                SELECT a.wallet, a.cluster_id, a.token_address,
+                    COALESCE(a.token_symbol, m.token_symbol) AS token_symbol,
+                    a.side, a.occurred_at
+                FROM wallet_activity a
+                LEFT JOIN solana_token_metadata m
+                    ON m.token_address = a.token_address
+                WHERE a.occurred_at >= NOW() - INTERVAL '24 hours'
+                ORDER BY a.occurred_at DESC
             """)
             rows = cur.fetchall()
             cur.execute("""
@@ -5484,10 +5514,10 @@ def build_solana_activity_diagnostics():
                 "token_address": token, "token_symbol": symbols.get(token),
                 "independent_buy_clusters": buy_count,
                 "independent_sell_clusters": sell_count,
-                "display_status": (
-                    "3+ BUYERS" if buy_count >= 3 else
-                    "2 BUYERS" if buy_count == 2 else
-                    "1 BUYER" if buy_count == 1 else "SELL-ONLY"
+                "display_status": solana_status_label(
+                    "PAPER_CONFIRMED" if buy_count >= 3 else
+                    "BUILDING" if buy_count == 2 else "OBSERVE",
+                    buy_count, sell_count,
                 ),
                 "dexscreener_url": f"https://dexscreener.com/solana/{token}",
             })
@@ -5542,7 +5572,7 @@ def serialize_signal_row(row):
         )
     return {
         "token_address": row[0], "token_symbol": row[1], "status": row[2],
-        "display_status": solana_status_label(row[2], row[5]),
+        "display_status": solana_status_label(row[2], row[5], row[6]),
         "buy_score": row[3], "sell_score": row[4],
         "independent_buy_clusters": row[5],
         "independent_sell_clusters": row[6],
