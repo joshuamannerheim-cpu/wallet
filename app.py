@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.12.0-paper-evidence-calibration"
+VERSION = "4.12.1-paper-signal-expiry"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -4297,6 +4297,39 @@ def persist_wallet_activity(events):
     return inserted
 
 
+def expire_stale_paper_signals():
+    """Expire elapsed Solana signals without providers, alerts, or refresh work."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=SIGNAL_WINDOW_MINUTES)
+    with db() as conn:
+        with conn.cursor() as cur:
+            # UPDATE ... RETURNING makes the sweep safe when dashboard and API
+            # reads arrive together: only the request that changes a row records
+            # its expiry transition.
+            cur.execute("""
+                UPDATE paper_signals SET status = 'EXPIRED', actionable = FALSE,
+                    updated_at = NOW()
+                WHERE last_activity_at < %s AND status <> 'EXPIRED'
+                RETURNING token_address, token_symbol, buy_score, sell_score,
+                    independent_buy_clusters, independent_sell_clusters
+            """, (cutoff,))
+            expired_rows = cur.fetchall()
+            for expired in expired_rows:
+                cur.execute("""
+                    INSERT INTO paper_signal_history (
+                        token_address, token_symbol, status, buy_score, sell_score,
+                        independent_buy_clusters, independent_sell_clusters, details
+                    ) VALUES (%s, %s, 'EXPIRED', %s, %s, %s, %s, %s)
+                """, (
+                    expired[0], expired[1], expired[2], expired[3],
+                    expired[4], expired[5], json.dumps({
+                        "reason": "signal_window_elapsed",
+                        "trigger": "read_safe_expiry_sweep",
+                    }),
+                ))
+        conn.commit()
+    return len(expired_rows)
+
+
 def refresh_paper_signals():
     """Aggregate recent events with one maximum-weight vote per wallet cluster."""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=SIGNAL_WINDOW_MINUTES)
@@ -4416,29 +4449,9 @@ def refresh_paper_signals():
                     "safety_status": item.get("safety_status", "unverified"),
                 })
 
-            cur.execute("""
-                SELECT token_address, token_symbol, buy_score, sell_score,
-                    independent_buy_clusters, independent_sell_clusters
-                FROM paper_signals
-                WHERE last_activity_at < %s AND status <> 'EXPIRED'
-            """, (cutoff,))
-            expiring = cur.fetchall()
-            for expired in expiring:
-                cur.execute("""
-                    INSERT INTO paper_signal_history (
-                        token_address, token_symbol, status, buy_score, sell_score,
-                        independent_buy_clusters, independent_sell_clusters, details
-                    ) VALUES (%s, %s, 'EXPIRED', %s, %s, %s, %s, %s)
-                """, (
-                    expired[0], expired[1], expired[2], expired[3],
-                    expired[4], expired[5], json.dumps({"reason": "signal_window_elapsed"}),
-                ))
-            cur.execute("""
-                UPDATE paper_signals SET status = 'EXPIRED', actionable = FALSE,
-                    updated_at = NOW()
-                WHERE last_activity_at < %s AND status <> 'EXPIRED'
-            """, (cutoff,))
         conn.commit()
+
+    expire_stale_paper_signals()
 
     for transition in notification_transitions:
         try:
@@ -5555,6 +5568,7 @@ SIGNAL_SELECT = """
 @app.get("/signals")
 def signals_endpoint():
     initialise_database()
+    expired_on_read = expire_stale_paper_signals()
     status = request.args.get("status")
     include_expired = str(request.args.get("include_expired", "true")).lower() in {
         "1", "true", "yes", "on",
@@ -5571,6 +5585,7 @@ def signals_endpoint():
     return jsonify({
         "success": True, "count": len(rows),
         "signals": [serialize_signal_row(row) for row in rows],
+        "expired_on_read": expired_on_read,
         "paper_mode": True, "actionable": False,
         "warning": "Paper research only; token safety is not yet verified.",
     })
@@ -5581,6 +5596,7 @@ def signal_detail_endpoint(token_address):
     initialise_database()
     if not is_valid_solana_address(token_address):
         return jsonify({"success": False, "error": "Invalid Solana token address"}), 400
+    expire_stale_paper_signals()
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(SIGNAL_SELECT + " WHERE token_address = %s", (token_address,))
@@ -5732,6 +5748,7 @@ def dashboard_change(current, baseline):
 def build_dashboard_payload():
     """Assemble read-only EVM/Solana monitoring data and rolling comparisons."""
     initialise_database()
+    expire_stale_paper_signals()
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(EVM_SIGNAL_SELECT + " ORDER BY s.token_symbol")
