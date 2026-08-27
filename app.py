@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.11.0-paper-benchmark-expansion"
+VERSION = "4.12.0-paper-evidence-calibration"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -104,6 +104,15 @@ HELIUS_MAX_REMOVAL_FRACTION = min(
     max(float(os.getenv("HELIUS_MAX_REMOVAL_FRACTION", "0.50")), 0.0), 1.0
 )
 SIGNAL_WINDOW_MINUTES = min(max(int(os.getenv("SIGNAL_WINDOW_MINUTES", "60")), 15), 360)
+SOLANA_CONSENSUS_WINDOWS_HOURS = (1, 6, 24)
+SOLANA_METADATA_REFRESH_HOURS = min(
+    max(int(os.getenv("SOLANA_METADATA_REFRESH_HOURS", "24")), 1), 168
+)
+SOLANA_METADATA_PER_REFRESH = min(
+    max(int(os.getenv("SOLANA_METADATA_PER_REFRESH", "3")), 0), 10
+)
+EVM_VISIBLE_STATE_CONFIRMATIONS = 2
+EVM_ALERT_CONFIRMATIONS = 3
 TELEGRAM_ALERT_STATUSES = {
     value.strip().upper()
     for value in os.getenv(
@@ -370,6 +379,18 @@ def initialise_database():
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS solana_token_metadata (
+                    token_address TEXT PRIMARY KEY,
+                    token_symbol TEXT,
+                    token_name TEXT,
+                    safety_status TEXT NOT NULL DEFAULT 'unverified',
+                    safety_details TEXT NOT NULL DEFAULT '{}',
+                    metadata_provider TEXT NOT NULL DEFAULT 'birdeye',
+                    last_attempted_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS paper_signal_history (
                     id BIGSERIAL PRIMARY KEY,
                     token_address TEXT NOT NULL,
@@ -563,6 +584,12 @@ def initialise_database():
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS availability_details TEXT NOT NULL DEFAULT '{}'")
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS last_trusted_status TEXT")
             cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS is_benchmark BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS pending_status TEXT")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS pending_status_count INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS raw_status TEXT")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS raw_status_count INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE evm_token_signals ADD COLUMN IF NOT EXISTS alert_confirmation_count INTEGER NOT NULL DEFAULT 0")
+            cur.execute("CREATE INDEX IF NOT EXISTS solana_metadata_updated_idx ON solana_token_metadata (updated_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS evm_snapshot_integrity_idx ON evm_token_snapshots (chain, token_address, is_anomaly, captured_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS evm_snapshot_availability_idx ON evm_token_snapshots (chain, token_address, is_provider_unavailable, captured_at DESC)")
             for chain, address, symbol, name, source, monitoring_status in DEFAULT_TOKEN_WATCHLIST:
@@ -587,7 +614,7 @@ def initialise_database():
                 """, (chain, address, symbol, name, source, monitoring_status))
 
             # The original native marker was metadata-only and never entered
-            # the EVM refresh. V4.11 replaces it with Base WETH so ETH becomes
+            # the EVM refresh. Base WETH makes ETH a real benchmark with the
             # a real, non-actionable benchmark with the same evidence cadence.
             cur.execute("""
                 UPDATE token_watchlist
@@ -1325,6 +1352,9 @@ def diagnostics():
                     "discovery_max_tokens": DISCOVERY_MAX_TOKENS,
                     "pipeline_max_seconds": PIPELINE_MAX_SECONDS,
                     "signal_window_minutes": SIGNAL_WINDOW_MINUTES,
+                    "solana_consensus_windows_hours": list(SOLANA_CONSENSUS_WINDOWS_HOURS),
+                    "solana_metadata_refresh_hours": SOLANA_METADATA_REFRESH_HOURS,
+                    "solana_metadata_per_refresh": SOLANA_METADATA_PER_REFRESH,
                     "helius_webhook_configured": bool(os.getenv("HELIUS_WEBHOOK_SECRET")),
                     "helius_webhook_sync_configured": bool(os.getenv("HELIUS_API_KEY")),
                     "helius_auto_sync": HELIUS_AUTO_SYNC,
@@ -1343,6 +1373,8 @@ def diagnostics():
                     "evm_min_momentum_liquidity_usd": EVM_MIN_MOMENTUM_LIQUIDITY_USD,
                     "evm_min_momentum_h1_volume_usd": EVM_MIN_MOMENTUM_H1_VOLUME_USD,
                     "evm_min_momentum_h1_transactions": EVM_MIN_MOMENTUM_H1_TRANSACTIONS,
+                    "evm_visible_state_confirmations": EVM_VISIBLE_STATE_CONFIRMATIONS,
+                    "evm_alert_confirmations": EVM_ALERT_CONFIRMATIONS,
                     "evm_data_integrity": {
                         "canonical_pair_locking": True,
                         "anomalies_excluded_from_trends": True,
@@ -2808,10 +2840,146 @@ def telegram_configured():
     return bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
 
 
+def solana_status_label(status, buy_clusters=0):
+    """Human-readable labels; internal codes remain stable for compatibility."""
+    status = str(status or "UNKNOWN").upper()
+    if status == "OBSERVE":
+        return "1 BUYER"
+    if status == "BUILDING":
+        return "2 BUYERS"
+    if status == "PAPER_CONFIRMED":
+        return "3+ BUYERS"
+    if status == "EXPIRED":
+        return f"NO ACTIVITY FOR {SIGNAL_WINDOW_MINUTES} MINUTES"
+    return status.replace("_", " ")
+
+
+def _birdeye_payload(response):
+    if response.status_code != 200:
+        return {}
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+def _solana_safety_status(security):
+    """Conservative provider screening; it never upgrades a token to 'safe'."""
+    if not security:
+        return "unverified", {"reason": "security_data_unavailable"}
+    flags = []
+    truthy_risk_fields = {
+        "mintable": "mint_authority_active",
+        "freezeable": "freeze_authority_active",
+        "mutableMetadata": "mutable_metadata",
+        "isToken2022": "token_2022_review_required",
+    }
+    for field, label in truthy_risk_fields.items():
+        if security.get(field) is True:
+            flags.append(label)
+    top10 = safe_float(
+        security.get("top10HolderPercent")
+        or security.get("top10HolderPercentage")
+    )
+    owner = safe_float(security.get("ownerPercentage"))
+    creator = safe_float(security.get("creatorPercentage"))
+    for value, label, threshold in (
+        (top10, "high_top10_concentration", 0.50),
+        (owner, "high_owner_concentration", 0.10),
+        (creator, "high_creator_concentration", 0.10),
+    ):
+        if value is not None and value >= threshold:
+            flags.append(label)
+    status = "review_required" if flags else "screened_unverified"
+    return status, {
+        "risk_flags": flags, "top10_holder_percent": top10,
+        "owner_percentage": owner, "creator_percentage": creator,
+        "provider_screened": True,
+    }
+
+
+def enrich_solana_token_metadata(token_addresses, limit=None):
+    """Bounded Birdeye metadata/security enrichment with a persistent cache."""
+    limit = SOLANA_METADATA_PER_REFRESH if limit is None else max(int(limit), 0)
+    if not os.getenv("BIRDEYE_API_KEY") or limit == 0:
+        return {}
+    ordered = list(dict.fromkeys(address for address in token_addresses if address))
+    if not ordered:
+        return {}
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=SOLANA_METADATA_REFRESH_HOURS)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT token_address, token_symbol, token_name, safety_status,
+                    safety_details, updated_at
+                FROM solana_token_metadata WHERE token_address = ANY(%s)
+            """, (ordered,))
+            cached_rows = cur.fetchall()
+    cached = {}
+    for row in cached_rows:
+        try:
+            details = json.loads(row[4] or "{}")
+        except (TypeError, ValueError):
+            details = {}
+        cached[row[0]] = {
+            "token_symbol": row[1], "token_name": row[2],
+            "safety_status": row[3], "safety_details": details,
+            "updated_at": row[5],
+        }
+    due = [
+        address for address in ordered
+        if address not in cached or not cached[address].get("updated_at")
+        or cached[address]["updated_at"] < cutoff
+        or not cached[address].get("token_symbol")
+    ][:limit]
+    for address in due:
+        symbol = name = None
+        security_data = {}
+        try:
+            overview = _birdeye_payload(birdeye_get(
+                "/defi/token_overview", {"address": address}, retry_429=False
+            ))
+            symbol = overview.get("symbol") or overview.get("tokenSymbol")
+            name = overview.get("name") or overview.get("tokenName")
+            security_data = _birdeye_payload(birdeye_get(
+                "/defi/token_security", {"address": address}, retry_429=False
+            ))
+        except (requests.Timeout, requests.ConnectionError):
+            pass
+        safety_status, safety_details = _solana_safety_status(security_data)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO solana_token_metadata (
+                        token_address, token_symbol, token_name, safety_status,
+                        safety_details, last_attempted_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (token_address) DO UPDATE SET
+                        token_symbol = COALESCE(EXCLUDED.token_symbol, solana_token_metadata.token_symbol),
+                        token_name = COALESCE(EXCLUDED.token_name, solana_token_metadata.token_name),
+                        safety_status = EXCLUDED.safety_status,
+                        safety_details = EXCLUDED.safety_details,
+                        last_attempted_at = NOW(), updated_at = NOW()
+                """, (address, symbol, name, safety_status, json.dumps(safety_details)))
+            conn.commit()
+        cached[address] = {
+            "token_symbol": symbol or cached.get(address, {}).get("token_symbol"),
+            "token_name": name or cached.get(address, {}).get("token_name"),
+            "safety_status": safety_status, "safety_details": safety_details,
+            "updated_at": datetime.now(timezone.utc),
+        }
+    return cached
+
+
 def format_signal_notification(signal, *, test=False):
     symbol = signal.get("token_symbol") or "Unknown token"
     status = signal.get("status") or "UNKNOWN"
-    heading = "TEST — Wallet Monitor notification pipeline" if test else f"Paper signal: {status}"
+    display_status = solana_status_label(
+        status, signal.get("independent_buy_clusters", 0)
+    )
+    heading = "TEST — Wallet Monitor notification pipeline" if test else f"Paper signal: {display_status}"
     return "\n".join([
         heading,
         f"Token: {symbol}",
@@ -2946,7 +3114,7 @@ def queue_and_deliver_signal_notification(signal, event_key, *, test=False):
 
 
 # =========================================================
-# V4.11 MULTI-CHAIN EVM BENCHMARK EXPANSION
+# V4.12 MULTI-CHAIN EVM EVIDENCE CALIBRATION
 # =========================================================
 
 def safe_float(value):
@@ -3449,7 +3617,7 @@ def classify_evm_benchmark(snapshot, previous=None, history=None):
 
 
 def format_evm_notification(signal, *, test=False):
-    heading = "TEST — V4.11 EVM notification pipeline" if test else f"EVM state change: {signal['status']}"
+    heading = "TEST — V4.12 EVM notification pipeline" if test else f"EVM state confirmed: {signal['status']}"
     chain = str(signal.get("chain") or "robinhood").lower()
     chain_label = EVM_CHAIN_CONFIG.get(chain, {}).get("label", chain.title())
     return "\n".join([
@@ -3462,6 +3630,7 @@ def format_evm_notification(signal, *, test=False):
         f"Liquidity tier: {signal.get('liquidity_tier', 'UNKNOWN')}",
         f"Structure: {signal.get('structure_state', 'COLLECTING')} ({signal.get('structure_confidence', 0)}%)",
         f"Data quality: {signal.get('data_quality', 'partial')}",
+        f"Confirmations: {signal.get('alert_confirmation_count', EVM_ALERT_CONFIRMATIONS)}/{EVM_ALERT_CONFIRMATIONS}",
         f"Reasons: {', '.join(signal.get('reasons') or ['baseline observation'])}",
         "MULTI-CHAIN EVM — PAPER RESEARCH ONLY; not a trade instruction.",
     ])
@@ -3636,6 +3805,61 @@ def evm_snapshot_history(chain, address, hours=26):
     } for row in rows]
 
 
+def calibrate_evm_state(raw_classification, old_row, snapshot):
+    """Require repeat evidence for market-state changes and alert delivery."""
+    classification = dict(raw_classification)
+    raw_status = classification["status"]
+    infrastructure_state = bool(
+        snapshot.get("is_anomaly") or snapshot.get("is_provider_unavailable")
+        or snapshot.get("is_benchmark")
+    )
+    if not old_row or infrastructure_state:
+        raw_count = 1
+        classification.update({
+            "raw_status": raw_status, "raw_status_count": raw_count,
+            "pending_status": None, "pending_status_count": 0,
+            "alert_confirmation_count": (
+                raw_count if raw_status in EVM_ALERT_STATUSES else 0
+            ),
+        })
+        return classification
+
+    previous_status, previous_trusted, old_pending, old_pending_count, \
+        old_raw, old_raw_count, old_alert_count = old_row
+    effective_previous = (
+        previous_trusted if previous_status in {
+            "EVM_DATA_ANOMALY", "EVM_PROVIDER_UNAVAILABLE",
+        } and previous_trusted else previous_status
+    )
+    raw_count = int(old_raw_count or 0) + 1 if old_raw == raw_status else 1
+    pending_status, pending_count = None, 0
+    effective_status = raw_status
+    if effective_previous and raw_status != effective_previous:
+        pending_status = raw_status
+        pending_count = (
+            int(old_pending_count or 0) + 1 if old_pending == raw_status else 1
+        )
+        if pending_count < EVM_VISIBLE_STATE_CONFIRMATIONS:
+            effective_status = effective_previous
+            classification["reasons"] = list(classification.get("reasons") or []) + [
+                f"pending_state_confirmation:{raw_status}:{pending_count}/{EVM_VISIBLE_STATE_CONFIRMATIONS}"
+            ]
+        else:
+            pending_status, pending_count = None, 0
+
+    alert_count = (
+        raw_count if effective_status == raw_status
+        and raw_status in EVM_ALERT_STATUSES else 0
+    )
+    classification.update({
+        "status": effective_status, "raw_status": raw_status,
+        "raw_status_count": raw_count, "pending_status": pending_status,
+        "pending_status_count": pending_count,
+        "alert_confirmation_count": alert_count,
+    })
+    return classification
+
+
 def persist_evm_snapshot(snapshot):
     snapshot["captured_at"] = snapshot.get("captured_at") or datetime.now(timezone.utc)
     history = evm_snapshot_history(snapshot["chain"], snapshot["token_address"])
@@ -3660,12 +3884,16 @@ def persist_evm_snapshot(snapshot):
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT status, last_trusted_status FROM evm_token_signals
+                SELECT status, last_trusted_status, pending_status,
+                    pending_status_count, raw_status, raw_status_count,
+                    alert_confirmation_count
+                FROM evm_token_signals
                 WHERE chain = %s AND token_address = %s
             """, (snapshot["chain"], snapshot["token_address"]))
             old_row = cur.fetchone()
             previous_status = old_row[0] if old_row else None
             previous_trusted_status = old_row[1] if old_row else None
+            classification = calibrate_evm_state(classification, old_row, snapshot)
             recovering_from_provider_outage = bool(
                 previous_status == "EVM_PROVIDER_UNAVAILABLE"
                 and not snapshot["is_provider_unavailable"]
@@ -3773,6 +4001,20 @@ def persist_evm_snapshot(snapshot):
                 else snapshot_id,
                 snapshot["data_quality"],
             ))
+            cur.execute("""
+                UPDATE evm_token_signals
+                SET pending_status = %s, pending_status_count = %s,
+                    raw_status = %s, raw_status_count = %s,
+                    alert_confirmation_count = %s
+                WHERE chain = %s AND token_address = %s
+            """, (
+                classification.get("pending_status"),
+                classification.get("pending_status_count", 0),
+                classification.get("raw_status", classification["status"]),
+                classification.get("raw_status_count", 1),
+                classification.get("alert_confirmation_count", 0),
+                snapshot["chain"], snapshot["token_address"],
+            ))
             history_id = None
             history_previous_status = (
                 previous_trusted_status
@@ -3835,14 +4077,34 @@ def persist_evm_snapshot(snapshot):
         "previous_status": previous_status, "history_id": history_id,
         "recovered_from_provider_outage": recovering_from_provider_outage,
     }
+    notification_history_id = history_id
+    if (
+        not notification_history_id
+        and classification["status"] in EVM_ALERT_STATUSES
+        and classification.get("alert_confirmation_count", 0) >= EVM_ALERT_CONFIRMATIONS
+    ):
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id FROM evm_signal_history
+                    WHERE chain = %s AND token_address = %s AND status = %s
+                    ORDER BY id DESC LIMIT 1
+                """, (
+                    snapshot["chain"], snapshot["token_address"],
+                    classification["status"],
+                ))
+                notification_row = cur.fetchone()
+                notification_history_id = notification_row[0] if notification_row else None
     if (
         not snapshot["is_anomaly"] and not snapshot["is_provider_unavailable"]
-        and not recovering_from_provider_outage and previous_status and history_id
+        and not recovering_from_provider_outage and previous_status
+        and notification_history_id
         and classification["status"] in EVM_ALERT_STATUSES
+        and classification.get("alert_confirmation_count", 0) >= EVM_ALERT_CONFIRMATIONS
     ):
         try:
             notification = queue_and_deliver_evm_notification(
-                result, f"evm-signal-history:{history_id}"
+                result, f"evm-signal-confirmed:{notification_history_id}"
             )
             result["notification_status"] = notification.get("status")
         except Exception:
@@ -4065,6 +4327,13 @@ def refresh_paper_signals():
         prior = item[side].get(cluster_id, 0)
         item[side][cluster_id] = max(prior, float(weight or 0))
 
+    metadata = enrich_solana_token_metadata(grouped.keys())
+    for token, item in grouped.items():
+        enriched = metadata.get(token) or {}
+        if not item.get("token_symbol") and enriched.get("token_symbol"):
+            item["token_symbol"] = enriched["token_symbol"]
+        item["safety_status"] = enriched.get("safety_status") or "unverified"
+
     refreshed = []
     notification_transitions = []
     with db() as conn:
@@ -4094,7 +4363,7 @@ def refresh_paper_signals():
                         first_activity_at, last_activity_at, safety_status,
                         actionable, updated_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        'unverified', FALSE, NOW())
+                        %s, FALSE, NOW())
                     ON CONFLICT (token_address) DO UPDATE SET
                         token_symbol = COALESCE(EXCLUDED.token_symbol, paper_signals.token_symbol),
                         status = EXCLUDED.status, buy_score = EXCLUDED.buy_score,
@@ -4105,11 +4374,13 @@ def refresh_paper_signals():
                         contributing_clusters = EXCLUDED.contributing_clusters,
                         first_activity_at = EXCLUDED.first_activity_at,
                         last_activity_at = EXCLUDED.last_activity_at,
-                        safety_status = 'unverified', actionable = FALSE, updated_at = NOW()
+                        safety_status = EXCLUDED.safety_status,
+                        actionable = FALSE, updated_at = NOW()
                 """, (
                     token, item.get("token_symbol"), status, buy_score, sell_score,
                     buy_clusters, sell_clusters, json.dumps(wallets),
                     json.dumps(clusters), item["first_activity_at"], item["last_activity_at"],
+                    item.get("safety_status", "unverified"),
                 ))
                 if not prior or prior[0] != status:
                     cur.execute("""
@@ -4140,7 +4411,9 @@ def refresh_paper_signals():
                     "status": status, "buy_score": buy_score, "sell_score": sell_score,
                     "independent_buy_clusters": buy_clusters,
                     "independent_sell_clusters": sell_clusters,
-                    "actionable": False, "safety_status": "unverified",
+                    "display_status": solana_status_label(status, buy_clusters),
+                    "actionable": False,
+                    "safety_status": item.get("safety_status", "unverified"),
                 })
 
             cur.execute("""
@@ -4488,7 +4761,7 @@ def watchlist_endpoint():
         })
     return jsonify({
         "success": True, "count": len(items), "tokens": items,
-        "note": "V4.11 adds ETH benchmark context plus GOOD and BSTONK while retaining provider-resilient canonical-pair evidence.",
+        "note": "V4.12 retains the expanded watchlist and adds evidence calibration, holder freshness and ETH-relative performance.",
         "paper_mode": True, "actionable": False,
     })
 
@@ -4602,7 +4875,8 @@ EVM_SIGNAL_SELECT = """
         s.liquidity_tier, s.structure_state, s.structure_confidence,
         s.structure_details, s.horizon_metrics, s.wallet_quality,
         s.anomaly_details, s.availability_details, s.last_trusted_status,
-        s.is_benchmark
+        s.is_benchmark, s.pending_status, s.pending_status_count,
+        s.raw_status, s.raw_status_count, s.alert_confirmation_count
     FROM evm_token_signals s
     LEFT JOIN evm_token_snapshots p ON p.id = s.latest_snapshot_id
 """
@@ -4653,6 +4927,11 @@ def serialize_evm_signal(row):
         "availability_details": parsed_json(28, {}),
         "last_trusted_status": row[29],
         "is_benchmark": bool(row[30]),
+        "pending_status": row[31], "pending_status_count": row[32] or 0,
+        "raw_status": row[33], "raw_status_count": row[34] or 0,
+        "alert_confirmation_count": row[35] or 0,
+        "visible_state_confirmations_required": EVM_VISIBLE_STATE_CONFIRMATIONS,
+        "alert_confirmations_required": EVM_ALERT_CONFIRMATIONS,
         "using_last_trusted_snapshot": row[3] in {
             "EVM_DATA_ANOMALY", "EVM_PROVIDER_UNAVAILABLE",
         },
@@ -4771,7 +5050,7 @@ def evm_signals_endpoint():
 
 @app.get("/evm-evidence")
 def evm_evidence_endpoint():
-    """Read-only V4.11 multi-chain evidence summary for calibration and review."""
+    """Read-only V4.12 multi-chain evidence summary for calibration and review."""
     initialise_database()
     with db() as conn:
         with conn.cursor() as cur:
@@ -4796,6 +5075,47 @@ def evm_evidence_endpoint():
         "signals": signals,
         "wallet_quality_coverage": "holder_count_only",
         "chart_method": "15-minute snapshot proxy; not OHLC candles",
+        "paper_mode": True, "actionable": False,
+    })
+
+
+@app.get("/evm-transition-history")
+def evm_transition_history_endpoint():
+    """Read-only EVM classification history for churn and calibration review."""
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 200)), 1), 1000)
+    except ValueError:
+        limit = 200
+    chain = str(request.args.get("chain") or "").strip().lower()
+    clauses, params = [], []
+    if chain:
+        if chain not in EVM_CHAIN_CONFIG:
+            return jsonify({"success": False, "error": "Unsupported EVM chain"}), 400
+        clauses.append("chain = %s")
+        params.append(chain)
+    query = """
+        SELECT id, chain, token_address, token_symbol, previous_status, status,
+            momentum_score, risk_score, details, recorded_at
+        FROM evm_signal_history
+    """
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY id DESC LIMIT %s"
+    params.append(limit)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, tuple(params))
+            rows = cur.fetchall()
+    return jsonify({
+        "success": True, "version": VERSION, "count": len(rows),
+        "transitions": [{
+            "id": row[0], "chain": row[1], "token_address": row[2],
+            "token_symbol": row[3], "previous_status": row[4],
+            "status": row[5], "momentum_score": row[6],
+            "risk_score": row[7], "details": json.loads(row[8] or "{}"),
+            "recorded_at": row[9],
+        } for row in rows],
         "paper_mode": True, "actionable": False,
     })
 
@@ -5109,19 +5429,116 @@ def wallet_activity_endpoint():
     } for row in rows]})
 
 
+def build_solana_activity_diagnostics():
+    """Measure where Solana evidence converges or disappears over 1h/6h/24h."""
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet, cluster_id, token_address, token_symbol, side,
+                    occurred_at
+                FROM wallet_activity
+                WHERE occurred_at >= NOW() - INTERVAL '24 hours'
+                ORDER BY occurred_at DESC
+            """)
+            rows = cur.fetchall()
+            cur.execute("""
+                SELECT c.wallet, c.cluster_id, MAX(a.occurred_at) AS last_activity_at
+                FROM wallet_clusters c
+                LEFT JOIN wallet_activity a ON a.wallet = c.wallet
+                GROUP BY c.wallet, c.cluster_id
+                ORDER BY last_activity_at DESC NULLS LAST
+            """)
+            wallet_rows = cur.fetchall()
+
+    now = datetime.now(timezone.utc)
+    windows = {}
+    for hours in SOLANA_CONSENSUS_WINDOWS_HOURS:
+        cutoff = now - timedelta(hours=hours)
+        selected = [row for row in rows if row[5] >= cutoff]
+        buyers, sellers = {}, {}
+        symbols = {}
+        for wallet, cluster, token, symbol, side, occurred_at in selected:
+            symbols[token] = symbol or symbols.get(token)
+            target = buyers if side == "BUY" else sellers
+            target.setdefault(token, set()).add(cluster)
+        tokens = set(buyers) | set(sellers)
+        consensus = []
+        for token in tokens:
+            buy_count = len(buyers.get(token, set()))
+            sell_count = len(sellers.get(token, set()))
+            consensus.append({
+                "token_address": token, "token_symbol": symbols.get(token),
+                "independent_buy_clusters": buy_count,
+                "independent_sell_clusters": sell_count,
+                "display_status": (
+                    "3+ BUYERS" if buy_count >= 3 else
+                    "2 BUYERS" if buy_count == 2 else
+                    "1 BUYER" if buy_count == 1 else "SELL-ONLY"
+                ),
+                "dexscreener_url": f"https://dexscreener.com/solana/{token}",
+            })
+        consensus.sort(key=lambda item: (
+            item["independent_buy_clusters"],
+            -item["independent_sell_clusters"],
+        ), reverse=True)
+        windows[f"{hours}h"] = {
+            "events": len(selected),
+            "active_wallets": len({row[0] for row in selected}),
+            "independent_clusters": len({row[1] for row in selected}),
+            "unique_tokens": len(tokens),
+            "unique_tokens_bought": len(buyers),
+            "tokens_with_2_buyers": sum(1 for item in consensus if item["independent_buy_clusters"] == 2),
+            "tokens_with_3_plus_buyers": sum(1 for item in consensus if item["independent_buy_clusters"] >= 3),
+            "missing_symbols": sum(1 for token in tokens if not symbols.get(token)),
+            "top_consensus": consensus[:20],
+        }
+    return {
+        "success": True, "version": VERSION, "generated_at": now,
+        "tracked_wallets": len(wallet_rows),
+        "tracked_clusters": len({row[1] for row in wallet_rows}),
+        "windows": windows,
+        "wallet_last_activity": [{
+            "wallet": row[0], "cluster_id": row[1],
+            "last_activity_at": row[2],
+        } for row in wallet_rows],
+        "paper_mode": True, "actionable": False,
+        "note": "Buyer counts represent independent wallet clusters, not transaction count.",
+    }
+
+
+@app.get("/solana-activity")
+def solana_activity_endpoint():
+    return jsonify(build_solana_activity_diagnostics())
+
+
 def serialize_signal_row(row):
     try:
         wallets = json.loads(row[8] or "[]")
         clusters = json.loads(row[9] or "[]")
     except (TypeError, ValueError):
         wallets, clusters = [], []
+    last_activity_at = row[11]
+    signal_age_seconds = None
+    if last_activity_at:
+        observed = last_activity_at
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        signal_age_seconds = max(
+            int((datetime.now(timezone.utc) - observed).total_seconds()), 0
+        )
     return {
         "token_address": row[0], "token_symbol": row[1], "status": row[2],
+        "display_status": solana_status_label(row[2], row[5]),
         "buy_score": row[3], "sell_score": row[4],
         "independent_buy_clusters": row[5],
         "independent_sell_clusters": row[6],
         "contributing_wallets": wallets, "contributing_clusters": clusters,
-        "first_activity_at": row[10], "last_activity_at": row[11],
+        "first_activity_at": row[10], "last_activity_at": last_activity_at,
+        "signal_age_seconds": signal_age_seconds,
+        "dexscreener_url": (
+            f"https://dexscreener.com/solana/{row[0]}" if row[0] else None
+        ),
         "safety_status": row[12], "actionable": False, "updated_at": row[14],
     }
 
@@ -5139,10 +5556,15 @@ SIGNAL_SELECT = """
 def signals_endpoint():
     initialise_database()
     status = request.args.get("status")
+    include_expired = str(request.args.get("include_expired", "true")).lower() in {
+        "1", "true", "yes", "on",
+    }
     with db() as conn:
         with conn.cursor() as cur:
             if status:
                 cur.execute(SIGNAL_SELECT + " WHERE status = %s ORDER BY updated_at DESC", (status.upper(),))
+            elif not include_expired:
+                cur.execute(SIGNAL_SELECT + " WHERE status <> 'EXPIRED' ORDER BY updated_at DESC")
             else:
                 cur.execute(SIGNAL_SELECT + " ORDER BY updated_at DESC")
             rows = cur.fetchall()
@@ -5324,13 +5746,23 @@ def build_dashboard_payload():
                 ORDER BY chain, token_address, captured_at DESC
             """)
             snapshot_rows = cur.fetchall()
-            cur.execute(SIGNAL_SELECT + " ORDER BY updated_at DESC LIMIT 50")
+            cur.execute(SIGNAL_SELECT + " WHERE status <> 'EXPIRED' ORDER BY updated_at DESC LIMIT 50")
             solana_rows = cur.fetchall()
             cur.execute("""
                 SELECT id, completed_at, snapshots_created, transitions_created,
                     status FROM evm_refresh_runs ORDER BY id DESC LIMIT 1
             """)
             refresh_row = cur.fetchone()
+            cur.execute("""
+                SELECT COUNT(*),
+                    COUNT(*) FILTER (WHERE data_quality = 'complete'),
+                    COUNT(*) FILTER (WHERE is_provider_unavailable = TRUE),
+                    COUNT(*) FILTER (WHERE is_anomaly = TRUE),
+                    COUNT(*) FILTER (WHERE holder_count IS NOT NULL)
+                FROM evm_token_snapshots
+                WHERE captured_at >= NOW() - INTERVAL '24 hours'
+            """)
+            quality_row = cur.fetchone()
 
     grouped = {}
     for row in snapshot_rows:
@@ -5345,11 +5777,33 @@ def build_dashboard_payload():
         item = serialize_evm_signal(row)
         samples = grouped.get((row[0], row[1]), [])
         latest = samples[0] if samples else None
+        latest_holder = next(
+            (sample for sample in samples if sample.get("holder_count") is not None),
+            None,
+        )
+        if latest_holder:
+            item["holder_count"] = latest_holder["holder_count"]
+            holder_at = latest_holder["captured_at"]
+            if holder_at.tzinfo is None:
+                holder_at = holder_at.replace(tzinfo=timezone.utc)
+            item["holder_data_age_seconds"] = max(
+                int((now - holder_at).total_seconds()), 0
+            )
+        else:
+            item["holder_data_age_seconds"] = None
         trends = {}
         for hours in (1, 6, 24):
             target = now - timedelta(hours=hours)
             baseline = next(
                 (sample for sample in samples if sample["captured_at"] <= target),
+                None,
+            )
+            holder_baseline = next(
+                (
+                    sample for sample in samples
+                    if sample["captured_at"] <= target
+                    and sample.get("holder_count") is not None
+                ),
                 None,
             )
             trends[f"{hours}h"] = {
@@ -5363,25 +5817,55 @@ def build_dashboard_payload():
                     baseline.get("liquidity_usd") if baseline else None,
                 ),
                 "holder_change": (
-                    latest["holder_count"] - baseline["holder_count"]
-                    if latest and baseline and latest.get("holder_count") is not None
-                    and baseline.get("holder_count") is not None else None
+                    latest_holder["holder_count"] - holder_baseline["holder_count"]
+                    if latest_holder and holder_baseline else None
                 ),
                 "baseline_at": baseline.get("captured_at") if baseline else None,
             }
         item["trends"] = trends
         evm_signals.append(item)
 
+    eth_benchmark = next(
+        (item for item in evm_signals if item.get("is_benchmark")), None
+    )
+    for item in evm_signals:
+        for window, metrics in item["trends"].items():
+            eth_change = (
+                eth_benchmark.get("trends", {}).get(window, {}).get("price_change_pct")
+                if eth_benchmark else None
+            )
+            token_change = metrics.get("price_change_pct")
+            metrics["eth_change_pct"] = eth_change
+            metrics["relative_to_eth_pct"] = (
+                round(token_change - eth_change, 4)
+                if token_change is not None and eth_change is not None else None
+            )
+
     solana_signals = [serialize_signal_row(row) for row in solana_rows]
+    solana_activity = build_solana_activity_diagnostics()
     latest_refresh = None if not refresh_row else {
         "id": refresh_row[0], "completed_at": refresh_row[1],
         "snapshots_created": refresh_row[2],
         "transitions_created": refresh_row[3], "status": refresh_row[4],
     }
+    total_snapshots = quality_row[0] or 0
+    snapshot_quality = {
+        "snapshots_24h": total_snapshots,
+        "complete_pct": round((quality_row[1] or 0) * 100 / total_snapshots, 1)
+        if total_snapshots else None,
+        "provider_available_pct": round(
+            (total_snapshots - (quality_row[2] or 0)) * 100 / total_snapshots, 1
+        ) if total_snapshots else None,
+        "anomaly_pct": round((quality_row[3] or 0) * 100 / total_snapshots, 1)
+        if total_snapshots else None,
+        "holder_coverage_pct": round((quality_row[4] or 0) * 100 / total_snapshots, 1)
+        if total_snapshots else None,
+    }
     return {
         "success": True, "version": VERSION,
         "generated_at": now, "latest_refresh": latest_refresh,
         "evm_signals": evm_signals, "solana_signals": solana_signals,
+        "solana_activity": solana_activity, "snapshot_quality": snapshot_quality,
         "summary": {
             "evm_tokens": len(evm_signals),
             "evm_chains": len({item["chain"] for item in evm_signals}),
@@ -5414,15 +5898,16 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.11 Premium · Benchmark-expanded Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana wallet consensus + ETH-relative multi-chain EVM evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.12 Premium · Evidence-calibrated Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Multi-window Solana consensus + ETH-relative EVM evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
     <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
   </section>
-  <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair evidence; provider outages and token anomalies are separated</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="12" class="empty">Loading…</td></tr></tbody></table></div></section>
-  <section class="section"><div class="section-head"><div><h2>Solana paper signals</h2><div class="muted">Relationship-aware wallet consensus; execution remains disabled</div></div><div class="links"><a href="/signals">JSON signals</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Status</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Updated</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair evidence; holder freshness and performance relative to ETH are explicit</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="13" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Solana consensus windows</h2><div class="muted">Activity funnel across independent wallet clusters</div></div><div class="links"><a href="/solana-activity">Full diagnostics</a></div></div><div class="table-wrap"><table><thead><tr><th>Window</th><th>Events</th><th>Active wallets</th><th>Clusters</th><th>Tokens bought</th><th>2 buyers</th><th>3+ buyers</th><th>Missing symbols</th></tr></thead><tbody id="solWindowBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Active Solana paper signals</h2><div class="muted">Buyer labels count independent wallet clusters—not transactions</div></div><div class="links"><a href="/signals?include_expired=false">Active JSON</a><a href="/signals?include_expired=true">History</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Last activity</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <div class="warning">Paper research only. Signals are observations—not trade instructions—and token safety remains unverified.</div><div class="footer" id="footer">Auto-refreshes every 60 seconds.</div>
 </main><script>
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -5434,8 +5919,9 @@ const age=s=>s==null?'unknown age':s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m`:s<
 const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_BENCHMARK'?'benchmark':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
 document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
-document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td>${num(x.holder_count)}</td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="12" class="empty">No EVM snapshots yet.</td></tr>';
-document.getElementById('solBody').innerHTML=d.solana_signals.length?d.solana_signals.map(x=>`<tr><td><div class="token">${esc(x.token_symbol||'Unknown')}</div><div class="address">${esc((x.token_address||'').slice(0,10))}…</div></td><td>${badge(x.status)}</td><td>${num(x.buy_score)}</td><td>${num(x.sell_score)}</td><td>${num(x.independent_buy_clusters)}</td><td>${num(x.independent_sell_clusters)}</td><td>${esc(x.safety_status)}</td><td>${when(x.updated_at)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">No Solana paper signals yet.</td></tr>';
+document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td><div>${num(x.holder_count)}</div><div class="address">${age(x.holder_data_age_seconds)} old</div></td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${trend(x.trends['24h'].relative_to_eth_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="13" class="empty">No EVM snapshots yet.</td></tr>';
+const windows=d.solana_activity?.windows||{};document.getElementById('solWindowBody').innerHTML=['1h','6h','24h'].map(w=>{const x=windows[w]||{};return `<tr><td><div class="token">${w}</div></td><td>${num(x.events)}</td><td>${num(x.active_wallets)}</td><td>${num(x.independent_clusters)}</td><td>${num(x.unique_tokens_bought)}</td><td>${num(x.tokens_with_2_buyers)}</td><td>${num(x.tokens_with_3_plus_buyers)}</td><td>${num(x.missing_symbols)}</td></tr>`}).join('');
+document.getElementById('solBody').innerHTML=d.solana_signals.length?d.solana_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.token_symbol||'Unknown')}<span class="external">↗</span></div><div class="address">${esc((x.token_address||'').slice(0,10))}…</div></a>`:`<div class="token">${esc(x.token_symbol||'Unknown')}</div>`}</td><td>${badge(x.display_status)}</td><td>${num(x.buy_score)}</td><td>${num(x.sell_score)}</td><td>${num(x.independent_buy_clusters)}</td><td>${num(x.independent_sell_clusters)}</td><td>${esc(x.safety_status)}</td><td><div>${when(x.last_activity_at)}</div><div class="address">${age(x.signal_age_seconds)} ago</div></td></tr>`).join(''):'<tr><td colspan="8" class="empty">No active Solana paper signals.</td></tr>';
 document.getElementById('footer').textContent=`${esc(d.version)} · generated ${when(d.generated_at)} · auto-refreshes every 60 seconds.`;
 }catch(e){document.getElementById('refreshState').textContent='Dashboard data unavailable';document.querySelector('.warning').classList.add('error');document.querySelector('.warning').textContent='Could not load dashboard data. The monitoring APIs continue running independently.';}}
 load();setInterval(load,60000);
