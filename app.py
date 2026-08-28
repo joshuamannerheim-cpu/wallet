@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.12.2-paper-solana-evidence-quality"
+VERSION = "4.13.0-paper-dex-wallet-discovery"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -41,6 +41,31 @@ HELIUS_HISTORY_LIMIT = 100
 HELIUS_WEBHOOKS_URL = "https://mainnet.helius-rpc.com/v0/webhooks"
 ROBINHOOD_CHAIN_ID = 4663
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
+DEXSCREENER_BOOSTS_TOP_URL = "https://api.dexscreener.com/token-boosts/top/v1"
+DEX_WALLET_DISCOVERY_MAX_TOKENS = min(
+    max(int(os.getenv("DEX_WALLET_DISCOVERY_MAX_TOKENS", "5")), 1), 10
+)
+DEX_WALLET_CANDIDATES_PER_TOKEN = min(
+    max(int(os.getenv("DEX_WALLET_CANDIDATES_PER_TOKEN", "5")), 1), 10
+)
+DEX_WALLET_HISTORY_LIMIT = min(
+    max(int(os.getenv("DEX_WALLET_HISTORY_LIMIT", "50")), 10), 100
+)
+DEX_WALLET_MIN_LIQUIDITY_USD = max(
+    float(os.getenv("DEX_WALLET_MIN_LIQUIDITY_USD", "25000")), 0
+)
+DEX_WALLET_MIN_VOLUME_H24_USD = max(
+    float(os.getenv("DEX_WALLET_MIN_VOLUME_H24_USD", "10000")), 0
+)
+DEX_WALLET_MIN_PAIR_AGE_HOURS = min(
+    max(float(os.getenv("DEX_WALLET_MIN_PAIR_AGE_HOURS", "1")), 0), 168
+)
+DEX_WALLET_PROBATION_MIN_DAYS = min(
+    max(int(os.getenv("DEX_WALLET_PROBATION_MIN_DAYS", "7")), 1), 30
+)
+DEX_WALLET_PROBATION_MIN_TRADES = min(
+    max(int(os.getenv("DEX_WALLET_PROBATION_MIN_TRADES", "5")), 1), 50
+)
 ROBINHOOD_BLOCKSCOUT_URL = "https://robinhoodchain.blockscout.com/api/v2"
 EVM_CHAIN_CONFIG = {
     "robinhood": {
@@ -155,7 +180,10 @@ _diagnostics = {"birdeye_requests": 0, "helius_requests": 0,
                 "evm_provider_unavailable": 0, "evm_provider_recoveries": 0,
                 "telegram_requests": 0, "telegram_deliveries": 0,
                 "telegram_failures": 0, "retries": 0, "rate_limits": 0,
-                "timeouts": 0, "upstream_errors": 0}
+                "timeouts": 0, "upstream_errors": 0,
+                "dex_wallet_discovery_runs": 0,
+                "dex_wallet_candidates_found": 0,
+                "probation_wallet_events": 0}
 
 
 def diagnostic_increment(name):
@@ -232,18 +260,23 @@ def birdeye_post(path, body=None, retry_429=True):
                             retries=2 if retry_429 else 0)
 
 
-def helius_get_transactions(wallet):
-    """Fetch a bounded, parsed history sample for heuristic screening."""
+def helius_get_address_transactions(address, limit=HELIUS_HISTORY_LIMIT):
+    """Fetch a bounded parsed history sample for a wallet, token, or account."""
     return upstream_request(
-        "GET", f"https://api-mainnet.helius-rpc.com/v0/addresses/{wallet}/transactions",
+        "GET", f"https://api-mainnet.helius-rpc.com/v0/addresses/{address}/transactions",
         params={
             "api-key": os.getenv("HELIUS_API_KEY", ""),
             "token-accounts": "balanceChanged",
             "sort-order": "desc",
-            "limit": HELIUS_HISTORY_LIMIT,
+            "limit": min(max(int(limit), 1), 100),
         },
         timeout=25, retries=1, provider="helius",
     )
+
+
+def helius_get_transactions(wallet):
+    """Fetch a bounded, parsed history sample for heuristic screening."""
+    return helius_get_address_transactions(wallet, HELIUS_HISTORY_LIMIT)
 
 
 def initialise_database():
@@ -354,6 +387,58 @@ def initialise_database():
                     side TEXT NOT NULL,
                     token_amount DOUBLE PRECISION,
                     estimated_usd_value DOUBLE PRECISION,
+                    occurred_at TIMESTAMPTZ NOT NULL,
+                    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    raw_summary TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (signature, wallet, token_address, side)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS dex_wallet_discovery_runs (
+                    id BIGSERIAL PRIMARY KEY,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ,
+                    tokens_examined INTEGER NOT NULL DEFAULT 0,
+                    candidates_found INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    details TEXT NOT NULL DEFAULT '{}'
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_discovery_cohorts (
+                    wallet TEXT PRIMARY KEY,
+                    source TEXT NOT NULL DEFAULT 'dexscreener',
+                    cohort_status TEXT NOT NULL DEFAULT 'CANDIDATE',
+                    discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    admitted_at TIMESTAMPTZ,
+                    eligible_signal_at TIMESTAMPTZ,
+                    forward_trades INTEGER NOT NULL DEFAULT 0,
+                    forward_tokens INTEGER NOT NULL DEFAULT 0,
+                    last_forward_activity_at TIMESTAMPTZ,
+                    rejection_reason TEXT,
+                    details TEXT NOT NULL DEFAULT '{}',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_discovery_sources (
+                    wallet TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    pair_address TEXT,
+                    source TEXT NOT NULL DEFAULT 'dexscreener',
+                    discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    details TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (wallet, token_address)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_probation_activity (
+                    signature TEXT NOT NULL,
+                    wallet TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT,
+                    side TEXT NOT NULL,
+                    token_amount DOUBLE PRECISION,
                     occurred_at TIMESTAMPTZ NOT NULL,
                     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     raw_summary TEXT NOT NULL DEFAULT '{}',
@@ -544,6 +629,10 @@ def initialise_database():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_token_time_idx ON wallet_activity (token_address, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_wallet_time_idx ON wallet_activity (wallet, occurred_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS dex_wallet_run_time_idx ON dex_wallet_discovery_runs (started_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS wallet_cohort_status_idx ON wallet_discovery_cohorts (cohort_status, updated_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS wallet_probation_time_idx ON wallet_probation_activity (occurred_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS wallet_probation_wallet_time_idx ON wallet_probation_activity (wallet, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS notification_delivery_status_idx ON notification_deliveries (delivery_status, created_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS helius_sync_created_idx ON helius_sync_history (created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS evm_snapshot_token_time_idx ON evm_token_snapshots (chain, token_address, captured_at DESC)")
@@ -1355,6 +1444,20 @@ def diagnostics():
                     "solana_consensus_windows_hours": list(SOLANA_CONSENSUS_WINDOWS_HOURS),
                     "solana_metadata_refresh_hours": SOLANA_METADATA_REFRESH_HOURS,
                     "solana_metadata_per_refresh": SOLANA_METADATA_PER_REFRESH,
+                    "dex_wallet_discovery": {
+                        "enabled": True,
+                        "maximum_tokens_per_run": DEX_WALLET_DISCOVERY_MAX_TOKENS,
+                        "candidates_per_token": DEX_WALLET_CANDIDATES_PER_TOKEN,
+                        "helius_history_limit": DEX_WALLET_HISTORY_LIMIT,
+                        "minimum_pair_liquidity_usd": DEX_WALLET_MIN_LIQUIDITY_USD,
+                        "minimum_pair_volume_h24_usd": DEX_WALLET_MIN_VOLUME_H24_USD,
+                        "minimum_pair_age_hours": DEX_WALLET_MIN_PAIR_AGE_HOURS,
+                        "minimum_probation_days": DEX_WALLET_PROBATION_MIN_DAYS,
+                        "minimum_forward_trades": DEX_WALLET_PROBATION_MIN_TRADES,
+                        "candidate_and_probation_consensus_weight": 0,
+                        "source_tokens_permanently_excluded": True,
+                        "manual_promotion_required": True,
+                    },
                     "helius_webhook_configured": bool(os.getenv("HELIUS_WEBHOOK_SECRET")),
                     "helius_webhook_sync_configured": bool(os.getenv("HELIUS_API_KEY")),
                     "helius_auto_sync": HELIUS_AUTO_SYNC,
@@ -1391,6 +1494,530 @@ def diagnostics():
 # =========================================================
 # DISCOVERY
 # =========================================================
+
+def extract_dex_wallet_candidates(token_address, transactions, limit):
+    """Rank recent on-chain buyers without treating discovery as proof of skill."""
+    observations = {}
+    if not isinstance(transactions, list):
+        return []
+    for transaction in transactions:
+        if not isinstance(transaction, dict):
+            continue
+        if str(transaction.get("type") or "").upper() != "SWAP":
+            continue
+        signature = transaction.get("signature")
+        timestamp = transaction.get("timestamp")
+        if not isinstance(signature, str) or not isinstance(timestamp, (int, float)):
+            continue
+        for transfer in transaction.get("tokenTransfers") or []:
+            if not isinstance(transfer, dict) or transfer.get("mint") != token_address:
+                continue
+            wallet = transfer.get("toUserAccount")
+            if not is_valid_solana_address(wallet):
+                continue
+            try:
+                amount = float(transfer.get("tokenAmount"))
+            except (TypeError, ValueError):
+                continue
+            if amount <= 0 or transfer.get("fromUserAccount") == wallet:
+                continue
+            record = observations.setdefault(wallet, {
+                "wallet": wallet, "buy_transactions": set(),
+                "first_observed_at": timestamp, "last_observed_at": timestamp,
+                "token_amount": 0.0,
+            })
+            record["buy_transactions"].add(signature)
+            record["first_observed_at"] = min(record["first_observed_at"], timestamp)
+            record["last_observed_at"] = max(record["last_observed_at"], timestamp)
+            record["token_amount"] += amount
+    ranked = []
+    for record in observations.values():
+        ranked.append({
+            "wallet": record["wallet"],
+            "buy_transactions": len(record["buy_transactions"]),
+            "first_observed_at": datetime.fromtimestamp(
+                record["first_observed_at"], timezone.utc
+            ),
+            "last_observed_at": datetime.fromtimestamp(
+                record["last_observed_at"], timezone.utc
+            ),
+            "token_amount": record["token_amount"],
+        })
+    ranked.sort(key=lambda item: (
+        -item["buy_transactions"], item["first_observed_at"], item["wallet"]
+    ))
+    return ranked[:limit]
+
+
+def select_solana_discovery_pair(payload, token_address):
+    """Choose the most liquid Solana pair for bounded on-chain sampling."""
+    pairs = payload.get("pairs") if isinstance(payload, dict) else None
+    eligible = []
+    for pair in pairs if isinstance(pairs, list) else []:
+        if not isinstance(pair, dict) or pair.get("chainId") != "solana":
+            continue
+        base_address = (pair.get("baseToken") or {}).get("address")
+        quote_address = (pair.get("quoteToken") or {}).get("address")
+        if token_address not in {base_address, quote_address}:
+            continue
+        pair_address = pair.get("pairAddress")
+        if not is_valid_solana_address(pair_address):
+            continue
+        try:
+            liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
+        except (TypeError, ValueError):
+            liquidity = 0.0
+        eligible.append((liquidity, pair))
+    return max(eligible, key=lambda item: item[0])[1] if eligible else None
+
+
+def candidate_probation_assessment(wallet):
+    """Apply the existing evidence classifier to one discovery candidate."""
+    validation_summaries = load_validation_summaries()
+    repeat_evidence = load_repeat_evidence()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.wallet, c.tokens_found, c.realized_pnl_30d,
+                    c.total_pnl_30d, c.win_rate_30d, c.trades_30d,
+                    c.total_invested_30d, c.score, c.score_status,
+                    c.screening_status, c.screening_risk_score,
+                    c.validation_status, COALESCE(ws.risk_flags, '[]')
+                FROM candidate_wallets c
+                LEFT JOIN wallet_screenings ws ON ws.wallet = c.wallet
+                    AND ws.screening_version = %s
+                WHERE c.wallet = %s
+            """, (SCREENING_VERSION, wallet))
+            row = cur.fetchone()
+    if not row:
+        return {"ready": False, "classification": "UNKNOWN", "reasons": ["candidate_not_found"]}
+    try:
+        risk_flags = json.loads(row[12]) if row[12] else []
+    except (TypeError, ValueError):
+        risk_flags = []
+    candidate = {
+        "wallet": row[0], "tokens_found": row[1], "realized_pnl": row[2],
+        "total_pnl": row[3], "win_rate": row[4], "trades": row[5],
+        "invested": row[6], "score": row[7], "score_status": row[8],
+        "screening_status": row[9], "validation_status": row[11],
+    }
+    classification = classify_candidate(
+        candidate, {"risk_score": row[10], "risk_flags": risk_flags},
+        validation_summaries.get(wallet), repeat_evidence.get(wallet, {}),
+    )
+    hard_risks = {"service_like_activity", "bursty_automated_activity"}
+    probation_requirements = {
+        "scored_at_least_30": row[8] == "scored" and (row[7] or 0) >= 30,
+        "screened_low_risk": row[9] == "screened" and row[10] is not None and row[10] <= 25,
+        "no_hard_service_or_bot_risk": not bool(set(risk_flags) & hard_risks),
+        "meaningful_trade_history": row[5] is not None and row[5] >= 30,
+        "positive_realized_pnl": row[2] is not None and row[2] > 0,
+    }
+    classification["probation_requirements"] = probation_requirements
+    classification["signal_ready"] = classification["classification"] in {"WATCH", "ASYMMETRIC"}
+    classification["ready"] = all(probation_requirements.values())
+    return classification
+
+
+@app.post("/discover-dex-wallets")
+def discover_dex_wallets():
+    """Use DexScreener for token discovery and Helius for wallet attribution."""
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    body = request.get_json(silent=True) or {}
+    try:
+        token_limit = int(body.get("tokens", DEX_WALLET_DISCOVERY_MAX_TOKENS))
+    except (TypeError, ValueError):
+        token_limit = DEX_WALLET_DISCOVERY_MAX_TOKENS
+    token_limit = min(max(token_limit, 1), DEX_WALLET_DISCOVERY_MAX_TOKENS)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO dex_wallet_discovery_runs (status) VALUES ('running') RETURNING id")
+            run_id = cur.fetchone()[0]
+        conn.commit()
+    diagnostic_increment("dex_wallet_discovery_runs")
+    try:
+        response = upstream_request(
+            "GET", DEXSCREENER_BOOSTS_TOP_URL, timeout=15, retries=1,
+            provider="dexscreener",
+        )
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE dex_wallet_discovery_runs SET completed_at = NOW(),
+                        status = 'provider_unavailable', details = %s WHERE id = %s
+                """, (json.dumps({"error": type(exc).__name__}), run_id))
+            conn.commit()
+        return jsonify({"success": False, "run_id": run_id, "error": "DexScreener unavailable"}), 503
+    try:
+        boost_items = response.json() if response.status_code == 200 else []
+    except ValueError:
+        boost_items = []
+    tokens = []
+    seen = set()
+    for item in boost_items if isinstance(boost_items, list) else []:
+        token_address = item.get("tokenAddress") if isinstance(item, dict) else None
+        if item.get("chainId") != "solana" or not is_valid_solana_address(token_address):
+            continue
+        if token_address in seen or token_address in STABLE_MINTS or token_address == SOL_MINT:
+            continue
+        seen.add(token_address)
+        tokens.append(item)
+        if len(tokens) >= token_limit:
+            break
+    if not tokens:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE dex_wallet_discovery_runs SET completed_at = NOW(),
+                        status = 'no_solana_tokens', details = %s WHERE id = %s
+                """, (json.dumps({"dexscreener_status": response.status_code}), run_id))
+            conn.commit()
+        return jsonify({"success": False, "run_id": run_id, "error": "No usable boosted Solana tokens"}), 502
+
+    unique_wallets = set()
+    results = []
+    for token in tokens:
+        token_address = token["tokenAddress"]
+        try:
+            pair_response = upstream_request(
+                "GET", DEXSCREENER_TOKEN_URL.format(address=token_address),
+                timeout=15, retries=1, provider="dexscreener",
+            )
+            pair_payload = pair_response.json() if pair_response.status_code == 200 else {}
+            pair = select_solana_discovery_pair(pair_payload, token_address)
+            if not pair:
+                results.append({
+                    "token_address": token_address, "status": "pair_unavailable",
+                    "candidates": 0,
+                })
+                continue
+            try:
+                pair_liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
+                pair_volume_h24 = float((pair.get("volume") or {}).get("h24") or 0)
+                pair_created_ms = float(pair.get("pairCreatedAt") or 0)
+            except (TypeError, ValueError):
+                pair_liquidity, pair_volume_h24, pair_created_ms = 0.0, 0.0, 0.0
+            pair_age_hours = (
+                (time.time() - pair_created_ms / 1000) / 3600
+                if pair_created_ms > 0 else None
+            )
+            quality_reasons = []
+            if pair_liquidity < DEX_WALLET_MIN_LIQUIDITY_USD:
+                quality_reasons.append("insufficient_liquidity")
+            if pair_volume_h24 < DEX_WALLET_MIN_VOLUME_H24_USD:
+                quality_reasons.append("insufficient_24h_volume")
+            if pair_age_hours is None or pair_age_hours < DEX_WALLET_MIN_PAIR_AGE_HOURS:
+                quality_reasons.append("pair_too_new_or_age_unknown")
+            if quality_reasons:
+                results.append({
+                    "token_address": token_address, "status": "quality_filtered",
+                    "pair_address": pair.get("pairAddress"),
+                    "liquidity_usd": pair_liquidity,
+                    "volume_h24_usd": pair_volume_h24,
+                    "pair_age_hours": round(pair_age_hours, 2) if pair_age_hours is not None else None,
+                    "reasons": quality_reasons, "candidates": 0,
+                })
+                continue
+            history_response = helius_get_address_transactions(
+                pair["pairAddress"], DEX_WALLET_HISTORY_LIMIT
+            )
+            history = history_response.json() if history_response.status_code == 200 else []
+        except (requests.Timeout, requests.ConnectionError, ValueError) as exc:
+            results.append({
+                "token_address": token_address, "status": "helius_unavailable",
+                "error": type(exc).__name__, "candidates": 0,
+            })
+            continue
+        candidates = extract_dex_wallet_candidates(
+            token_address, history, DEX_WALLET_CANDIDATES_PER_TOKEN
+        )
+        pair_token = (
+            pair.get("baseToken")
+            if (pair.get("baseToken") or {}).get("address") == token_address
+            else pair.get("quoteToken")
+        ) or {}
+        with db() as conn:
+            with conn.cursor() as cur:
+                for candidate in candidates:
+                    wallet = candidate["wallet"]
+                    unique_wallets.add(wallet)
+                    cur.execute("""
+                        INSERT INTO candidate_wallets (wallet, tokens_found)
+                        VALUES (%s, 1) ON CONFLICT (wallet) DO NOTHING
+                    """, (wallet,))
+                    cur.execute("""
+                        INSERT INTO wallet_token_hits (
+                            wallet, token_address, token_symbol, token_name
+                        ) VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (wallet, token_address) DO UPDATE SET
+                            token_symbol = COALESCE(EXCLUDED.token_symbol, wallet_token_hits.token_symbol),
+                            token_name = COALESCE(EXCLUDED.token_name, wallet_token_hits.token_name)
+                    """, (
+                        wallet, token_address, pair_token.get("symbol"),
+                        pair_token.get("name") or token.get("description"),
+                    ))
+                    cur.execute("""
+                        UPDATE candidate_wallets SET tokens_found = (
+                            SELECT COUNT(*) FROM wallet_token_hits WHERE wallet = %s
+                        ), updated_at = NOW() WHERE wallet = %s
+                    """, (wallet, wallet))
+                    cur.execute("""
+                        INSERT INTO wallet_discovery_cohorts (
+                            wallet, cohort_status, eligible_signal_at, details
+                        ) SELECT %s,
+                            CASE WHEN EXISTS (
+                                SELECT 1 FROM wallet_clusters WHERE wallet = %s
+                            ) THEN 'VALIDATED' ELSE 'CANDIDATE' END,
+                            CASE WHEN EXISTS (
+                                SELECT 1 FROM wallet_clusters WHERE wallet = %s
+                            ) THEN NOW() ELSE NULL END,
+                            %s
+                        ON CONFLICT (wallet) DO UPDATE SET
+                            details = EXCLUDED.details, updated_at = NOW()
+                    """, (
+                        wallet, wallet, wallet, json.dumps({
+                            "latest_run_id": run_id,
+                            "discovery_is_not_performance_proof": True,
+                        }),
+                    ))
+                    cur.execute("""
+                        INSERT INTO wallet_discovery_sources (
+                            wallet, token_address, pair_address, details
+                        ) VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (wallet, token_address) DO UPDATE SET
+                            details = EXCLUDED.details
+                    """, (
+                        wallet, token_address, pair.get("pairAddress"),
+                        json.dumps({
+                            "run_id": run_id,
+                            "buy_transactions_in_sample": candidate["buy_transactions"],
+                            "first_observed_at": candidate["first_observed_at"].isoformat(),
+                            "last_observed_at": candidate["last_observed_at"].isoformat(),
+                        }),
+                    ))
+            conn.commit()
+        results.append({
+            "token_address": token_address, "status": "completed",
+            "pair_address": pair.get("pairAddress"), "candidates": len(candidates),
+        })
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE dex_wallet_discovery_runs SET completed_at = NOW(),
+                    tokens_examined = %s, candidates_found = %s,
+                    status = 'completed', details = %s WHERE id = %s
+            """, (
+                len(tokens), len(unique_wallets),
+                json.dumps({"results": results}), run_id,
+            ))
+        conn.commit()
+    for _ in unique_wallets:
+        diagnostic_increment("dex_wallet_candidates_found")
+    return jsonify({
+        "success": True, "version": VERSION, "run_id": run_id,
+        "tokens_examined": len(tokens), "unique_candidates_found": len(unique_wallets),
+        "results": results, "cohort_status": "CANDIDATE",
+        "next_gate": "existing scoring, Helius screening, and token validation",
+        "policy": {
+            "paper_only": True,
+            "discovery_does_not_prove_success": True,
+            "source_tokens_permanently_excluded": True,
+            "automatic_signal_admission": False,
+        },
+    })
+
+
+@app.post("/dex-wallet-cohorts/<wallet>/probation")
+def admit_dex_wallet_probation(wallet):
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    if not is_valid_solana_address(wallet):
+        return jsonify({"success": False, "error": "Invalid Solana wallet"}), 400
+    initialise_database()
+    assessment = candidate_probation_assessment(wallet)
+    if not assessment.get("ready"):
+        return jsonify({
+            "success": False, "error": "Candidate has not passed the zero-weight probation gates",
+            "assessment": assessment,
+        }), 409
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE wallet_discovery_cohorts SET cohort_status = 'PROBATION',
+                    admitted_at = NOW(), eligible_signal_at = NOW(),
+                    forward_trades = 0, forward_tokens = 0,
+                    last_forward_activity_at = NULL, updated_at = NOW()
+                WHERE wallet = %s AND source = 'dexscreener'
+                    AND cohort_status = 'CANDIDATE'
+            """, (wallet,))
+            changed = cur.rowcount
+        conn.commit()
+    if not changed:
+        return jsonify({"success": False, "error": "Candidate is not awaiting probation"}), 409
+    sync_result = synchronise_helius_webhook(dry_run=False, force=False) if HELIUS_AUTO_SYNC else None
+    return jsonify({
+        "success": True, "wallet": wallet, "cohort_status": "PROBATION",
+        "assessment": assessment, "helius_sync": sync_result,
+        "consensus_weight": 0, "paper_only": True,
+    })
+
+
+@app.post("/dex-wallet-cohorts/<wallet>/validate")
+def validate_dex_wallet_cohort(wallet):
+    """Manual promotion after a minimum future-only probation sample."""
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    body = request.get_json(silent=True) or {}
+    if body.get("manual_review_approved") is not True:
+        return jsonify({"success": False, "error": "manual_review_approved=true is required"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT cohort_status, admitted_at, forward_trades, forward_tokens
+                FROM wallet_discovery_cohorts WHERE wallet = %s
+            """, (wallet,))
+            row = cur.fetchone()
+    if not row or row[0] != "PROBATION":
+        return jsonify({"success": False, "error": "Wallet is not in probation"}), 409
+    probation_age = datetime.now(timezone.utc) - row[1] if row[1] else timedelta(0)
+    assessment = candidate_probation_assessment(wallet)
+    requirements = {
+        "minimum_days": probation_age >= timedelta(days=DEX_WALLET_PROBATION_MIN_DAYS),
+        "minimum_forward_trades": row[2] >= DEX_WALLET_PROBATION_MIN_TRADES,
+        "multiple_forward_tokens": row[3] >= 2,
+        "full_signal_evidence_gates": bool(assessment.get("signal_ready")),
+    }
+    if not all(requirements.values()):
+        return jsonify({
+            "success": False, "error": "Probation evidence is incomplete",
+            "requirements": requirements, "assessment": assessment,
+        }), 409
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE wallet_discovery_cohorts SET cohort_status = 'VALIDATED',
+                    eligible_signal_at = NOW(), updated_at = NOW() WHERE wallet = %s
+            """, (wallet,))
+        conn.commit()
+    compute_and_persist_wallet_clusters()
+    sync_result = synchronise_helius_webhook(dry_run=False, force=False) if HELIUS_AUTO_SYNC else None
+    return jsonify({
+        "success": True, "wallet": wallet, "cohort_status": "VALIDATED",
+        "requirements": requirements, "helius_sync": sync_result,
+        "source_tokens_permanently_excluded": True, "paper_only": True,
+    })
+
+
+@app.get("/dex-wallet-cohorts")
+def dex_wallet_cohorts():
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.wallet, c.cohort_status, c.discovered_at, c.admitted_at,
+                    c.eligible_signal_at, c.forward_trades, c.forward_tokens,
+                    c.last_forward_activity_at, c.updated_at,
+                    COUNT(s.token_address) AS source_tokens
+                FROM wallet_discovery_cohorts c
+                LEFT JOIN wallet_discovery_sources s ON s.wallet = c.wallet
+                GROUP BY c.wallet, c.cohort_status, c.discovered_at, c.admitted_at,
+                    c.eligible_signal_at, c.forward_trades, c.forward_tokens,
+                    c.last_forward_activity_at, c.updated_at
+                ORDER BY c.updated_at DESC
+            """)
+            rows = cur.fetchall()
+    now = datetime.now(timezone.utc)
+    items = []
+    counts = {}
+    for row in rows:
+        status = row[1]
+        counts[status] = counts.get(status, 0) + 1
+        age = now - row[3] if row[3] else timedelta(0)
+        items.append({
+            "wallet": row[0], "cohort_status": status,
+            "discovered_at": row[2], "admitted_at": row[3],
+            "eligible_signal_at": row[4], "forward_trades": row[5],
+            "forward_tokens": row[6], "last_forward_activity_at": row[7],
+            "source_tokens_excluded": row[9], "updated_at": row[8],
+            "promotion_ready": status == "PROBATION"
+                and age >= timedelta(days=DEX_WALLET_PROBATION_MIN_DAYS)
+                and row[5] >= DEX_WALLET_PROBATION_MIN_TRADES and row[6] >= 2,
+        })
+    return jsonify({
+        "success": True, "version": VERSION, "counts": counts, "wallets": items,
+        "policy": {
+            "candidate_votes": 0, "probation_votes": 0,
+            "minimum_probation_days": DEX_WALLET_PROBATION_MIN_DAYS,
+            "minimum_forward_trades": DEX_WALLET_PROBATION_MIN_TRADES,
+            "manual_promotion_required": True,
+            "source_tokens_permanently_excluded": True,
+        },
+    })
+
+
+@app.get("/dex-wallet-discovery-history")
+def dex_wallet_discovery_history():
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 20)), 1), 100)
+    except ValueError:
+        limit = 20
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, started_at, completed_at, tokens_examined,
+                    candidates_found, status, details
+                FROM dex_wallet_discovery_runs ORDER BY id DESC LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    items = []
+    for row in rows:
+        try:
+            details = json.loads(row[6] or "{}")
+        except (TypeError, ValueError):
+            details = {}
+        items.append({
+            "id": row[0], "started_at": row[1], "completed_at": row[2],
+            "tokens_examined": row[3], "candidates_found": row[4],
+            "status": row[5], "details": details,
+        })
+    return jsonify({"success": True, "version": VERSION, "runs": items})
+
+
+@app.get("/probation-wallet-activity")
+def probation_wallet_activity():
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+    except ValueError:
+        limit = 100
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT signature, wallet, token_address, token_symbol, side,
+                    token_amount, occurred_at, received_at
+                FROM wallet_probation_activity
+                ORDER BY occurred_at DESC LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    return jsonify({
+        "success": True, "count": len(rows), "consensus_weight": 0,
+        "events": [{
+            "signature": row[0], "wallet": row[1], "token_address": row[2],
+            "token_symbol": row[3], "side": row[4], "token_amount": row[5],
+            "occurred_at": row[6], "received_at": row[7],
+        } for row in rows],
+    })
 
 @app.get("/discover")
 def discover():
@@ -2490,6 +3117,12 @@ def load_signal_eligible_wallets():
                 LEFT JOIN wallet_screenings ws ON ws.wallet = c.wallet
                     AND ws.screening_version = %s
                 WHERE c.score_status = 'scored'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM wallet_discovery_cohorts dc
+                        WHERE dc.wallet = c.wallet
+                            AND dc.source = 'dexscreener'
+                            AND dc.cohort_status <> 'VALIDATED'
+                    )
             """, (SCREENING_VERSION,))
             rows = cur.fetchall()
 
@@ -2638,13 +3271,62 @@ def load_tracked_wallet_map():
                 FROM wallet_clusters
             """)
             rows = cur.fetchall()
-    return {
+    tracked = {
         row[0]: {
             "cluster_id": row[1], "classification": row[2],
             "confidence": row[3], "signal_weight": row[4],
         }
         for row in rows
     }
+    if not tracked:
+        return tracked
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.wallet, c.eligible_signal_at, s.token_address
+                FROM wallet_discovery_cohorts c
+                LEFT JOIN wallet_discovery_sources s ON s.wallet = c.wallet
+                WHERE c.cohort_status = 'VALIDATED'
+            """)
+            restrictions = cur.fetchall()
+    for wallet, eligible_at, token_address in restrictions:
+        if wallet not in tracked:
+            continue
+        tracked[wallet]["eligible_from"] = eligible_at
+        tracked[wallet].setdefault("excluded_tokens", set())
+        if token_address:
+            tracked[wallet]["excluded_tokens"].add(token_address)
+    return tracked
+
+
+def load_probation_wallet_map():
+    """Return monitored probation wallets without granting a consensus vote."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.wallet, c.eligible_signal_at, s.token_address
+                FROM wallet_discovery_cohorts c
+                LEFT JOIN wallet_discovery_sources s ON s.wallet = c.wallet
+                WHERE c.cohort_status = 'PROBATION'
+            """)
+            rows = cur.fetchall()
+    probation = {}
+    for wallet, eligible_at, token_address in rows:
+        record = probation.setdefault(wallet, {
+            "cluster_id": f"probation:{wallet}",
+            "classification": "PROBATION",
+            "confidence": "UNPROVEN",
+            "signal_weight": 0.0,
+            "eligible_from": eligible_at,
+            "excluded_tokens": set(),
+        })
+        if token_address:
+            record["excluded_tokens"].add(token_address)
+    return probation
+
+
+def load_helius_monitored_wallets():
+    return sorted(set(load_tracked_wallet_map()) | set(load_probation_wallet_map()))
 
 
 def helius_webhook_headers():
@@ -2695,8 +3377,8 @@ def record_helius_sync(result):
 
 
 def synchronise_helius_webhook(*, dry_run=True, force=False):
-    """Compare eligible Solana wallets with Helius and update only on drift."""
-    desired = sorted(load_tracked_wallet_map())
+    """Sync validated plus probation wallets; only validated wallets can vote."""
+    desired = load_helius_monitored_wallets()
     base_result = {
         "success": False, "dry_run": bool(dry_run), "webhook_id": None,
         "sync_status": "configuration_required",
@@ -4259,6 +4941,9 @@ def parse_helius_activity(payload, tracked_wallets):
         occurred_at = datetime.fromtimestamp(timestamp, timezone.utc)
         transfers = transaction.get("tokenTransfers") or []
         for wallet, tracked in tracked_wallets.items():
+            eligible_from = tracked.get("eligible_from")
+            if eligible_from and occurred_at < eligible_from:
+                continue
             deltas = {}
             symbols = {}
             for transfer in transfers:
@@ -4283,6 +4968,8 @@ def parse_helius_activity(payload, tracked_wallets):
                     symbols[mint] = symbol
             for mint, delta in deltas.items():
                 if abs(delta) <= 0:
+                    continue
+                if mint in tracked.get("excluded_tokens", set()):
                     continue
                 events.append({
                     "signature": signature, "wallet": wallet,
@@ -4318,6 +5005,52 @@ def persist_wallet_activity(events):
                 ))
                 inserted += cur.rowcount
         conn.commit()
+    return inserted
+
+
+def persist_probation_wallet_activity(events):
+    """Store forward-only probation evidence outside the consensus ledger."""
+    inserted = 0
+    affected_wallets = set()
+    with db() as conn:
+        with conn.cursor() as cur:
+            for event in events:
+                cur.execute("""
+                    INSERT INTO wallet_probation_activity (
+                        signature, wallet, token_address, token_symbol, side,
+                        token_amount, occurred_at, raw_summary
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (signature, wallet, token_address, side) DO NOTHING
+                """, (
+                    event["signature"], event["wallet"], event["token_address"],
+                    event.get("token_symbol"), event["side"],
+                    event.get("token_amount"), event["occurred_at"],
+                    json.dumps(event.get("raw_summary") or {}),
+                ))
+                if cur.rowcount:
+                    inserted += 1
+                    affected_wallets.add(event["wallet"])
+            for wallet in affected_wallets:
+                cur.execute("""
+                    UPDATE wallet_discovery_cohorts SET
+                        forward_trades = (
+                            SELECT COUNT(DISTINCT signature)
+                            FROM wallet_probation_activity WHERE wallet = %s
+                        ),
+                        forward_tokens = (
+                            SELECT COUNT(DISTINCT token_address)
+                            FROM wallet_probation_activity WHERE wallet = %s
+                        ),
+                        last_forward_activity_at = (
+                            SELECT MAX(occurred_at)
+                            FROM wallet_probation_activity WHERE wallet = %s
+                        ),
+                        updated_at = NOW()
+                    WHERE wallet = %s AND cohort_status = 'PROBATION'
+                """, (wallet, wallet, wallet, wallet))
+        conn.commit()
+    if inserted:
+        diagnostic_increment("probation_wallet_events")
     return inserted
 
 
@@ -5424,9 +6157,14 @@ def helius_webhook_endpoint():
         tracked = load_tracked_wallet_map()
     events = parse_helius_activity(payload, tracked)
     inserted = persist_wallet_activity(events)
+    probation = load_probation_wallet_map()
+    probation_events = parse_helius_activity(payload, probation)
+    probation_inserted = persist_probation_wallet_activity(probation_events)
     signals = refresh_paper_signals() if inserted else []
     return jsonify({
         "success": True, "events_parsed": len(events), "events_inserted": inserted,
+        "probation_events_parsed": len(probation_events),
+        "probation_events_inserted": probation_inserted,
         "signals_refreshed": len(signals), "paper_mode": True,
         "actionable": False,
     })
@@ -5945,7 +6683,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.12 Premium · Evidence-calibrated Console</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Multi-window Solana consensus + ETH-relative EVM evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.13 Premium · Controlled Wallet Discovery</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Multi-window Solana consensus + probation-isolated discovery + ETH-relative EVM evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
@@ -5953,7 +6691,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
   </section>
   <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair evidence; holder freshness and performance relative to ETH are explicit</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="13" class="empty">Loading…</td></tr></tbody></table></div></section>
-  <section class="section"><div class="section-head"><div><h2>Solana consensus windows</h2><div class="muted">Activity funnel across independent wallet clusters</div></div><div class="links"><a href="/solana-activity">Full diagnostics</a></div></div><div class="table-wrap"><table><thead><tr><th>Window</th><th>Events</th><th>Active wallets</th><th>Clusters</th><th>Tokens bought</th><th>2 buyers</th><th>3+ buyers</th><th>Missing symbols</th></tr></thead><tbody id="solWindowBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Solana consensus windows</h2><div class="muted">Activity funnel across independent validated wallet clusters; probation activity cannot vote</div></div><div class="links"><a href="/solana-activity">Full diagnostics</a><a href="/dex-wallet-cohorts">Discovery cohorts</a><a href="/dex-wallet-discovery-history">Discovery runs</a><a href="/probation-wallet-activity">Probation activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Window</th><th>Events</th><th>Active wallets</th><th>Clusters</th><th>Tokens bought</th><th>2 buyers</th><th>3+ buyers</th><th>Missing symbols</th></tr></thead><tbody id="solWindowBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Active Solana paper signals</h2><div class="muted">Buyer labels count independent wallet clusters—not transactions</div></div><div class="links"><a href="/signals?include_expired=false">Active JSON</a><a href="/signals?include_expired=true">History</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Last activity</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <div class="warning">Paper research only. Signals are observations—not trade instructions—and token safety remains unverified.</div><div class="footer" id="footer">Auto-refreshes every 60 seconds.</div>
 </main><script>
