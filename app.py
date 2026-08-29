@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.13.0-paper-dex-wallet-discovery"
+VERSION = "4.14.0-wide-wallet-discovery"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -43,22 +43,25 @@ ROBINHOOD_CHAIN_ID = 4663
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 DEXSCREENER_BOOSTS_TOP_URL = "https://api.dexscreener.com/token-boosts/top/v1"
 DEX_WALLET_DISCOVERY_MAX_TOKENS = min(
-    max(int(os.getenv("DEX_WALLET_DISCOVERY_MAX_TOKENS", "5")), 1), 10
+    max(int(os.getenv("DEX_WALLET_DISCOVERY_MAX_TOKENS", "20")), 1), 50
 )
 DEX_WALLET_CANDIDATES_PER_TOKEN = min(
-    max(int(os.getenv("DEX_WALLET_CANDIDATES_PER_TOKEN", "5")), 1), 10
+    max(int(os.getenv("DEX_WALLET_CANDIDATES_PER_TOKEN", "15")), 1), 30
 )
 DEX_WALLET_HISTORY_LIMIT = min(
-    max(int(os.getenv("DEX_WALLET_HISTORY_LIMIT", "50")), 10), 100
+    max(int(os.getenv("DEX_WALLET_HISTORY_LIMIT", "100")), 25), 100
 )
 DEX_WALLET_MIN_LIQUIDITY_USD = max(
-    float(os.getenv("DEX_WALLET_MIN_LIQUIDITY_USD", "25000")), 0
+    float(os.getenv("DEX_WALLET_MIN_LIQUIDITY_USD", "10000")), 0
 )
 DEX_WALLET_MIN_VOLUME_H24_USD = max(
-    float(os.getenv("DEX_WALLET_MIN_VOLUME_H24_USD", "10000")), 0
+    float(os.getenv("DEX_WALLET_MIN_VOLUME_H24_USD", "5000")), 0
 )
 DEX_WALLET_MIN_PAIR_AGE_HOURS = min(
-    max(float(os.getenv("DEX_WALLET_MIN_PAIR_AGE_HOURS", "1")), 0), 168
+    max(float(os.getenv("DEX_WALLET_MIN_PAIR_AGE_HOURS", "0.25")), 0), 168
+)
+DEX_WALLET_EARLY_SCORE_THRESHOLD = min(
+    max(float(os.getenv("DEX_WALLET_EARLY_SCORE_THRESHOLD", "65")), 0), 100
 )
 DEX_WALLET_PROBATION_MIN_DAYS = min(
     max(int(os.getenv("DEX_WALLET_PROBATION_MIN_DAYS", "7")), 1), 30
@@ -294,6 +297,9 @@ def initialise_database():
                     total_invested_30d DOUBLE PRECISION,
                     score DOUBLE PRECISION NOT NULL DEFAULT 0,
                     score_status TEXT NOT NULL DEFAULT 'unscored',
+                    early_entry_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    repeat_early_entries INTEGER NOT NULL DEFAULT 0,
+                    discovery_tier TEXT NOT NULL DEFAULT 'CANDIDATE',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     last_scored TIMESTAMPTZ
@@ -427,6 +433,12 @@ def initialise_database():
                     pair_address TEXT,
                     source TEXT NOT NULL DEFAULT 'dexscreener',
                     discovered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    observed_entry_rank INTEGER,
+                    observed_entry_delay_seconds DOUBLE PRECISION,
+                    early_entry_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    liquidity_usd DOUBLE PRECISION,
+                    volume_h24_usd DOUBLE PRECISION,
+                    pair_age_hours DOUBLE PRECISION,
                     details TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (wallet, token_address)
                 )
@@ -654,6 +666,15 @@ def initialise_database():
             cur.execute("ALTER TABLE wallet_screenings ADD COLUMN IF NOT EXISTS screening_version TEXT NOT NULL DEFAULT '4.2'")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS validation_status TEXT NOT NULL DEFAULT 'unvalidated'")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS last_validated TIMESTAMPTZ")
+            cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS early_entry_score DOUBLE PRECISION NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS repeat_early_entries INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS discovery_tier TEXT NOT NULL DEFAULT 'CANDIDATE'")
+            cur.execute("ALTER TABLE wallet_discovery_sources ADD COLUMN IF NOT EXISTS observed_entry_rank INTEGER")
+            cur.execute("ALTER TABLE wallet_discovery_sources ADD COLUMN IF NOT EXISTS observed_entry_delay_seconds DOUBLE PRECISION")
+            cur.execute("ALTER TABLE wallet_discovery_sources ADD COLUMN IF NOT EXISTS early_entry_score DOUBLE PRECISION NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE wallet_discovery_sources ADD COLUMN IF NOT EXISTS liquidity_usd DOUBLE PRECISION")
+            cur.execute("ALTER TABLE wallet_discovery_sources ADD COLUMN IF NOT EXISTS volume_h24_usd DOUBLE PRECISION")
+            cur.execute("ALTER TABLE wallet_discovery_sources ADD COLUMN IF NOT EXISTS pair_age_hours DOUBLE PRECISION")
             cur.execute("ALTER TABLE discovery_observations ADD COLUMN IF NOT EXISTS token_symbol TEXT")
             cur.execute("ALTER TABLE token_watchlist ADD COLUMN IF NOT EXISTS canonical_pair_address TEXT")
             cur.execute("ALTER TABLE token_watchlist ADD COLUMN IF NOT EXISTS canonical_pair_dex_id TEXT")
@@ -1495,7 +1516,27 @@ def diagnostics():
 # DISCOVERY
 # =========================================================
 
-def extract_dex_wallet_candidates(token_address, transactions, limit):
+def observed_early_entry_score(entry_delay_seconds, entry_rank):
+    """Score bounded observed entry evidence without claiming first-ever entry."""
+    if entry_delay_seconds is None or entry_delay_seconds < 0:
+        time_score = 20
+    elif entry_delay_seconds <= 15 * 60:
+        time_score = 95
+    elif entry_delay_seconds <= 60 * 60:
+        time_score = 85
+    elif entry_delay_seconds <= 6 * 60 * 60:
+        time_score = 70
+    elif entry_delay_seconds <= 24 * 60 * 60:
+        time_score = 50
+    elif entry_delay_seconds <= 72 * 60 * 60:
+        time_score = 30
+    else:
+        time_score = 15
+    rank_bonus = 10 if entry_rank <= 3 else 5 if entry_rank <= 10 else 0
+    return min(time_score + rank_bonus, 100)
+
+
+def extract_dex_wallet_candidates(token_address, transactions, limit, pair_created_ms=None):
     """Rank recent on-chain buyers without treating discovery as proof of skill."""
     observations = {}
     if not isinstance(transactions, list):
@@ -1544,9 +1585,57 @@ def extract_dex_wallet_candidates(token_address, transactions, limit):
             "token_amount": record["token_amount"],
         })
     ranked.sort(key=lambda item: (
-        -item["buy_transactions"], item["first_observed_at"], item["wallet"]
+        item["first_observed_at"], -item["buy_transactions"], item["wallet"]
     ))
+    pair_created_at = (
+        datetime.fromtimestamp(pair_created_ms / 1000, timezone.utc)
+        if isinstance(pair_created_ms, (int, float)) and pair_created_ms > 0 else None
+    )
+    for entry_rank, item in enumerate(ranked, start=1):
+        delay = (
+            max((item["first_observed_at"] - pair_created_at).total_seconds(), 0)
+            if pair_created_at else None
+        )
+        item["observed_entry_rank"] = entry_rank
+        item["observed_entry_delay_seconds"] = delay
+        item["early_entry_score"] = observed_early_entry_score(delay, entry_rank)
     return ranked[:limit]
+
+
+def refresh_discovery_wallet_evidence(cur, wallet):
+    """Aggregate repeat early-entry evidence while keeping admission manual."""
+    cur.execute("""
+        SELECT COUNT(*),
+            COUNT(*) FILTER (WHERE early_entry_score >= %s),
+            COALESCE(AVG(early_entry_score), 0)
+        FROM wallet_discovery_sources WHERE wallet = %s
+    """, (DEX_WALLET_EARLY_SCORE_THRESHOLD, wallet))
+    tokens_found, repeat_early_entries, average_early_score = cur.fetchone()
+    if repeat_early_entries >= 3 and average_early_score >= DEX_WALLET_EARLY_SCORE_THRESHOLD:
+        discovery_tier = "PROVEN"
+    elif repeat_early_entries >= 2:
+        discovery_tier = "PROBATION"
+    else:
+        discovery_tier = "CANDIDATE"
+    cur.execute("""
+        UPDATE candidate_wallets SET tokens_found = %s,
+            early_entry_score = %s, repeat_early_entries = %s,
+            discovery_tier = %s, updated_at = NOW() WHERE wallet = %s
+    """, (
+        tokens_found, round(float(average_early_score), 2),
+        repeat_early_entries, discovery_tier, wallet,
+    ))
+    cur.execute("""
+        UPDATE wallet_discovery_cohorts SET details =
+            COALESCE(details, '{}')::jsonb || %s::jsonb,
+            updated_at = NOW() WHERE wallet = %s
+    """, (json.dumps({
+        "discovery_tier": discovery_tier,
+        "repeat_early_entries": repeat_early_entries,
+        "average_early_entry_score": round(float(average_early_score), 2),
+        "automatic_signal_admission": False,
+    }), wallet))
+    return discovery_tier
 
 
 def select_solana_discovery_pair(payload, token_address):
@@ -1734,7 +1823,8 @@ def discover_dex_wallets():
             })
             continue
         candidates = extract_dex_wallet_candidates(
-            token_address, history, DEX_WALLET_CANDIDATES_PER_TOKEN
+            token_address, history, DEX_WALLET_CANDIDATES_PER_TOKEN,
+            pair_created_ms,
         )
         pair_token = (
             pair.get("baseToken")
@@ -1787,19 +1877,44 @@ def discover_dex_wallets():
                     ))
                     cur.execute("""
                         INSERT INTO wallet_discovery_sources (
-                            wallet, token_address, pair_address, details
-                        ) VALUES (%s, %s, %s, %s)
+                            wallet, token_address, pair_address,
+                            observed_entry_rank, observed_entry_delay_seconds,
+                            early_entry_score, liquidity_usd, volume_h24_usd,
+                            pair_age_hours, details
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (wallet, token_address) DO UPDATE SET
+                            pair_address = EXCLUDED.pair_address,
+                            observed_entry_rank = LEAST(
+                                wallet_discovery_sources.observed_entry_rank,
+                                EXCLUDED.observed_entry_rank
+                            ),
+                            observed_entry_delay_seconds = LEAST(
+                                wallet_discovery_sources.observed_entry_delay_seconds,
+                                EXCLUDED.observed_entry_delay_seconds
+                            ),
+                            early_entry_score = GREATEST(
+                                wallet_discovery_sources.early_entry_score,
+                                EXCLUDED.early_entry_score
+                            ),
+                            liquidity_usd = EXCLUDED.liquidity_usd,
+                            volume_h24_usd = EXCLUDED.volume_h24_usd,
+                            pair_age_hours = EXCLUDED.pair_age_hours,
                             details = EXCLUDED.details
                     """, (
                         wallet, token_address, pair.get("pairAddress"),
+                        candidate["observed_entry_rank"],
+                        candidate["observed_entry_delay_seconds"],
+                        candidate["early_entry_score"], pair_liquidity,
+                        pair_volume_h24, pair_age_hours,
                         json.dumps({
                             "run_id": run_id,
                             "buy_transactions_in_sample": candidate["buy_transactions"],
                             "first_observed_at": candidate["first_observed_at"].isoformat(),
                             "last_observed_at": candidate["last_observed_at"].isoformat(),
+                            "observed_entry_not_first_ever_entry": True,
                         }),
                     ))
+                    refresh_discovery_wallet_evidence(cur, wallet)
             conn.commit()
         results.append({
             "token_address": token_address, "status": "completed",
@@ -1828,7 +1943,51 @@ def discover_dex_wallets():
             "discovery_does_not_prove_success": True,
             "source_tokens_permanently_excluded": True,
             "automatic_signal_admission": False,
+            "wide_funnel": True,
+            "early_entry_threshold": DEX_WALLET_EARLY_SCORE_THRESHOLD,
         },
+    })
+
+
+@app.get("/dex-wallet-leaderboard")
+def dex_wallet_leaderboard():
+    """Expose the wide funnel and repeat early-entry evidence for review."""
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+    except (TypeError, ValueError):
+        limit = 50
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT discovery_tier, COUNT(*)
+                FROM candidate_wallets GROUP BY discovery_tier
+            """)
+            tier_counts = {row[0]: row[1] for row in cur.fetchall()}
+            cur.execute("""
+                SELECT wallet, discovery_tier, tokens_found,
+                    repeat_early_entries, early_entry_score, score,
+                    score_status, screening_status, screening_risk_score,
+                    created_at, updated_at
+                FROM candidate_wallets
+                ORDER BY repeat_early_entries DESC, early_entry_score DESC,
+                    tokens_found DESC, updated_at DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    return jsonify({
+        "success": True, "version": VERSION, "paper_mode": True,
+        "automatic_signal_admission": False,
+        "early_entry_threshold": DEX_WALLET_EARLY_SCORE_THRESHOLD,
+        "tier_counts": tier_counts,
+        "wallets": [{
+            "wallet": row[0], "discovery_tier": row[1],
+            "tokens_found": row[2], "repeat_early_entries": row[3],
+            "average_early_entry_score": row[4],
+            "performance_score": row[5], "score_status": row[6],
+            "screening_status": row[7], "screening_risk_score": row[8],
+            "discovered_at": row[9], "updated_at": row[10],
+        } for row in rows],
     })
 
 
