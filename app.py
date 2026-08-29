@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.14.3-candidate-pipeline"
+VERSION = "4.14.4-probation-quality"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -161,7 +161,6 @@ DEFAULT_TOKEN_WATCHLIST = (
     ("robinhood", "0xe934e36A439C94017B64a3FecE66AF12099aBF50", "STONKBROKER", "StonkBroker", "portfolio", "evm_monitoring_ready"),
     ("robinhood", "0x020bfC650A365f8BB26819deAAbF3E21291018b4", "CASHCAT", "Cash Cat", "portfolio", "evm_monitoring_ready"),
     ("robinhood", "0xfd181632e1F2335DaB74535E6dD29082d3191bb2", "RFLX", "RFLIX", "portfolio", "evm_monitoring_ready"),
-    ("robinhood", "0xeC45C6C413b498Cf5aCF5a1a889F1a95cA9b6bB3", "PORTLY", "PORTLY", "existing_test_case", "evm_monitoring_ready"),
     ("robinhood", "0x298348d5b2e45C774E3ee4f1a0924071DfbDC8C7", "SWAPPY", "Swappy", "research_test_case", "evm_monitoring_ready"),
     ("base", "0xA4A2E2ca3fBfE21aed83471D28b6f65A233C6e00", "TIBBIR", "Ribbita by Virtuals", "research_test_case", "evm_monitoring_ready"),
     ("robinhood", "0x5f62c57e5c537887117eef828b7e3ad41c009feb", "GOOD", "Good In The Hood", "research_watchlist", "evm_monitoring_ready"),
@@ -732,6 +731,19 @@ def initialise_database():
                     monitoring_status = 'replaced_by_base_weth_benchmark',
                     updated_at = NOW()
                 WHERE token_address = 'native:ETH'
+            """)
+
+            # V4.14.4 retires PORTLY from active monitoring while preserving
+            # its historical snapshots, signals and transition evidence.
+            cur.execute("""
+                UPDATE token_watchlist
+                SET active = FALSE,
+                    monitoring_status = 'removed_from_watchlist_v4_14_4',
+                    updated_at = NOW()
+                WHERE chain = 'robinhood'
+                    AND LOWER(token_address) = LOWER(
+                        '0xeC45C6C413b498Cf5aCF5a1a889F1a95cA9b6bB3'
+                    )
             """)
 
             # Reclassify the V4.10.1/2 timeout-only observations. Their market
@@ -1758,7 +1770,7 @@ def load_dex_wallet_pipeline_status():
                                 NOT LIKE '%%service_like_activity%%'
                             AND COALESCE(screening.risk_flags, '[]')
                                 NOT LIKE '%%bursty_automated_activity%%'
-                    ) AS probation_ready,
+                    ) AS minimum_gates_passed,
                     COUNT(*) FILTER (
                         WHERE cohort.wallet IS NOT NULL
                             AND cohort.cohort_status = 'PROBATION'
@@ -1781,7 +1793,11 @@ def load_dex_wallet_pipeline_status():
                     candidate.screening_risk_score,
                     candidate.realized_pnl_30d, candidate.trades_30d,
                     candidate.validation_status, candidate.repeat_early_entries,
-                    candidate.early_entry_score
+                    candidate.early_entry_score, candidate.tokens_found,
+                    candidate.total_pnl_30d, candidate.win_rate_30d,
+                    candidate.total_invested_30d, candidate.score_status,
+                    candidate.screening_status,
+                    COALESCE(screening.risk_flags, '[]')
                 FROM candidate_wallets candidate
                 JOIN wallet_discovery_cohorts cohort
                     ON cohort.wallet = candidate.wallet
@@ -1810,21 +1826,69 @@ def load_dex_wallet_pipeline_status():
     names = (
         "all_candidates", "discovered", "awaiting_score", "scored",
         "performance_pass", "screened", "low_risk", "validated",
-        "probation_ready", "probation", "consensus_validated",
+        "minimum_gates_passed", "probation", "consensus_validated",
     )
     counts = dict(zip(names, row or (0,) * len(names)))
-    return {
-        "counts": counts,
-        "probation_ready_wallets": [{
-            "wallet": item[0], "performance_score": item[1],
+    validation_summaries = load_validation_summaries()
+    historical_evidence = load_repeat_evidence()
+    minimum_gate_wallets = []
+    recommended_wallets = []
+    for item in ready_rows:
+        wallet = item[0]
+        try:
+            risk_flags = json.loads(item[14] or "[]")
+        except (TypeError, ValueError):
+            risk_flags = []
+        candidate = {
+            "wallet": wallet, "score": item[1], "realized_pnl": item[3],
+            "trades": item[4], "validation_status": item[5],
+            "tokens_found": item[8], "total_pnl": item[9],
+            "win_rate": item[10], "invested": item[11],
+            "score_status": item[12], "screening_status": item[13],
+        }
+        validation = validation_summaries.get(wallet, {})
+        evidence = historical_evidence.get(wallet, {})
+        classification = classify_candidate(
+            candidate,
+            {"risk_score": item[2], "risk_flags": risk_flags},
+            validation, evidence,
+        )
+        dex_repeat_early = (item[6] or 0) >= 2
+        independent_repeat = bool(evidence.get("independent_repeat_evidence"))
+        cross_token = bool(evidence.get("cross_token_evidence"))
+        discovery_confirmed = dex_repeat_early or independent_repeat or cross_token
+        record = {
+            "wallet": wallet, "performance_score": item[1],
             "screening_risk_score": item[2],
             "realized_pnl_30d": item[3], "trades_30d": item[4],
             "validation_status": item[5], "repeat_early_entries": item[6],
             "average_early_entry_score": item[7],
+            "classification": classification["classification"],
+            "validation_strength": validation.get("validation_strength"),
+            "independent_repeat_evidence": independent_repeat,
+            "cross_token_evidence": cross_token,
+            "discovery_confirmed": discovery_confirmed,
             "consensus_weight": 0,
-        } for item in ready_rows],
+        }
+        minimum_gate_wallets.append(record)
+        if (
+            validation.get("validation_strength") == "strong"
+            and classification["classification"] in {"WATCH", "ASYMMETRIC"}
+            and discovery_confirmed
+        ):
+            recommended_wallets.append(record)
+    counts["recommended_for_probation"] = len(recommended_wallets)
+    return {
+        "counts": counts,
+        "minimum_gates_passed_wallets": minimum_gate_wallets,
+        "recommended_probation_wallets": recommended_wallets,
         "policy": {
             "batch_limits": {"score": 5, "screen": 5, "validate": 2},
+            "recommendation_requires": {
+                "validation_strength": "strong",
+                "classification": ["WATCH", "ASYMMETRIC"],
+                "repeat_or_cross_token_early_entry_evidence": True,
+            },
             "manual_probation_admission": True,
             "automatic_consensus_admission": False,
             "candidate_and_probation_consensus_weight": 0,
@@ -5959,6 +6023,9 @@ EVM_SIGNAL_SELECT = """
         s.is_benchmark, s.pending_status, s.pending_status_count,
         s.raw_status, s.raw_status_count, s.alert_confirmation_count
     FROM evm_token_signals s
+    JOIN token_watchlist w ON w.chain = s.chain
+        AND LOWER(w.token_address) = LOWER(s.token_address)
+        AND w.active = TRUE
     LEFT JOIN evm_token_snapshots p ON p.id = s.latest_snapshot_id
 """
 
@@ -7071,7 +7138,12 @@ def build_dashboard_payload():
             "probation_wallets": len(probation_wallets),
             "screened_wallets": len(screened_wallets),
             "dex_candidates": candidate_pipeline["counts"]["discovered"],
-            "probation_ready": candidate_pipeline["counts"]["probation_ready"],
+            "minimum_gates_passed": candidate_pipeline["counts"][
+                "minimum_gates_passed"
+            ],
+            "recommended_for_probation": candidate_pipeline["counts"][
+                "recommended_for_probation"
+            ],
         },
         "paper_mode": True, "actionable": False,
     }
@@ -7094,22 +7166,24 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.14.3 · Candidate Pipeline</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Wide DexScreener discovery + visible screening funnel + zero-weight probation + multi-chain evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.14.4 · Probation Quality</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Wide DexScreener discovery + evidence-qualified probation recommendations + multi-chain monitoring</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
     <div class="card"><span class="label">Dex candidates</span><b id="dexCandidateCount">—</b><span class="muted">Wide discovery cohort</span></div>
     <div class="card"><span class="label">Passed screening</span><b id="screenedCount">—</b><span class="muted">Candidates · zero consensus weight</span></div>
-    <div class="card"><span class="label">Probation ready</span><b id="probationReadyCount">—</b><span class="muted">Manual admission required</span></div>
+    <div class="card"><span class="label">Minimum gates passed</span><b id="minimumGatesCount">—</b><span class="muted">Baseline eligibility only</span></div>
+    <div class="card"><span class="label">Recommended for probation</span><b id="recommendedCount">—</b><span class="muted">Strong, repeated evidence</span></div>
     <div class="card"><span class="label">Probation wallets</span><b id="probationCount">—</b><span class="muted">Visible · zero consensus weight</span></div>
     <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
   </section>
   <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair evidence; holder freshness and performance relative to ETH are explicit</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="13" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana consensus windows</h2><div class="muted">Activity funnel across independent validated wallet clusters; probation activity cannot vote</div></div><div class="links"><a href="/solana-activity">Full diagnostics</a><a href="/dex-wallet-cohorts">Discovery cohorts</a><a href="/dex-wallet-discovery-history">Discovery runs</a><a href="/probation-wallet-activity">Probation activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Window</th><th>Events</th><th>Active wallets</th><th>Clusters</th><th>Tokens bought</th><th>2 buyers</th><th>3+ buyers</th><th>Missing symbols</th></tr></thead><tbody id="solWindowBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
-  <section class="section"><div class="section-head"><div><h2>DexScreener candidate processing pipeline</h2><div class="muted">Newly discovered wallets are prioritised through bounded scoring, screening and validation batches</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Pipeline JSON</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a><a href="/dex-wallet-cohorts">Discovery cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Discovered</th><th>Awaiting score</th><th>Scored</th><th>Performance ≥30</th><th>Screened</th><th>Low risk</th><th>Validated</th><th>Probation ready</th><th>In probation</th><th>Consensus validated</th></tr></thead><tbody id="pipelineBody"><tr><td colspan="10" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>DexScreener candidate processing pipeline</h2><div class="muted">Newly discovered wallets are prioritised through bounded scoring, screening and validation batches</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Pipeline JSON</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a><a href="/dex-wallet-cohorts">Discovery cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Discovered</th><th>Awaiting score</th><th>Scored</th><th>Performance ≥30</th><th>Screened</th><th>Low risk</th><th>Validated</th><th>Minimum gates</th><th>Recommended</th><th>In probation</th><th>Consensus validated</th></tr></thead><tbody id="pipelineBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Wallets passed initial performance and risk screening</h2><div class="muted">Performance ≥30 and risk ≤25; source identifies whether the wallet came from the new DexScreener cohort</div></div><div class="links"><a href="/dex-wallet-leaderboard">Candidate leaderboard</a><a href="/screenings">Screening evidence</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Source</th><th>Performance score</th><th>Risk score</th><th>30-day realised P&amp;L</th><th>Trades</th></tr></thead><tbody id="screenedWalletBody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody></table></div></section>
-  <section class="section"><div class="section-head"><div><h2>DexScreener wallets ready for probation review</h2><div class="muted">All admission gates passed; entry remains manual and consensus weight remains zero during probation</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Readiness details</a><a href="/dex-wallet-cohorts">All cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Performance</th><th>Risk</th><th>30-day realised P&amp;L</th><th>Trades</th><th>Validation</th><th>Repeat early entries</th><th>Early-entry score</th></tr></thead><tbody id="probationReadyBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Wallets passing minimum probation gates</h2><div class="muted">Baseline performance, risk and trade-history gates only; this does not mean the wallet is recommended</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Gate details</a><a href="/dex-wallet-cohorts">All cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Performance</th><th>Risk</th><th>30-day realised P&amp;L</th><th>Trades</th><th>Validation</th><th>Strength</th><th>Classification</th><th>Repeat early entries</th><th>Early-entry score</th></tr></thead><tbody id="minimumGatesBody"><tr><td colspan="10" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Recommended for probation</h2><div class="muted">Requires strong token validation, WATCH or ASYMMETRIC classification, and repeat or cross-token early-entry evidence</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Recommendation evidence</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Classification</th><th>Validation strength</th><th>Performance</th><th>Risk</th><th>Repeat early entries</th><th>Cross-token evidence</th><th>Early-entry score</th></tr></thead><tbody id="recommendedBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana probation wallets</h2><div class="muted">Forward-only evidence is visible here but contributes zero buyer votes until manual validation</div></div><div class="links"><a href="/dex-wallet-cohorts">All cohorts</a><a href="/probation-wallet-activity">Probation activity</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Status</th><th>Admitted</th><th>Probation age</th><th>Performance</th><th>Risk</th><th>Early entries</th><th>Forward trades</th><th>Forward tokens</th><th>Last activity</th><th>Promotion review</th></tr></thead><tbody id="probationBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Active Solana paper signals</h2><div class="muted">Buyer labels count independent wallet clusters—not transactions</div></div><div class="links"><a href="/signals?include_expired=false">Active JSON</a><a href="/signals?include_expired=true">History</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Last activity</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <div class="warning">Paper research only. Signals are observations—not trade instructions—and token safety remains unverified.</div><div class="footer" id="footer">Auto-refreshes every 60 seconds.</div>
@@ -7122,12 +7196,13 @@ const when=v=>v?new Date(v).toLocaleString():'—';
 const age=s=>s==null?'unknown age':s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m`:s<86400?`${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`:`${Math.floor(s/86400)}d ${Math.floor((s%86400)/3600)}h`;
 const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_BENCHMARK'?'benchmark':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
-document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('probationReadyCount').textContent=d.summary.probation_ready;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
+document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
 document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td><div>${num(x.holder_count)}</div><div class="address">${age(x.holder_data_age_seconds)} old</div></td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${trend(x.trends['24h'].relative_to_eth_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="13" class="empty">No EVM snapshots yet.</td></tr>';
 const windows=d.solana_activity?.windows||{};document.getElementById('solWindowBody').innerHTML=['1h','6h','24h'].map(w=>{const x=windows[w]||{};return `<tr><td><div class="token">${w}</div></td><td>${num(x.events)}</td><td>${num(x.active_wallets)}</td><td>${num(x.independent_clusters)}</td><td>${num(x.unique_tokens_bought)}</td><td>${num(x.tokens_with_2_buyers)}</td><td>${num(x.tokens_with_3_plus_buyers)}</td><td>${num(x.missing_symbols)}</td></tr>`}).join('');
-const pc=d.candidate_pipeline?.counts||{};document.getElementById('pipelineBody').innerHTML=`<tr><td>${num(pc.discovered)}</td><td>${num(pc.awaiting_score)}</td><td>${num(pc.scored)}</td><td>${num(pc.performance_pass)}</td><td>${num(pc.screened)}</td><td>${num(pc.low_risk)}</td><td>${num(pc.validated)}</td><td>${num(pc.probation_ready)}</td><td>${num(pc.probation)}</td><td>${num(pc.consensus_validated)}</td></tr>`;
+const pc=d.candidate_pipeline?.counts||{};document.getElementById('pipelineBody').innerHTML=`<tr><td>${num(pc.discovered)}</td><td>${num(pc.awaiting_score)}</td><td>${num(pc.scored)}</td><td>${num(pc.performance_pass)}</td><td>${num(pc.screened)}</td><td>${num(pc.low_risk)}</td><td>${num(pc.validated)}</td><td>${num(pc.minimum_gates_passed)}</td><td>${num(pc.recommended_for_probation)}</td><td>${num(pc.probation)}</td><td>${num(pc.consensus_validated)}</td></tr>`;
 const screened=d.screened_wallets||[];document.getElementById('screenedWalletBody').innerHTML=screened.length?screened.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">provisional pass · zero consensus weight</div></a></td><td><span class="badge ${x.source==='DEX DISCOVERY'?'accumulation':'observe'}">${esc(x.source)}</span></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${money(x.realized_pnl_30d)}</td><td>${num(x.trades_30d)}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">No wallets have passed both initial performance and risk screening yet.</td></tr>';
-const ready=d.candidate_pipeline?.probation_ready_wallets||[];document.getElementById('probationReadyBody').innerHTML=ready.length?ready.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">manual admission · zero consensus weight</div></a></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${money(x.realized_pnl_30d)}</td><td>${num(x.trades_30d)}</td><td>${esc(x.validation_status)}</td><td>${num(x.repeat_early_entries)}</td><td>${num(x.average_early_entry_score)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">No newly discovered wallets have passed every probation admission gate yet.</td></tr>';
+const minimum=d.candidate_pipeline?.minimum_gates_passed_wallets||[];document.getElementById('minimumGatesBody').innerHTML=minimum.length?minimum.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">baseline gates · zero consensus weight</div></a></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${money(x.realized_pnl_30d)}</td><td>${num(x.trades_30d)}</td><td>${esc(x.validation_status||'unvalidated')}</td><td>${esc(x.validation_strength||'none')}</td><td>${esc(x.classification||'REJECT')}</td><td>${num(x.repeat_early_entries)}</td><td>${num(x.average_early_entry_score)}</td></tr>`).join(''):'<tr><td colspan="10" class="empty">No newly discovered wallets currently pass all minimum probation gates.</td></tr>';
+const recommended=d.candidate_pipeline?.recommended_probation_wallets||[];document.getElementById('recommendedBody').innerHTML=recommended.length?recommended.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">manual admission · zero consensus weight</div></a></td><td><span class="badge accumulation">${esc(x.classification)}</span></td><td>${esc(x.validation_strength)}</td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${num(x.repeat_early_entries)}</td><td>${x.cross_token_evidence?'yes':x.independent_repeat_evidence?'repeat evidence':'no'}</td><td>${num(x.average_early_entry_score)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">No wallet currently satisfies strong validation plus WATCH/ASYMMETRIC and repeat or cross-token evidence.</td></tr>';
 const probation=d.probation_wallets||[];document.getElementById('probationBody').innerHTML=probation.length?probation.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">zero consensus weight</div></a></td><td><span class="badge provider">PROBATION</span></td><td>${when(x.admitted_at)}</td><td>${age(x.probation_age_seconds)}</td><td>${num(x.performance_score)}</td><td>${x.screening_risk_score==null?'—':num(x.screening_risk_score)}</td><td><div>${num(x.repeat_early_entries)}</div><div class="address">avg ${num(x.average_early_entry_score)}</div></td><td><div>${num(x.forward_trades)}</div><div class="address">minimum ${num(d.probation_policy.minimum_forward_trades)}</div></td><td><div>${num(x.forward_tokens)}</div><div class="address">minimum ${num(d.probation_policy.minimum_forward_tokens)}</div></td><td>${when(x.last_forward_activity_at)}</td><td>${x.promotion_review_ready?'<span class="badge accumulation">READY FOR REVIEW</span>':'<span class="badge expired">COLLECTING</span>'}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No wallets are currently in probation. Candidates remain in the discovery funnel until all admission gates pass.</td></tr>';
 document.getElementById('solBody').innerHTML=d.solana_signals.length?d.solana_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.token_symbol||'Unknown')}<span class="external">↗</span></div><div class="address">${esc((x.token_address||'').slice(0,10))}…</div></a>`:`<div class="token">${esc(x.token_symbol||'Unknown')}</div>`}</td><td>${badge(x.display_status)}</td><td>${num(x.buy_score)}</td><td>${num(x.sell_score)}</td><td>${num(x.independent_buy_clusters)}</td><td>${num(x.independent_sell_clusters)}</td><td>${esc(x.safety_status)}</td><td><div>${when(x.last_activity_at)}</div><div class="address">${age(x.signal_age_seconds)} ago</div></td></tr>`).join(''):'<tr><td colspan="8" class="empty">No active Solana paper signals.</td></tr>';
 document.getElementById('footer').textContent=`${esc(d.version)} · generated ${when(d.generated_at)} · auto-refreshes every 60 seconds.`;
