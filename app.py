@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.14.4-probation-quality"
+VERSION = "4.14.5-candidate-visibility"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -1820,7 +1820,7 @@ def load_dex_wallet_pipeline_status():
                 ORDER BY candidate.repeat_early_entries DESC,
                     candidate.early_entry_score DESC, candidate.score DESC,
                     candidate.screening_risk_score ASC
-                LIMIT 25
+                LIMIT 200
             """, (SCREENING_VERSION,))
             ready_rows = cur.fetchall()
     names = (
