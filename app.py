@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.14.0-wide-wallet-discovery"
+VERSION = "4.14.1-probation-dashboard"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -6707,6 +6707,27 @@ def build_dashboard_payload():
                 WHERE captured_at >= NOW() - INTERVAL '24 hours'
             """)
             quality_row = cur.fetchone()
+            cur.execute("""
+                SELECT cohort.wallet, cohort.admitted_at,
+                    cohort.forward_trades, cohort.forward_tokens,
+                    cohort.last_forward_activity_at, cohort.updated_at,
+                    candidate.score, candidate.screening_risk_score,
+                    candidate.repeat_early_entries, candidate.early_entry_score,
+                    COUNT(DISTINCT source.token_address) AS source_tokens
+                FROM wallet_discovery_cohorts cohort
+                LEFT JOIN candidate_wallets candidate
+                    ON candidate.wallet = cohort.wallet
+                LEFT JOIN wallet_discovery_sources source
+                    ON source.wallet = cohort.wallet
+                WHERE cohort.cohort_status = 'PROBATION'
+                GROUP BY cohort.wallet, cohort.admitted_at,
+                    cohort.forward_trades, cohort.forward_tokens,
+                    cohort.last_forward_activity_at, cohort.updated_at,
+                    candidate.score, candidate.screening_risk_score,
+                    candidate.repeat_early_entries, candidate.early_entry_score
+                ORDER BY cohort.admitted_at DESC NULLS LAST, cohort.updated_at DESC
+            """)
+            probation_rows = cur.fetchall()
 
     grouped = {}
     for row in snapshot_rows:
@@ -6805,11 +6826,54 @@ def build_dashboard_payload():
         "holder_coverage_pct": round((quality_row[4] or 0) * 100 / total_snapshots, 1)
         if total_snapshots else None,
     }
+    probation_wallets = []
+    for row in probation_rows:
+        admitted_at = row[1]
+        if admitted_at and admitted_at.tzinfo is None:
+            admitted_at = admitted_at.replace(tzinfo=timezone.utc)
+        probation_age_seconds = max(
+            int((now - admitted_at).total_seconds()), 0
+        ) if admitted_at else 0
+        forward_trades = row[2] or 0
+        forward_tokens = row[3] or 0
+        probation_wallets.append({
+            "wallet": row[0], "cohort_status": "PROBATION",
+            "consensus_weight": 0, "admitted_at": admitted_at,
+            "probation_age_seconds": probation_age_seconds,
+            "forward_trades": forward_trades,
+            "forward_tokens": forward_tokens,
+            "last_forward_activity_at": row[4], "updated_at": row[5],
+            "performance_score": row[6], "screening_risk_score": row[7],
+            "repeat_early_entries": row[8],
+            "average_early_entry_score": row[9],
+            "source_tokens_excluded": row[10] or 0,
+            "minimum_days_met": probation_age_seconds >= (
+                DEX_WALLET_PROBATION_MIN_DAYS * 86400
+            ),
+            "minimum_forward_trades_met": (
+                forward_trades >= DEX_WALLET_PROBATION_MIN_TRADES
+            ),
+            "multiple_forward_tokens_met": forward_tokens >= 2,
+            "promotion_review_ready": (
+                probation_age_seconds >= DEX_WALLET_PROBATION_MIN_DAYS * 86400
+                and forward_trades >= DEX_WALLET_PROBATION_MIN_TRADES
+                and forward_tokens >= 2
+            ),
+        })
     return {
         "success": True, "version": VERSION,
         "generated_at": now, "latest_refresh": latest_refresh,
         "evm_signals": evm_signals, "solana_signals": solana_signals,
         "solana_activity": solana_activity, "snapshot_quality": snapshot_quality,
+        "probation_wallets": probation_wallets,
+        "probation_policy": {
+            "consensus_weight": 0,
+            "minimum_days": DEX_WALLET_PROBATION_MIN_DAYS,
+            "minimum_forward_trades": DEX_WALLET_PROBATION_MIN_TRADES,
+            "minimum_forward_tokens": 2,
+            "manual_promotion_required": True,
+            "source_tokens_permanently_excluded": True,
+        },
         "summary": {
             "evm_tokens": len(evm_signals),
             "evm_chains": len({item["chain"] for item in evm_signals}),
@@ -6820,6 +6884,7 @@ def build_dashboard_payload():
             "solana_active": sum(
                 1 for item in solana_signals if item["status"] != "EXPIRED"
             ),
+            "probation_wallets": len(probation_wallets),
         },
         "paper_mode": True, "actionable": False,
     }
@@ -6835,22 +6900,24 @@ DASHBOARD_HTML = r"""<!doctype html>
     :root{--bg:#07111f;--panel:#101d2e;--panel2:#13243a;--line:#24364d;--text:#e7eef8;--muted:#8fa3bb;--blue:#55a7ff;--green:#37d49b;--amber:#ffbd59;--red:#ff6577}
     *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at 15% 0,#122c48 0,transparent 38%),var(--bg);color:var(--text);font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
     .wrap{max-width:1460px;margin:auto;padding:28px}.top{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;margin-bottom:22px}.eyebrow{color:var(--blue);font-weight:700;letter-spacing:.14em;text-transform:uppercase;font-size:11px}h1{font-size:30px;margin:5px 0 4px}.sub,.muted{color:var(--muted)}.live{display:flex;align-items:center;gap:8px;background:#102d2a;border:1px solid #1d5d4d;color:#77e4bd;padding:9px 13px;border-radius:999px}.dot{width:8px;height:8px;background:var(--green);border-radius:50%;box-shadow:0 0 12px var(--green)}
-    .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}.card,.section{background:linear-gradient(145deg,rgba(19,36,58,.96),rgba(12,25,42,.96));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 40px rgba(0,0,0,.16)}.card{padding:18px}.card b{display:block;font-size:25px;margin-top:4px}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:24px}.card,.section{background:linear-gradient(145deg,rgba(19,36,58,.96),rgba(12,25,42,.96));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 40px rgba(0,0,0,.16)}.card{padding:18px}.card b{display:block;font-size:25px;margin-top:4px}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em}
     .section{padding:18px;margin-bottom:20px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.section h2{font-size:18px;margin:0}.links a{color:var(--blue);text-decoration:none;margin-left:14px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1040px}th{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:11px 10px;border-bottom:1px solid var(--line)}td{padding:13px 10px;border-bottom:1px solid rgba(36,54,77,.7);white-space:nowrap}tbody tr:hover{background:rgba(85,167,255,.04)}.token{font-weight:750}.address{font:11px ui-monospace,SFMono-Regular,Consolas;color:var(--muted)}.token-link{color:inherit;text-decoration:none;display:inline-block}.token-link:hover .token{color:var(--blue)}.external{color:var(--blue);font-size:11px;margin-left:4px}
     .badge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:700;font-size:11px}.observe{background:#19304b;color:#9ecbff}.benchmark{background:#252e58;color:#b7c7ff}.momentum,.accumulation{background:#123b31;color:#67e6b8}.high{background:#294320;color:#b4ef79}.risk,.distribution{background:#4a2028;color:#ff9aaa}.thin,.rebound,.provider{background:#4a381d;color:#ffd27d}.expired{background:#29313d;color:#aab5c3}.pos{color:var(--green)}.neg{color:var(--red)}.neutral{color:var(--muted)}.warning{margin-top:18px;padding:12px 15px;border:1px solid #54421f;background:#2a2415;color:#f2cf82;border-radius:12px}.empty{text-align:center;color:var(--muted);padding:24px}.error{border-color:#68303a;background:#321820;color:#ff9aaa}.footer{color:var(--muted);font-size:12px;text-align:center;padding:8px}
     @media(max-width:800px){.wrap{padding:18px}.top{display:block}.live{margin-top:14px;width:max-content}.cards{grid-template-columns:repeat(2,1fr)}h1{font-size:25px}.section-head{align-items:flex-start;flex-direction:column}.links a{margin:0 14px 0 0}}
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.13 Premium · Controlled Wallet Discovery</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Multi-window Solana consensus + probation-isolated discovery + ETH-relative EVM evidence</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.14.1 · Wide Discovery + Visible Probation</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Multi-window Solana consensus + zero-weight probation evidence + ETH-relative EVM monitoring</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
+    <div class="card"><span class="label">Probation wallets</span><b id="probationCount">—</b><span class="muted">Visible · zero consensus weight</span></div>
     <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
   </section>
   <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair evidence; holder freshness and performance relative to ETH are explicit</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="13" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana consensus windows</h2><div class="muted">Activity funnel across independent validated wallet clusters; probation activity cannot vote</div></div><div class="links"><a href="/solana-activity">Full diagnostics</a><a href="/dex-wallet-cohorts">Discovery cohorts</a><a href="/dex-wallet-discovery-history">Discovery runs</a><a href="/probation-wallet-activity">Probation activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Window</th><th>Events</th><th>Active wallets</th><th>Clusters</th><th>Tokens bought</th><th>2 buyers</th><th>3+ buyers</th><th>Missing symbols</th></tr></thead><tbody id="solWindowBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Solana probation wallets</h2><div class="muted">Forward-only evidence is visible here but contributes zero buyer votes until manual validation</div></div><div class="links"><a href="/dex-wallet-cohorts">All cohorts</a><a href="/probation-wallet-activity">Probation activity</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Status</th><th>Admitted</th><th>Probation age</th><th>Performance</th><th>Risk</th><th>Early entries</th><th>Forward trades</th><th>Forward tokens</th><th>Last activity</th><th>Promotion review</th></tr></thead><tbody id="probationBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Active Solana paper signals</h2><div class="muted">Buyer labels count independent wallet clusters—not transactions</div></div><div class="links"><a href="/signals?include_expired=false">Active JSON</a><a href="/signals?include_expired=true">History</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Last activity</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <div class="warning">Paper research only. Signals are observations—not trade instructions—and token safety remains unverified.</div><div class="footer" id="footer">Auto-refreshes every 60 seconds.</div>
 </main><script>
@@ -6862,9 +6929,10 @@ const when=v=>v?new Date(v).toLocaleString():'—';
 const age=s=>s==null?'unknown age':s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m`:s<86400?`${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`:`${Math.floor(s/86400)}d ${Math.floor((s%86400)/3600)}h`;
 const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_BENCHMARK'?'benchmark':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
-document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
+document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
 document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td><div>${num(x.holder_count)}</div><div class="address">${age(x.holder_data_age_seconds)} old</div></td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${trend(x.trends['24h'].relative_to_eth_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="13" class="empty">No EVM snapshots yet.</td></tr>';
 const windows=d.solana_activity?.windows||{};document.getElementById('solWindowBody').innerHTML=['1h','6h','24h'].map(w=>{const x=windows[w]||{};return `<tr><td><div class="token">${w}</div></td><td>${num(x.events)}</td><td>${num(x.active_wallets)}</td><td>${num(x.independent_clusters)}</td><td>${num(x.unique_tokens_bought)}</td><td>${num(x.tokens_with_2_buyers)}</td><td>${num(x.tokens_with_3_plus_buyers)}</td><td>${num(x.missing_symbols)}</td></tr>`}).join('');
+const probation=d.probation_wallets||[];document.getElementById('probationBody').innerHTML=probation.length?probation.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">zero consensus weight</div></a></td><td><span class="badge provider">PROBATION</span></td><td>${when(x.admitted_at)}</td><td>${age(x.probation_age_seconds)}</td><td>${num(x.performance_score)}</td><td>${x.screening_risk_score==null?'—':num(x.screening_risk_score)}</td><td><div>${num(x.repeat_early_entries)}</div><div class="address">avg ${num(x.average_early_entry_score)}</div></td><td><div>${num(x.forward_trades)}</div><div class="address">minimum ${num(d.probation_policy.minimum_forward_trades)}</div></td><td><div>${num(x.forward_tokens)}</div><div class="address">minimum ${num(d.probation_policy.minimum_forward_tokens)}</div></td><td>${when(x.last_forward_activity_at)}</td><td>${x.promotion_review_ready?'<span class="badge accumulation">READY FOR REVIEW</span>':'<span class="badge expired">COLLECTING</span>'}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No wallets are currently in probation. Candidates remain in the discovery funnel until all admission gates pass.</td></tr>';
 document.getElementById('solBody').innerHTML=d.solana_signals.length?d.solana_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.token_symbol||'Unknown')}<span class="external">↗</span></div><div class="address">${esc((x.token_address||'').slice(0,10))}…</div></a>`:`<div class="token">${esc(x.token_symbol||'Unknown')}</div>`}</td><td>${badge(x.display_status)}</td><td>${num(x.buy_score)}</td><td>${num(x.sell_score)}</td><td>${num(x.independent_buy_clusters)}</td><td>${num(x.independent_sell_clusters)}</td><td>${esc(x.safety_status)}</td><td><div>${when(x.last_activity_at)}</div><div class="address">${age(x.signal_age_seconds)} ago</div></td></tr>`).join(''):'<tr><td colspan="8" class="empty">No active Solana paper signals.</td></tr>';
 document.getElementById('footer').textContent=`${esc(d.version)} · generated ${when(d.generated_at)} · auto-refreshes every 60 seconds.`;
 }catch(e){document.getElementById('refreshState').textContent='Dashboard data unavailable';document.querySelector('.warning').classList.add('error');document.querySelector('.warning').textContent='Could not load dashboard data. The monitoring APIs continue running independently.';}}
