@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.15-observation-evidence"
+VERSION = "4.15.1-pepons-watchlist"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -170,6 +170,7 @@ DEFAULT_TOKEN_WATCHLIST = (
     ("robinhood", "0x298348d5b2e45C774E3ee4f1a0924071DfbDC8C7", "SWAPPY", "Swappy", "research_test_case", "evm_monitoring_ready"),
     ("base", "0xA4A2E2ca3fBfE21aed83471D28b6f65A233C6e00", "TIBBIR", "Ribbita by Virtuals", "research_test_case", "evm_monitoring_ready"),
     ("robinhood", "0x5f62c57e5c537887117eef828b7e3ad41c009feb", "GOOD", "Good In The Hood", "research_watchlist", "evm_monitoring_ready"),
+    ("robinhood", "0xD2a577E92438Fd0c1F2485f4FB91B9F866EB1E6C", "PEPONS", "Pepons", "research_watchlist", "evm_monitoring_ready"),
     ("base", "0x0F61Edbfe6Cd86024C0f210c0695B08df55fdfc9", "BSTONK", "BaseStonk", "research_watchlist", "evm_monitoring_ready"),
 )
 BASE58_ALPHABET = (
