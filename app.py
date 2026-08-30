@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.14.5-candidate-visibility"
+VERSION = "4.15-observation-evidence"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -69,6 +69,12 @@ DEX_WALLET_PROBATION_MIN_DAYS = min(
 DEX_WALLET_PROBATION_MIN_TRADES = min(
     max(int(os.getenv("DEX_WALLET_PROBATION_MIN_TRADES", "5")), 1), 50
 )
+OBSERVATION_POOL_LIMIT = min(
+    max(int(os.getenv("OBSERVATION_POOL_LIMIT", "100")), 25), 250
+)
+OBSERVATION_REPEAT_MIN_TOKENS = 2
+OBSERVATION_ENTRY_RANK_MAX = 10
+OBSERVATION_HORIZONS_HOURS = (0, 1, 6, 24, 168)
 ROBINHOOD_BLOCKSCOUT_URL = "https://robinhoodchain.blockscout.com/api/v2"
 EVM_CHAIN_CONFIG = {
     "robinhood": {
@@ -457,6 +463,47 @@ def initialise_database():
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_observation_activity (
+                    signature TEXT NOT NULL,
+                    wallet TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT,
+                    side TEXT NOT NULL,
+                    token_amount DOUBLE PRECISION,
+                    occurred_at TIMESTAMPTZ NOT NULL,
+                    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    entry_rank INTEGER,
+                    seconds_from_first_observed DOUBLE PRECISION,
+                    raw_summary TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (signature, wallet, token_address, side)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_observation_snapshots (
+                    signature TEXT NOT NULL,
+                    wallet TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    horizon_hours INTEGER NOT NULL,
+                    price_usd DOUBLE PRECISION,
+                    liquidity_usd DOUBLE PRECISION,
+                    market_cap_usd DOUBLE PRECISION,
+                    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    details TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (signature, wallet, token_address, horizon_hours)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS discovery_token_cohorts (
+                    token_address TEXT PRIMARY KEY,
+                    token_symbol TEXT,
+                    outcome_label TEXT NOT NULL,
+                    outcome_return_pct DOUBLE PRECISION,
+                    outcome_horizon_hours INTEGER,
+                    labelled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    details TEXT NOT NULL DEFAULT '{}'
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS paper_signals (
                     token_address TEXT PRIMARY KEY,
                     token_symbol TEXT,
@@ -644,6 +691,10 @@ def initialise_database():
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_cohort_status_idx ON wallet_discovery_cohorts (cohort_status, updated_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_probation_time_idx ON wallet_probation_activity (occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_probation_wallet_time_idx ON wallet_probation_activity (wallet, occurred_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS wallet_observation_time_idx ON wallet_observation_activity (occurred_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS wallet_observation_wallet_time_idx ON wallet_observation_activity (wallet, occurred_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS wallet_observation_token_time_idx ON wallet_observation_activity (token_address, occurred_at ASC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS wallet_observation_snapshot_due_idx ON wallet_observation_snapshots (captured_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS notification_delivery_status_idx ON notification_deliveries (delivery_status, created_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS helius_sync_created_idx ON helius_sync_history (created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS evm_snapshot_token_time_idx ON evm_token_snapshots (chain, token_address, captured_at DESC)")
@@ -1831,6 +1882,11 @@ def load_dex_wallet_pipeline_status():
     counts = dict(zip(names, row or (0,) * len(names)))
     validation_summaries = load_validation_summaries()
     historical_evidence = load_repeat_evidence()
+    observation_evidence = {
+        item["wallet"]: item for item in load_observation_evidence(
+            limit=OBSERVATION_POOL_LIMIT
+        )
+    }
     minimum_gate_wallets = []
     recommended_wallets = []
     for item in ready_rows:
@@ -1854,8 +1910,15 @@ def load_dex_wallet_pipeline_status():
             validation, evidence,
         )
         dex_repeat_early = (item[6] or 0) >= 2
-        independent_repeat = bool(evidence.get("independent_repeat_evidence"))
-        cross_token = bool(evidence.get("cross_token_evidence"))
+        observed = observation_evidence.get(wallet, {})
+        independent_repeat = bool(
+            evidence.get("independent_repeat_evidence")
+            or observed.get("independent_repeat_evidence")
+        )
+        cross_token = bool(
+            evidence.get("cross_token_evidence")
+            or observed.get("cross_token_evidence")
+        )
         discovery_confirmed = dex_repeat_early or independent_repeat or cross_token
         record = {
             "wallet": wallet, "performance_score": item[1],
@@ -1867,6 +1930,10 @@ def load_dex_wallet_pipeline_status():
             "validation_strength": validation.get("validation_strength"),
             "independent_repeat_evidence": independent_repeat,
             "cross_token_evidence": cross_token,
+            "forward_buys": observed.get("forward_buys", 0),
+            "forward_tokens": observed.get("forward_tokens", 0),
+            "early_forward_tokens": observed.get("early_forward_tokens", 0),
+            "last_forward_entry_at": observed.get("last_forward_entry_at"),
             "discovery_confirmed": discovery_confirmed,
             "consensus_weight": 0,
         }
@@ -1878,6 +1945,15 @@ def load_dex_wallet_pipeline_status():
         ):
             recommended_wallets.append(record)
     counts["recommended_for_probation"] = len(recommended_wallets)
+    counts["observation_pool"] = len(observation_evidence)
+    counts["observation_active"] = sum(
+        1 for item in observation_evidence.values()
+        if item.get("last_activity_at") is not None
+    )
+    counts["observation_repeat_evidence"] = sum(
+        1 for item in observation_evidence.values()
+        if item.get("independent_repeat_evidence")
+    )
     return {
         "counts": counts,
         "minimum_gates_passed_wallets": minimum_gate_wallets,
@@ -1892,7 +1968,9 @@ def load_dex_wallet_pipeline_status():
             "manual_probation_admission": True,
             "automatic_consensus_admission": False,
             "candidate_and_probation_consensus_weight": 0,
+            "observation_pool_consensus_weight": 0,
         },
+        "observation_wallets": list(observation_evidence.values()),
     }
 
 
@@ -1954,8 +2032,19 @@ def discover_dex_wallets():
             continue
         seen.add(token_address)
         tokens.append(item)
-        if len(tokens) >= token_limit:
-            break
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT token_address
+                FROM wallet_discovery_sources
+                WHERE discovered_at >= NOW() - INTERVAL '12 hours'
+            """)
+            recently_examined = {row[0] for row in cur.fetchall()}
+    tokens.sort(key=lambda item: (
+        item.get("tokenAddress") in recently_examined,
+        -(float(item.get("amount") or 0)),
+    ))
+    tokens = tokens[:token_limit]
     if not tokens:
         with db() as conn:
             with conn.cursor() as cur:
@@ -2349,6 +2438,75 @@ def dex_wallet_discovery_history():
             "status": row[5], "details": details,
         })
     return jsonify({"success": True, "version": VERSION, "runs": items})
+
+
+@app.get("/discovery-token-cohorts")
+def discovery_token_cohorts_endpoint():
+    initialise_database()
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT cohort.token_address, cohort.token_symbol,
+                    cohort.outcome_label, cohort.outcome_return_pct,
+                    cohort.outcome_horizon_hours, cohort.labelled_at,
+                    COUNT(DISTINCT source.wallet) AS source_wallets
+                FROM discovery_token_cohorts cohort
+                LEFT JOIN wallet_discovery_sources source
+                    ON source.token_address = cohort.token_address
+                GROUP BY cohort.token_address, cohort.token_symbol,
+                    cohort.outcome_label, cohort.outcome_return_pct,
+                    cohort.outcome_horizon_hours, cohort.labelled_at
+                ORDER BY cohort.labelled_at DESC
+            """)
+            rows = cur.fetchall()
+    return jsonify({"success": True, "version": VERSION, "tokens": [{
+        "token_address": row[0], "token_symbol": row[1],
+        "outcome_label": row[2], "outcome_return_pct": row[3],
+        "outcome_horizon_hours": row[4], "labelled_at": row[5],
+        "source_wallets": row[6],
+    } for row in rows], "policy": {
+        "allowed_labels": ["WINNER", "LOSER", "CONTROL"],
+        "used_for_calibration_only": True,
+        "does_not_grant_consensus_weight": True,
+    }})
+
+
+@app.post("/discovery-token-cohorts")
+def label_discovery_token_cohort_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    body = request.get_json(silent=True) or {}
+    token_address = body.get("token_address")
+    outcome_label = str(body.get("outcome_label") or "").upper()
+    if not is_valid_solana_address(token_address):
+        return jsonify({"success": False, "error": "Valid Solana token_address required"}), 400
+    if outcome_label not in {"WINNER", "LOSER", "CONTROL"}:
+        return jsonify({"success": False, "error": "outcome_label must be WINNER, LOSER or CONTROL"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO discovery_token_cohorts (
+                    token_address, token_symbol, outcome_label,
+                    outcome_return_pct, outcome_horizon_hours, details
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (token_address) DO UPDATE SET
+                    token_symbol = COALESCE(EXCLUDED.token_symbol, discovery_token_cohorts.token_symbol),
+                    outcome_label = EXCLUDED.outcome_label,
+                    outcome_return_pct = EXCLUDED.outcome_return_pct,
+                    outcome_horizon_hours = EXCLUDED.outcome_horizon_hours,
+                    labelled_at = NOW(), details = EXCLUDED.details
+            """, (
+                token_address, body.get("token_symbol"), outcome_label,
+                body.get("outcome_return_pct"), body.get("outcome_horizon_hours"),
+                json.dumps({"manual_review": True, "calibration_only": True}),
+            ))
+        conn.commit()
+    return jsonify({"success": True, "token_address": token_address,
+                    "outcome_label": outcome_label,
+                    "consensus_weight": 0, "calibration_only": True})
 
 
 @app.get("/probation-wallet-activity")
@@ -3697,8 +3855,58 @@ def load_probation_wallet_map():
     return probation
 
 
+def load_observation_wallet_map():
+    """Monitor promising discovery wallets without granting any signal weight."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.wallet, cohort.discovered_at, source.token_address,
+                    c.score, c.screening_risk_score,
+                    CASE
+                        WHEN c.screening_risk_score IS NOT NULL
+                            AND c.screening_risk_score <= 25 THEN 0
+                        ELSE 1
+                    END AS priority_group
+                FROM candidate_wallets c
+                JOIN wallet_discovery_cohorts cohort
+                    ON cohort.wallet = c.wallet
+                    AND cohort.source = 'dexscreener'
+                    AND cohort.cohort_status = 'CANDIDATE'
+                LEFT JOIN wallet_discovery_sources source
+                    ON source.wallet = c.wallet
+                WHERE c.score_status = 'scored' AND c.score >= 30
+                    AND c.screening_status = 'screened'
+                ORDER BY priority_group, c.score DESC,
+                    c.screening_risk_score ASC NULLS LAST,
+                    cohort.discovered_at ASC
+                LIMIT %s
+            """, (OBSERVATION_POOL_LIMIT * 10,))
+            rows = cur.fetchall()
+    observation = {}
+    for wallet, observed_from, token_address, score, risk_score, _ in rows:
+        if wallet not in observation and len(observation) >= OBSERVATION_POOL_LIMIT:
+            continue
+        record = observation.setdefault(wallet, {
+            "cluster_id": f"observation:{wallet}",
+            "classification": "OBSERVATION",
+            "confidence": "UNPROVEN",
+            "signal_weight": 0.0,
+            "eligible_from": observed_from,
+            "excluded_tokens": set(),
+            "performance_score": score,
+            "screening_risk_score": risk_score,
+        })
+        if token_address:
+            record["excluded_tokens"].add(token_address)
+    return observation
+
+
 def load_helius_monitored_wallets():
-    return sorted(set(load_tracked_wallet_map()) | set(load_probation_wallet_map()))
+    return sorted(
+        set(load_tracked_wallet_map())
+        | set(load_probation_wallet_map())
+        | set(load_observation_wallet_map())
+    )
 
 
 def helius_webhook_headers():
@@ -5426,6 +5634,251 @@ def persist_probation_wallet_activity(events):
     return inserted
 
 
+def persist_observation_wallet_activity(events):
+    """Store candidate activity in a zero-weight ledger and rank new-token entries."""
+    inserted = 0
+    affected_tokens = set()
+    with db() as conn:
+        with conn.cursor() as cur:
+            for event in events:
+                cur.execute("""
+                    INSERT INTO wallet_observation_activity (
+                        signature, wallet, token_address, token_symbol, side,
+                        token_amount, occurred_at, raw_summary
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (signature, wallet, token_address, side) DO NOTHING
+                """, (
+                    event["signature"], event["wallet"], event["token_address"],
+                    event.get("token_symbol"), event["side"],
+                    event.get("token_amount"), event["occurred_at"],
+                    json.dumps({
+                        **(event.get("raw_summary") or {}),
+                        "observation_only": True,
+                        "consensus_weight": 0,
+                    }),
+                ))
+                if cur.rowcount:
+                    inserted += 1
+                    affected_tokens.add(event["token_address"])
+            for token_address in affected_tokens:
+                cur.execute("""
+                    WITH first_buys AS (
+                        SELECT signature, wallet, token_address,
+                            MIN(occurred_at) AS first_buy_at
+                        FROM wallet_observation_activity
+                        WHERE token_address = %s AND side = 'BUY'
+                        GROUP BY signature, wallet, token_address
+                    ), ranked AS (
+                        SELECT signature, wallet, token_address, first_buy_at,
+                            DENSE_RANK() OVER (ORDER BY first_buy_at, wallet) AS entry_rank,
+                            EXTRACT(EPOCH FROM (
+                                first_buy_at - MIN(first_buy_at) OVER ()
+                            )) AS seconds_from_first
+                        FROM first_buys
+                    )
+                    UPDATE wallet_observation_activity activity SET
+                        entry_rank = ranked.entry_rank,
+                        seconds_from_first_observed = ranked.seconds_from_first
+                    FROM ranked
+                    WHERE activity.signature = ranked.signature
+                        AND activity.wallet = ranked.wallet
+                        AND activity.token_address = ranked.token_address
+                        AND activity.side = 'BUY'
+                """, (token_address,))
+        conn.commit()
+    return inserted
+
+
+def load_observation_evidence(limit=100):
+    """Summarise independent forward entries without treating them as votes."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT pool.wallet, pool.score, pool.screening_risk_score,
+                    COUNT(DISTINCT activity.signature) FILTER (
+                        WHERE activity.side = 'BUY'
+                    ) AS forward_buys,
+                    COUNT(DISTINCT activity.token_address) FILTER (
+                        WHERE activity.side = 'BUY'
+                    ) AS forward_tokens,
+                    COUNT(DISTINCT activity.token_address) FILTER (
+                        WHERE activity.side = 'BUY'
+                            AND activity.entry_rank <= %s
+                    ) AS early_forward_tokens,
+                    MIN(activity.occurred_at) FILTER (
+                        WHERE activity.side = 'BUY'
+                    ) AS first_forward_entry,
+                    MAX(activity.occurred_at) FILTER (
+                        WHERE activity.side = 'BUY'
+                    ) AS last_forward_entry,
+                    MAX(activity.occurred_at) AS last_activity_at
+                FROM (
+                    SELECT c.wallet, c.score, c.screening_risk_score
+                    FROM candidate_wallets c
+                    JOIN wallet_discovery_cohorts cohort
+                        ON cohort.wallet = c.wallet
+                        AND cohort.source = 'dexscreener'
+                        AND cohort.cohort_status = 'CANDIDATE'
+                    WHERE c.score_status = 'scored' AND c.score >= 30
+                        AND c.screening_status = 'screened'
+                    ORDER BY CASE WHEN c.screening_risk_score <= 25 THEN 0 ELSE 1 END,
+                        c.score DESC
+                    LIMIT %s
+                ) pool
+                LEFT JOIN wallet_observation_activity activity
+                    ON activity.wallet = pool.wallet
+                GROUP BY pool.wallet, pool.score, pool.screening_risk_score
+                ORDER BY early_forward_tokens DESC, forward_tokens DESC,
+                    forward_buys DESC, pool.score DESC
+            """, (OBSERVATION_ENTRY_RANK_MAX, OBSERVATION_POOL_LIMIT))
+            rows = cur.fetchall()
+            cur.execute("""
+                SELECT snapshot.wallet, snapshot.horizon_hours,
+                    AVG((snapshot.price_usd / baseline.price_usd - 1) * 100),
+                    COUNT(*)
+                FROM wallet_observation_snapshots snapshot
+                JOIN wallet_observation_snapshots baseline
+                    ON baseline.signature = snapshot.signature
+                    AND baseline.wallet = snapshot.wallet
+                    AND baseline.token_address = snapshot.token_address
+                    AND baseline.horizon_hours = 0
+                WHERE snapshot.horizon_hours > 0
+                    AND snapshot.price_usd IS NOT NULL
+                    AND baseline.price_usd IS NOT NULL
+                    AND baseline.price_usd > 0
+                GROUP BY snapshot.wallet, snapshot.horizon_hours
+            """)
+            outcome_rows = cur.fetchall()
+            cur.execute("""
+                SELECT snapshot.wallet,
+                    COUNT(DISTINCT snapshot.token_address)
+                FROM wallet_observation_snapshots snapshot
+                JOIN wallet_observation_snapshots baseline
+                    ON baseline.signature = snapshot.signature
+                    AND baseline.wallet = snapshot.wallet
+                    AND baseline.token_address = snapshot.token_address
+                    AND baseline.horizon_hours = 0
+                WHERE snapshot.horizon_hours IN (6, 24)
+                    AND snapshot.price_usd IS NOT NULL
+                    AND baseline.price_usd IS NOT NULL
+                    AND baseline.price_usd > 0
+                    AND snapshot.price_usd > baseline.price_usd
+                GROUP BY snapshot.wallet
+            """)
+            positive_rows = cur.fetchall()
+    outcomes = {}
+    for wallet, horizon, average_return, samples in outcome_rows:
+        outcomes.setdefault(wallet, {})[f"{horizon}h"] = {
+            "average_return_pct": round(float(average_return), 2),
+            "samples": samples,
+        }
+    positive_tokens = {wallet: count for wallet, count in positive_rows}
+    records = []
+    for row in rows[:limit]:
+        first_entry, last_entry = row[6], row[7]
+        separated = bool(
+            first_entry and last_entry
+            and (last_entry - first_entry).total_seconds() >= INDEPENDENT_REPEAT_SECONDS
+        )
+        positive_count = positive_tokens.get(row[0], 0)
+        independent_repeat = (
+            (row[5] or 0) >= OBSERVATION_REPEAT_MIN_TOKENS
+            and positive_count >= OBSERVATION_REPEAT_MIN_TOKENS
+            and separated
+        )
+        records.append({
+            "wallet": row[0], "performance_score": row[1],
+            "screening_risk_score": row[2], "forward_buys": row[3] or 0,
+            "forward_tokens": row[4] or 0,
+            "early_forward_tokens": row[5] or 0,
+            "positive_outcome_tokens": positive_count,
+            "first_forward_entry_at": first_entry,
+            "last_forward_entry_at": last_entry,
+            "last_activity_at": row[8],
+            "forward_outcomes": outcomes.get(row[0], {}),
+            "independent_repeat_evidence": independent_repeat,
+            "cross_token_evidence": independent_repeat,
+            "consensus_weight": 0,
+            "source_tokens_excluded": True,
+        })
+    return records
+
+
+def refresh_observation_outcomes(limit=10):
+    """Capture bounded 0h/1h/6h/24h/7d market checkpoints for forward buys."""
+    now = datetime.now(timezone.utc)
+    due = []
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT activity.signature, activity.wallet,
+                    activity.token_address, activity.occurred_at
+                FROM wallet_observation_activity activity
+                WHERE activity.side = 'BUY'
+                ORDER BY activity.occurred_at ASC
+                LIMIT 500
+            """)
+            events = cur.fetchall()
+            for signature, wallet, token_address, occurred_at in events:
+                if occurred_at.tzinfo is None:
+                    occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+                age_hours = max((now - occurred_at).total_seconds() / 3600, 0)
+                for horizon in OBSERVATION_HORIZONS_HOURS:
+                    if age_hours < horizon:
+                        continue
+                    cur.execute("""
+                        SELECT 1 FROM wallet_observation_snapshots
+                        WHERE signature = %s AND wallet = %s
+                            AND token_address = %s AND horizon_hours = %s
+                    """, (signature, wallet, token_address, horizon))
+                    if cur.fetchone() is None:
+                        due.append((signature, wallet, token_address, horizon))
+                        break
+                if len(due) >= min(max(int(limit), 1), 25):
+                    break
+    results = []
+    for signature, wallet, token_address, horizon in due:
+        try:
+            response = upstream_request(
+                "GET", DEXSCREENER_TOKEN_URL.format(address=token_address),
+                timeout=10, retries=0, provider="dexscreener",
+            )
+            payload = response.json() if response.status_code == 200 else {}
+        except (requests.RequestException, ValueError):
+            results.append({"token_address": token_address,
+                            "horizon_hours": horizon,
+                            "status": "provider_unavailable"})
+            continue
+        pair = select_solana_discovery_pair(payload, token_address)
+        if not pair:
+            results.append({"token_address": token_address,
+                            "horizon_hours": horizon,
+                            "status": "pair_unavailable"})
+            continue
+        price_usd = safe_float(pair.get("priceUsd"))
+        liquidity_usd = safe_float((pair.get("liquidity") or {}).get("usd"))
+        market_cap_usd = safe_float(pair.get("marketCap") or pair.get("fdv"))
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO wallet_observation_snapshots (
+                        signature, wallet, token_address, horizon_hours,
+                        price_usd, liquidity_usd, market_cap_usd, details
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (signature, wallet, token_address, horizon_hours)
+                    DO NOTHING
+                """, (
+                    signature, wallet, token_address, horizon,
+                    price_usd, liquidity_usd, market_cap_usd,
+                    json.dumps({"pair_address": pair.get("pairAddress"),
+                                "dex_id": pair.get("dexId")}),
+                ))
+            conn.commit()
+        results.append({"token_address": token_address,
+                        "horizon_hours": horizon, "status": "captured"})
+    return {"selected": len(due), "processed": len(results), "results": results}
+
+
 def expire_stale_paper_signals():
     """Expire elapsed Solana signals without providers, alerts, or refresh work."""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=SIGNAL_WINDOW_MINUTES)
@@ -6535,11 +6988,16 @@ def helius_webhook_endpoint():
     probation = load_probation_wallet_map()
     probation_events = parse_helius_activity(payload, probation)
     probation_inserted = persist_probation_wallet_activity(probation_events)
+    observation = load_observation_wallet_map()
+    observation_events = parse_helius_activity(payload, observation)
+    observation_inserted = persist_observation_wallet_activity(observation_events)
     signals = refresh_paper_signals() if inserted else []
     return jsonify({
         "success": True, "events_parsed": len(events), "events_inserted": inserted,
         "probation_events_parsed": len(probation_events),
         "probation_events_inserted": probation_inserted,
+        "observation_events_parsed": len(observation_events),
+        "observation_events_inserted": observation_inserted,
         "signals_refreshed": len(signals), "paper_mode": True,
         "actionable": False,
     })
@@ -6580,6 +7038,73 @@ def wallet_activity_endpoint():
         "token_amount": row[6], "estimated_usd_value": row[7],
         "occurred_at": row[8], "received_at": row[9],
     } for row in rows]})
+
+
+@app.get("/observation-pool")
+def observation_pool_endpoint():
+    initialise_database()
+    records = load_observation_evidence(limit=OBSERVATION_POOL_LIMIT)
+    return jsonify({
+        "success": True, "version": VERSION,
+        "count": len(records), "wallets": records,
+        "policy": {
+            "consensus_weight": 0,
+            "maximum_wallets": OBSERVATION_POOL_LIMIT,
+            "performance_score_minimum": 30,
+            "source_tokens_excluded": True,
+            "independent_repeat_minimum_tokens": OBSERVATION_REPEAT_MIN_TOKENS,
+            "independent_repeat_minimum_separation_hours": (
+                INDEPENDENT_REPEAT_SECONDS // 3600
+            ),
+            "early_entry_rank_maximum": OBSERVATION_ENTRY_RANK_MAX,
+            "automatic_probation_admission": False,
+        },
+        "paper_mode": True, "actionable": False,
+    })
+
+
+@app.get("/observation-activity")
+def observation_activity_endpoint():
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+    except ValueError:
+        limit = 100
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT signature, wallet, token_address, token_symbol, side,
+                    token_amount, occurred_at, received_at, entry_rank,
+                    seconds_from_first_observed
+                FROM wallet_observation_activity
+                ORDER BY occurred_at DESC LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    return jsonify({"success": True, "count": len(rows), "events": [{
+        "signature": row[0], "wallet": row[1], "token_address": row[2],
+        "token_symbol": row[3], "side": row[4], "token_amount": row[5],
+        "occurred_at": row[6], "received_at": row[7],
+        "entry_rank": row[8],
+        "seconds_from_first_observed": row[9],
+        "consensus_weight": 0,
+    } for row in rows], "paper_mode": True, "actionable": False})
+
+
+@app.post("/refresh-observation-outcomes")
+def refresh_observation_outcomes_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    body = request.get_json(silent=True) or {}
+    try:
+        limit = min(max(int(body.get("limit", 10)), 1), 25)
+    except (TypeError, ValueError):
+        limit = 10
+    result = refresh_observation_outcomes(limit=limit)
+    return jsonify({"success": True, "version": VERSION, **result,
+                    "paper_mode": True, "actionable": False})
 
 
 def build_solana_activity_diagnostics():
@@ -7110,6 +7635,7 @@ def build_dashboard_payload():
         "solana_activity": solana_activity, "snapshot_quality": snapshot_quality,
         "screened_wallets": screened_wallets,
         "candidate_pipeline": candidate_pipeline,
+        "observation_wallets": candidate_pipeline.get("observation_wallets", []),
         "initial_screening_policy": {
             "minimum_performance_score": 30,
             "maximum_risk_score": 25,
@@ -7137,6 +7663,12 @@ def build_dashboard_payload():
             ),
             "probation_wallets": len(probation_wallets),
             "screened_wallets": len(screened_wallets),
+            "observation_pool": candidate_pipeline["counts"].get(
+                "observation_pool", 0
+            ),
+            "observation_repeat_evidence": candidate_pipeline["counts"].get(
+                "observation_repeat_evidence", 0
+            ),
             "dex_candidates": candidate_pipeline["counts"]["discovered"],
             "minimum_gates_passed": candidate_pipeline["counts"][
                 "minimum_gates_passed"
@@ -7166,13 +7698,14 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.14.4 · Probation Quality</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Wide DexScreener discovery + evidence-qualified probation recommendations + multi-chain monitoring</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.15 · Forward Evidence</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Wide discovery + zero-weight observation + evidence-qualified probation recommendations</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
     <div class="card"><span class="label">Dex candidates</span><b id="dexCandidateCount">—</b><span class="muted">Wide discovery cohort</span></div>
     <div class="card"><span class="label">Passed screening</span><b id="screenedCount">—</b><span class="muted">Candidates · zero consensus weight</span></div>
+    <div class="card"><span class="label">Observation pool</span><b id="observationCount">—</b><span class="muted">Forward tracked · zero weight</span></div>
     <div class="card"><span class="label">Minimum gates passed</span><b id="minimumGatesCount">—</b><span class="muted">Baseline eligibility only</span></div>
     <div class="card"><span class="label">Recommended for probation</span><b id="recommendedCount">—</b><span class="muted">Strong, repeated evidence</span></div>
     <div class="card"><span class="label">Probation wallets</span><b id="probationCount">—</b><span class="muted">Visible · zero consensus weight</span></div>
@@ -7182,6 +7715,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <section class="section"><div class="section-head"><div><h2>Solana consensus windows</h2><div class="muted">Activity funnel across independent validated wallet clusters; probation activity cannot vote</div></div><div class="links"><a href="/solana-activity">Full diagnostics</a><a href="/dex-wallet-cohorts">Discovery cohorts</a><a href="/dex-wallet-discovery-history">Discovery runs</a><a href="/probation-wallet-activity">Probation activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Window</th><th>Events</th><th>Active wallets</th><th>Clusters</th><th>Tokens bought</th><th>2 buyers</th><th>3+ buyers</th><th>Missing symbols</th></tr></thead><tbody id="solWindowBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>DexScreener candidate processing pipeline</h2><div class="muted">Newly discovered wallets are prioritised through bounded scoring, screening and validation batches</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Pipeline JSON</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a><a href="/dex-wallet-cohorts">Discovery cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Discovered</th><th>Awaiting score</th><th>Scored</th><th>Performance ≥30</th><th>Screened</th><th>Low risk</th><th>Validated</th><th>Minimum gates</th><th>Recommended</th><th>In probation</th><th>Consensus validated</th></tr></thead><tbody id="pipelineBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Wallets passed initial performance and risk screening</h2><div class="muted">Performance ≥30 and risk ≤25; source identifies whether the wallet came from the new DexScreener cohort</div></div><div class="links"><a href="/dex-wallet-leaderboard">Candidate leaderboard</a><a href="/screenings">Screening evidence</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Source</th><th>Performance score</th><th>Risk score</th><th>30-day realised P&amp;L</th><th>Trades</th></tr></thead><tbody id="screenedWalletBody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Zero-weight observation pool</h2><div class="muted">Performance-pass wallets are tracked forward; discovery-source tokens are excluded and activity cannot vote</div></div><div class="links"><a href="/observation-pool">Observation evidence</a><a href="/observation-activity?limit=100">Forward activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Performance</th><th>Risk</th><th>Forward buys</th><th>Forward tokens</th><th>Early forward tokens</th><th>24h outcome</th><th>Repeat evidence</th><th>Last entry</th></tr></thead><tbody id="observationBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Wallets passing minimum probation gates</h2><div class="muted">Baseline performance, risk and trade-history gates only; this does not mean the wallet is recommended</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Gate details</a><a href="/dex-wallet-cohorts">All cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Performance</th><th>Risk</th><th>30-day realised P&amp;L</th><th>Trades</th><th>Validation</th><th>Strength</th><th>Classification</th><th>Repeat early entries</th><th>Early-entry score</th></tr></thead><tbody id="minimumGatesBody"><tr><td colspan="10" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Recommended for probation</h2><div class="muted">Requires strong token validation, WATCH or ASYMMETRIC classification, and repeat or cross-token early-entry evidence</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Recommendation evidence</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Classification</th><th>Validation strength</th><th>Performance</th><th>Risk</th><th>Repeat early entries</th><th>Cross-token evidence</th><th>Early-entry score</th></tr></thead><tbody id="recommendedBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana probation wallets</h2><div class="muted">Forward-only evidence is visible here but contributes zero buyer votes until manual validation</div></div><div class="links"><a href="/dex-wallet-cohorts">All cohorts</a><a href="/probation-wallet-activity">Probation activity</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Status</th><th>Admitted</th><th>Probation age</th><th>Performance</th><th>Risk</th><th>Early entries</th><th>Forward trades</th><th>Forward tokens</th><th>Last activity</th><th>Promotion review</th></tr></thead><tbody id="probationBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
@@ -7196,11 +7730,12 @@ const when=v=>v?new Date(v).toLocaleString():'—';
 const age=s=>s==null?'unknown age':s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m`:s<86400?`${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`:`${Math.floor(s/86400)}d ${Math.floor((s%86400)/3600)}h`;
 const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_BENCHMARK'?'benchmark':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(s)}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
-document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
+document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('observationCount').textContent=d.summary.observation_pool;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
 document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td><div>${num(x.holder_count)}</div><div class="address">${age(x.holder_data_age_seconds)} old</div></td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${trend(x.trends['24h'].relative_to_eth_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="13" class="empty">No EVM snapshots yet.</td></tr>';
 const windows=d.solana_activity?.windows||{};document.getElementById('solWindowBody').innerHTML=['1h','6h','24h'].map(w=>{const x=windows[w]||{};return `<tr><td><div class="token">${w}</div></td><td>${num(x.events)}</td><td>${num(x.active_wallets)}</td><td>${num(x.independent_clusters)}</td><td>${num(x.unique_tokens_bought)}</td><td>${num(x.tokens_with_2_buyers)}</td><td>${num(x.tokens_with_3_plus_buyers)}</td><td>${num(x.missing_symbols)}</td></tr>`}).join('');
 const pc=d.candidate_pipeline?.counts||{};document.getElementById('pipelineBody').innerHTML=`<tr><td>${num(pc.discovered)}</td><td>${num(pc.awaiting_score)}</td><td>${num(pc.scored)}</td><td>${num(pc.performance_pass)}</td><td>${num(pc.screened)}</td><td>${num(pc.low_risk)}</td><td>${num(pc.validated)}</td><td>${num(pc.minimum_gates_passed)}</td><td>${num(pc.recommended_for_probation)}</td><td>${num(pc.probation)}</td><td>${num(pc.consensus_validated)}</td></tr>`;
 const screened=d.screened_wallets||[];document.getElementById('screenedWalletBody').innerHTML=screened.length?screened.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">provisional pass · zero consensus weight</div></a></td><td><span class="badge ${x.source==='DEX DISCOVERY'?'accumulation':'observe'}">${esc(x.source)}</span></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${money(x.realized_pnl_30d)}</td><td>${num(x.trades_30d)}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">No wallets have passed both initial performance and risk screening yet.</td></tr>';
+const observed=d.observation_wallets||[];document.getElementById('observationBody').innerHTML=observed.length?observed.map(x=>{const o=x.forward_outcomes?.['24h'];return `<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">observation only · zero consensus weight</div></a></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${num(x.forward_buys)}</td><td>${num(x.forward_tokens)}</td><td>${num(x.early_forward_tokens)}</td><td>${o?`${trend(o.average_return_pct)}<div class="address">${num(o.samples)} samples</div>`:'<span class="neutral">collecting</span>'}</td><td>${x.independent_repeat_evidence?'<span class="badge accumulation">QUALIFYING</span>':'<span class="badge expired">COLLECTING</span>'}</td><td>${when(x.last_forward_entry_at)}</td></tr>`}).join(''):'<tr><td colspan="9" class="empty">Observation wallets are being enrolled after performance screening.</td></tr>';
 const minimum=d.candidate_pipeline?.minimum_gates_passed_wallets||[];document.getElementById('minimumGatesBody').innerHTML=minimum.length?minimum.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">baseline gates · zero consensus weight</div></a></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${money(x.realized_pnl_30d)}</td><td>${num(x.trades_30d)}</td><td>${esc(x.validation_status||'unvalidated')}</td><td>${esc(x.validation_strength||'none')}</td><td>${esc(x.classification||'REJECT')}</td><td>${num(x.repeat_early_entries)}</td><td>${num(x.average_early_entry_score)}</td></tr>`).join(''):'<tr><td colspan="10" class="empty">No newly discovered wallets currently pass all minimum probation gates.</td></tr>';
 const recommended=d.candidate_pipeline?.recommended_probation_wallets||[];document.getElementById('recommendedBody').innerHTML=recommended.length?recommended.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">manual admission · zero consensus weight</div></a></td><td><span class="badge accumulation">${esc(x.classification)}</span></td><td>${esc(x.validation_strength)}</td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${num(x.repeat_early_entries)}</td><td>${x.cross_token_evidence?'yes':x.independent_repeat_evidence?'repeat evidence':'no'}</td><td>${num(x.average_early_entry_score)}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">No wallet currently satisfies strong validation plus WATCH/ASYMMETRIC and repeat or cross-token evidence.</td></tr>';
 const probation=d.probation_wallets||[];document.getElementById('probationBody').innerHTML=probation.length?probation.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">zero consensus weight</div></a></td><td><span class="badge provider">PROBATION</span></td><td>${when(x.admitted_at)}</td><td>${age(x.probation_age_seconds)}</td><td>${num(x.performance_score)}</td><td>${x.screening_risk_score==null?'—':num(x.screening_risk_score)}</td><td><div>${num(x.repeat_early_entries)}</div><div class="address">avg ${num(x.average_early_entry_score)}</div></td><td><div>${num(x.forward_trades)}</div><div class="address">minimum ${num(d.probation_policy.minimum_forward_trades)}</div></td><td><div>${num(x.forward_tokens)}</div><div class="address">minimum ${num(d.probation_policy.minimum_forward_tokens)}</div></td><td>${when(x.last_forward_activity_at)}</td><td>${x.promotion_review_ready?'<span class="badge accumulation">READY FOR REVIEW</span>':'<span class="badge expired">COLLECTING</span>'}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No wallets are currently in probation. Candidates remain in the discovery funnel until all admission gates pass.</td></tr>';
@@ -7341,14 +7876,19 @@ def premium_funnel():
         if stopped_reason:
             break
 
+    sync_result = None
+    if HELIUS_AUTO_SYNC and len(wallets) < limit and not stopped_reason:
+        sync_result = synchronise_helius_webhook(dry_run=False, force=False)
     return jsonify({"success": True, "version": VERSION, "selected": len(wallets),
                     "processed": len(results), "stopped_reason": stopped_reason,
                     "deadline_seconds": PIPELINE_MAX_SECONDS, "results": results,
+                    "helius_sync": sync_result,
                     "note": "Repeat this idempotent endpoint to continue incomplete work."})
 
 
 def run_evm_refresh_once():
     """Railway cron entrypoint with controlled partial-run semantics."""
+    observation_outcomes = None
     try:
         result = refresh_evm_watchlist(limit=10, offset=0)
     except Exception as exc:
@@ -7363,6 +7903,13 @@ def run_evm_refresh_once():
         and result.get("failures", 0) == 0
     )
     cron_success = bool(result["success"] or controlled_partial)
+    try:
+        observation_outcomes = refresh_observation_outcomes(limit=10)
+    except Exception as exc:
+        observation_outcomes = {
+            "selected": 0, "processed": 0,
+            "error": type(exc).__name__,
+        }
     print(json.dumps({
         "success": cron_success, "refresh_complete": result["success"],
         "version": VERSION,
@@ -7372,6 +7919,7 @@ def run_evm_refresh_once():
         "failures": result.get("failures", 0), "status": result.get("status"),
         "chain_counts": result.get("chain_counts", {}),
         "stopped_reason": result["stopped_reason"], "mode": "evm_cron_once",
+        "observation_outcomes": observation_outcomes,
     }))
     return 0 if cron_success else 1
 
