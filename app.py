@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.15.2-doggie-dashboard-order"
+VERSION = "4.15.3-doggie-11-token-cron"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -7893,7 +7893,10 @@ def run_evm_refresh_once():
     """Railway cron entrypoint with controlled partial-run semantics."""
     observation_outcomes = None
     try:
-        result = refresh_evm_watchlist(limit=10, offset=0)
+        # The scheduled run covers the full active watchlist. The refresh
+        # function still applies its deadline guard and controlled partial-run
+        # semantics if the list grows beyond what providers can serve safely.
+        result = refresh_evm_watchlist(limit=50, offset=0)
     except Exception as exc:
         print(json.dumps({
             "success": False, "version": VERSION,
