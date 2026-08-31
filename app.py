@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.16.1-evm-early-buyer-discovery"
+VERSION = "4.16.2-evm-early-buyer-discovery"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -4675,6 +4675,7 @@ def scan_robinhood_early_buyers(token, deadline):
             ordered_hashes.append(tx_hash)
 
     observations = []
+    seen_wallets = set()
     receipts_checked = 0
     for tx_hash in ordered_hashes:
         if len(observations) >= EVM_EARLY_BUYER_LIMIT:
@@ -4693,6 +4694,8 @@ def scan_robinhood_early_buyers(token, deadline):
         wallet = str(receipt.get("from") or "").lower()
         if len(wallet) != 42 or not wallet.startswith("0x"):
             continue
+        if wallet in seen_wallets:
+            continue
         raw_delta = receipt_token_delta(receipt, address, wallet)
         if raw_delta <= 0:
             continue
@@ -4702,6 +4705,7 @@ def scan_robinhood_early_buyers(token, deadline):
         entry_rank = len(observations) + 1
         seconds_after_pair = round(max(block_number - pair_block, 0) * 0.1, 1)
         exclusion_reason = "same_block_sniper" if block_number <= pair_block else None
+        seen_wallets.add(wallet)
         observations.append({
             "wallet": wallet, "transaction_hash": tx_hash,
             "block_number": block_number, "entry_rank": entry_rank,
@@ -4714,6 +4718,13 @@ def scan_robinhood_early_buyers(token, deadline):
 
     with db() as conn:
         with conn.cursor() as cur:
+            # This is derived, reproducible evidence. Replace only this exact
+            # token after a successful provider scan so entry ranks always
+            # represent unique purchasers rather than repeat transactions.
+            cur.execute("""
+                DELETE FROM evm_early_buyer_observations
+                WHERE chain = %s AND LOWER(token_address) = LOWER(%s)
+            """, (chain, address))
             for item in observations:
                 cur.execute("""
                     INSERT INTO evm_early_buyer_observations (
@@ -7030,6 +7041,12 @@ def evm_early_buyer_discovery_endpoint():
         return jsonify({"success": False, "error": "limit must be an integer"}), 400
     with db() as conn:
         with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE evm_early_buyer_runs SET completed_at = NOW(),
+                    status = 'interrupted', stop_reason = 'previous_run_interrupted'
+                WHERE status = 'running'
+                    AND started_at < NOW() - INTERVAL '2 minutes'
+            """)
             cur.execute("""
                 SELECT watchlist.chain, watchlist.token_address,
                     watchlist.token_symbol, watchlist.canonical_pair_address
