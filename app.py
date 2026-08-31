@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.16.0-evm-early-buyer-discovery"
+VERSION = "4.16.1-evm-early-buyer-discovery"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -7108,7 +7108,7 @@ def evm_early_buyer_discovery_endpoint():
                 WHERE id = %s
             """, (
                 len(results), wallets_observed, status, stop_reason,
-                json.dumps({"results": results, "errors": errors}), run_id,
+                json.dumps({"results": results, "errors": errors}, default=str), run_id,
             ))
         conn.commit()
     return jsonify({
