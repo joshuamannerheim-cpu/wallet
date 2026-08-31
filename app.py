@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.15.3-doggie-11-token-cron"
+VERSION = "4.16.0-evm-early-buyer-discovery"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -76,6 +76,31 @@ OBSERVATION_REPEAT_MIN_TOKENS = 2
 OBSERVATION_ENTRY_RANK_MAX = 10
 OBSERVATION_HORIZONS_HOURS = (0, 1, 6, 24, 168)
 ROBINHOOD_BLOCKSCOUT_URL = "https://robinhoodchain.blockscout.com/api/v2"
+ROBINHOOD_RPC_URL = os.getenv(
+    "ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"
+).rstrip("/")
+EVM_EARLY_BUYER_MAX_TOKENS = min(
+    max(int(os.getenv("EVM_EARLY_BUYER_MAX_TOKENS", "2")), 1), 4
+)
+EVM_EARLY_BUYER_LIMIT = min(
+    max(int(os.getenv("EVM_EARLY_BUYER_LIMIT", "250")), 25), 250
+)
+EVM_EARLY_BUYER_LOG_BLOCKS = min(
+    max(int(os.getenv("EVM_EARLY_BUYER_LOG_BLOCKS", "40000")), 2000), 100000
+)
+EVM_EARLY_BUYER_LOG_CHUNK = min(
+    max(int(os.getenv("EVM_EARLY_BUYER_LOG_CHUNK", "2000")), 100), 5000
+)
+EVM_EARLY_BUYER_MAX_RECEIPTS = min(
+    max(int(os.getenv("EVM_EARLY_BUYER_MAX_RECEIPTS", "400")), 50), 750
+)
+EVM_EARLY_BUYER_MAX_SECONDS = min(
+    max(int(os.getenv("EVM_EARLY_BUYER_MAX_SECONDS", "70")), 20), 85
+)
+ERC20_TRANSFER_TOPIC = (
+    "0xddf252ad1be2c89b69c2b068fc378daa"
+    "952ba7f163c4a11628f55a4df523b3ef"
+)
 EVM_CHAIN_CONFIG = {
     "robinhood": {
         "chain_id": ROBINHOOD_CHAIN_ID,
@@ -687,6 +712,58 @@ def initialise_database():
                     details TEXT NOT NULL DEFAULT '{}'
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS evm_early_buyer_runs (
+                    id BIGSERIAL PRIMARY KEY,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ,
+                    tokens_selected INTEGER NOT NULL DEFAULT 0,
+                    tokens_completed INTEGER NOT NULL DEFAULT 0,
+                    wallets_observed INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    stop_reason TEXT,
+                    details TEXT NOT NULL DEFAULT '{}'
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS evm_early_buyer_token_state (
+                    chain TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT NOT NULL,
+                    pair_address TEXT,
+                    pair_created_at TIMESTAMPTZ,
+                    pair_created_block BIGINT,
+                    last_scanned_block BIGINT,
+                    observations_retained INTEGER NOT NULL DEFAULT 0,
+                    scan_status TEXT NOT NULL DEFAULT 'pending',
+                    provider_status TEXT NOT NULL DEFAULT 'not_checked',
+                    last_error TEXT,
+                    details TEXT NOT NULL DEFAULT '{}',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (chain, token_address)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS evm_early_buyer_observations (
+                    chain TEXT NOT NULL,
+                    wallet TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT NOT NULL,
+                    pair_address TEXT,
+                    transaction_hash TEXT NOT NULL,
+                    block_number BIGINT NOT NULL,
+                    entry_rank INTEGER NOT NULL,
+                    seconds_after_pair DOUBLE PRECISION,
+                    token_amount DOUBLE PRECISION,
+                    occurred_at TIMESTAMPTZ,
+                    filter_status TEXT NOT NULL DEFAULT 'eligible',
+                    exclusion_reason TEXT,
+                    evidence_quality TEXT NOT NULL DEFAULT 'pair_verified',
+                    details TEXT NOT NULL DEFAULT '{}',
+                    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (chain, wallet, token_address)
+                )
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_token_time_idx ON wallet_activity (token_address, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_wallet_time_idx ON wallet_activity (wallet, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS dex_wallet_run_time_idx ON dex_wallet_discovery_runs (started_at DESC)")
@@ -702,6 +779,9 @@ def initialise_database():
             cur.execute("CREATE INDEX IF NOT EXISTS evm_snapshot_token_time_idx ON evm_token_snapshots (chain, token_address, captured_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS evm_signal_status_idx ON evm_token_signals (status, updated_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS evm_history_time_idx ON evm_signal_history (recorded_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS evm_early_buyer_run_time_idx ON evm_early_buyer_runs (started_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS evm_early_buyer_wallet_idx ON evm_early_buyer_observations (wallet, entry_rank)")
+            cur.execute("CREATE INDEX IF NOT EXISTS evm_early_buyer_token_idx ON evm_early_buyer_observations (token_address, entry_rank)")
 
             # These are idempotent and preserve databases created by earlier V4 builds.
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS total_pnl_30d DOUBLE PRECISION")
@@ -1573,6 +1653,18 @@ def diagnostics():
                         "last_trusted_snapshot_preserved": True,
                         "price_ratio_threshold": EVM_ANOMALY_PRICE_RATIO,
                         "liquidity_ratio_threshold": EVM_ANOMALY_LIQUIDITY_RATIO,
+                    },
+                    "evm_early_buyer_discovery": {
+                        "enabled": True,
+                        "provider_configured": bool(ROBINHOOD_RPC_URL),
+                        "maximum_tokens_per_run": EVM_EARLY_BUYER_MAX_TOKENS,
+                        "wallet_limit_per_token": EVM_EARLY_BUYER_LIMIT,
+                        "receipt_limit_per_token": EVM_EARLY_BUYER_MAX_RECEIPTS,
+                        "log_block_limit": EVM_EARLY_BUYER_LOG_BLOCKS,
+                        "pair_event_verification_required": True,
+                        "same_block_snipers_excluded": True,
+                        "automatic_admission": False,
+                        "consensus_weight": 0,
                     },
                     "counters": counters})
 
@@ -4425,6 +4517,366 @@ def percentage_change(current, previous):
     return ((current - previous) / abs(previous)) * 100.0
 
 
+def robinhood_rpc(method, params):
+    """Call the official read-only RPC once; provider failures are never retried aggressively."""
+    response = upstream_request(
+        "POST", ROBINHOOD_RPC_URL,
+        headers={"content-type": "application/json"},
+        json_body={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=0, provider="robinhood_rpc",
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"robinhood_rpc_http_{response.status_code}")
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("error"):
+        error = payload.get("error") if isinstance(payload, dict) else None
+        code = error.get("code") if isinstance(error, dict) else "invalid_response"
+        raise RuntimeError(f"robinhood_rpc_error_{code}")
+    return payload.get("result")
+
+
+def rpc_hex_int(value):
+    if not isinstance(value, str) or not value.startswith("0x"):
+        return None
+    try:
+        return int(value, 16)
+    except ValueError:
+        return None
+
+
+def topic_address(value):
+    if not isinstance(value, str) or len(value) < 42:
+        return None
+    return "0x" + value[-40:].lower()
+
+
+def robinhood_block_at_or_after(target_timestamp):
+    """Binary-search the public archive RPC for the first block at a UTC timestamp."""
+    latest = rpc_hex_int(robinhood_rpc("eth_blockNumber", []))
+    if latest is None:
+        raise RuntimeError("robinhood_rpc_latest_block_missing")
+    low, high = 0, latest
+    while low < high:
+        middle = (low + high) // 2
+        block = robinhood_rpc("eth_getBlockByNumber", [hex(middle), False])
+        block_time = rpc_hex_int(block.get("timestamp")) if isinstance(block, dict) else None
+        if block_time is None:
+            raise RuntimeError("robinhood_rpc_block_timestamp_missing")
+        if block_time < int(target_timestamp):
+            low = middle + 1
+        else:
+            high = middle
+    return low, latest
+
+
+def robinhood_token_pair(token_address, canonical_pair):
+    response = upstream_request(
+        "GET", DEXSCREENER_TOKEN_URL.format(address=token_address),
+        timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=0, provider="dexscreener",
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"dexscreener_http_{response.status_code}")
+    payload = response.json()
+    pairs = payload.get("pairs") if isinstance(payload, dict) else []
+    pairs = pairs if isinstance(pairs, list) else []
+    eligible = [
+        pair for pair in pairs if isinstance(pair, dict)
+        and str(pair.get("chainId") or "").lower() in EVM_CHAIN_CONFIG["robinhood"]["dex_chain_ids"]
+        and str((pair.get("baseToken") or {}).get("address") or "").lower()
+        == token_address.lower()
+    ]
+    if canonical_pair:
+        eligible = [
+            pair for pair in eligible
+            if str(pair.get("pairAddress") or "").lower() == canonical_pair.lower()
+        ]
+    if not eligible:
+        raise RuntimeError("canonical_pair_metadata_unavailable")
+    pair = max(
+        eligible,
+        key=lambda item: safe_float((item.get("liquidity") or {}).get("usd")) or 0,
+    )
+    created_ms = safe_int(pair.get("pairCreatedAt"))
+    if not created_ms:
+        raise RuntimeError("pair_creation_time_unavailable")
+    return pair, datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc)
+
+
+def receipt_uses_pair(receipt, pair_address):
+    pair = str(pair_address or "").lower()
+    if not pair:
+        return False
+    for log in receipt.get("logs") or []:
+        address = str(log.get("address") or "").lower()
+        topics = [str(topic).lower() for topic in (log.get("topics") or [])]
+        if len(pair) == 42 and address == pair:
+            return True
+        if len(pair) == 66 and pair in topics[1:]:
+            return True
+    return False
+
+
+def receipt_token_delta(receipt, token_address, wallet):
+    delta = 0
+    token = token_address.lower()
+    wallet = wallet.lower()
+    for log in receipt.get("logs") or []:
+        topics = log.get("topics") or []
+        if str(log.get("address") or "").lower() != token or len(topics) < 3:
+            continue
+        if str(topics[0]).lower() != ERC20_TRANSFER_TOPIC:
+            continue
+        amount = rpc_hex_int(log.get("data")) or 0
+        if topic_address(topics[2]) == wallet:
+            delta += amount
+        if topic_address(topics[1]) == wallet:
+            delta -= amount
+    return delta
+
+
+def scan_robinhood_early_buyers(token, deadline):
+    """Reconstruct bounded, pair-verified early buys for one Robinhood token."""
+    chain, address, symbol, canonical_pair = token
+    pair, pair_created_at = robinhood_token_pair(address, canonical_pair)
+    pair_address = str(pair.get("pairAddress") or canonical_pair or "")
+    pair_block, latest_block = robinhood_block_at_or_after(
+        pair_created_at.timestamp() - 5
+    )
+    decimals_raw = robinhood_rpc("eth_call", [{"to": address, "data": "0x313ce567"}, "latest"])
+    decimals = rpc_hex_int(decimals_raw)
+    decimals = decimals if decimals is not None and 0 <= decimals <= 36 else 18
+    end_block = min(pair_block + EVM_EARLY_BUYER_LOG_BLOCKS, latest_block)
+    transfer_logs = []
+    stop_reason = None
+    cursor = pair_block
+    while cursor <= end_block and time.monotonic() < deadline:
+        chunk_end = min(cursor + EVM_EARLY_BUYER_LOG_CHUNK - 1, end_block)
+        logs = robinhood_rpc("eth_getLogs", [{
+            "address": address, "fromBlock": hex(cursor), "toBlock": hex(chunk_end),
+            "topics": [ERC20_TRANSFER_TOPIC],
+        }])
+        if not isinstance(logs, list):
+            raise RuntimeError("robinhood_rpc_logs_invalid")
+        transfer_logs.extend(log for log in logs if isinstance(log, dict))
+        cursor = chunk_end + 1
+    if cursor <= end_block:
+        stop_reason = "deadline_guard"
+
+    ordered_hashes = []
+    seen_hashes = set()
+    for log in sorted(transfer_logs, key=lambda item: (
+        rpc_hex_int(item.get("blockNumber")) or 0,
+        rpc_hex_int(item.get("transactionIndex")) or 0,
+        rpc_hex_int(item.get("logIndex")) or 0,
+    )):
+        tx_hash = str(log.get("transactionHash") or "")
+        if tx_hash and tx_hash not in seen_hashes:
+            seen_hashes.add(tx_hash)
+            ordered_hashes.append(tx_hash)
+
+    observations = []
+    receipts_checked = 0
+    for tx_hash in ordered_hashes:
+        if len(observations) >= EVM_EARLY_BUYER_LIMIT:
+            stop_reason = stop_reason or "wallet_limit"
+            break
+        if receipts_checked >= EVM_EARLY_BUYER_MAX_RECEIPTS:
+            stop_reason = stop_reason or "receipt_limit"
+            break
+        if time.monotonic() >= deadline:
+            stop_reason = "deadline_guard"
+            break
+        receipt = robinhood_rpc("eth_getTransactionReceipt", [tx_hash])
+        receipts_checked += 1
+        if not isinstance(receipt, dict) or not receipt_uses_pair(receipt, pair_address):
+            continue
+        wallet = str(receipt.get("from") or "").lower()
+        if len(wallet) != 42 or not wallet.startswith("0x"):
+            continue
+        raw_delta = receipt_token_delta(receipt, address, wallet)
+        if raw_delta <= 0:
+            continue
+        block_number = rpc_hex_int(receipt.get("blockNumber"))
+        if block_number is None:
+            continue
+        entry_rank = len(observations) + 1
+        seconds_after_pair = round(max(block_number - pair_block, 0) * 0.1, 1)
+        exclusion_reason = "same_block_sniper" if block_number <= pair_block else None
+        observations.append({
+            "wallet": wallet, "transaction_hash": tx_hash,
+            "block_number": block_number, "entry_rank": entry_rank,
+            "seconds_after_pair": seconds_after_pair,
+            "token_amount": raw_delta / (10 ** decimals),
+            "occurred_at": pair_created_at + timedelta(seconds=seconds_after_pair),
+            "filter_status": "excluded" if exclusion_reason else "eligible",
+            "exclusion_reason": exclusion_reason,
+        })
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            for item in observations:
+                cur.execute("""
+                    INSERT INTO evm_early_buyer_observations (
+                        chain, wallet, token_address, token_symbol, pair_address,
+                        transaction_hash, block_number, entry_rank,
+                        seconds_after_pair, token_amount, occurred_at,
+                        filter_status, exclusion_reason, evidence_quality, details
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, 'pair_verified_timing_estimated', %s)
+                    ON CONFLICT (chain, wallet, token_address) DO UPDATE SET
+                        transaction_hash = CASE WHEN EXCLUDED.entry_rank < evm_early_buyer_observations.entry_rank THEN EXCLUDED.transaction_hash ELSE evm_early_buyer_observations.transaction_hash END,
+                        block_number = LEAST(evm_early_buyer_observations.block_number, EXCLUDED.block_number),
+                        entry_rank = LEAST(evm_early_buyer_observations.entry_rank, EXCLUDED.entry_rank),
+                        seconds_after_pair = LEAST(evm_early_buyer_observations.seconds_after_pair, EXCLUDED.seconds_after_pair),
+                        token_amount = CASE WHEN EXCLUDED.entry_rank < evm_early_buyer_observations.entry_rank THEN EXCLUDED.token_amount ELSE evm_early_buyer_observations.token_amount END,
+                        occurred_at = LEAST(evm_early_buyer_observations.occurred_at, EXCLUDED.occurred_at),
+                        filter_status = CASE WHEN evm_early_buyer_observations.filter_status = 'eligible' OR EXCLUDED.filter_status = 'eligible' THEN 'eligible' ELSE 'excluded' END,
+                        exclusion_reason = CASE WHEN evm_early_buyer_observations.filter_status = 'eligible' OR EXCLUDED.filter_status = 'eligible' THEN NULL ELSE EXCLUDED.exclusion_reason END,
+                        observed_at = NOW()
+                """, (
+                    chain, item["wallet"], address, symbol, pair_address,
+                    item["transaction_hash"], item["block_number"], item["entry_rank"],
+                    item["seconds_after_pair"], item["token_amount"], item["occurred_at"],
+                    item["filter_status"], item["exclusion_reason"],
+                    json.dumps({"consensus_weight": 0, "timing_is_estimated": True}),
+                ))
+            cur.execute("""
+                INSERT INTO evm_early_buyer_token_state (
+                    chain, token_address, token_symbol, pair_address,
+                    pair_created_at, pair_created_block, last_scanned_block,
+                    observations_retained, scan_status, provider_status,
+                    last_error, details, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    'healthy', NULL, %s, NOW())
+                ON CONFLICT (chain, token_address) DO UPDATE SET
+                    token_symbol = EXCLUDED.token_symbol,
+                    pair_address = EXCLUDED.pair_address,
+                    pair_created_at = EXCLUDED.pair_created_at,
+                    pair_created_block = EXCLUDED.pair_created_block,
+                    last_scanned_block = GREATEST(evm_early_buyer_token_state.last_scanned_block, EXCLUDED.last_scanned_block),
+                    observations_retained = EXCLUDED.observations_retained,
+                    scan_status = EXCLUDED.scan_status,
+                    provider_status = 'healthy', last_error = NULL,
+                    details = EXCLUDED.details, updated_at = NOW()
+            """, (
+                chain, address, symbol, pair_address, pair_created_at,
+                pair_block, max(cursor - 1, pair_block), len(observations),
+                "complete" if stop_reason in {None, "wallet_limit"} else "bounded_stop",
+                json.dumps({"receipts_checked": receipts_checked,
+                            "transfer_logs": len(transfer_logs),
+                            "stop_reason": stop_reason}),
+            ))
+        conn.commit()
+    return {
+        "token_symbol": symbol, "token_address": address,
+        "pair_address": pair_address, "pair_created_at": pair_created_at,
+        "pair_created_block": pair_block, "last_scanned_block": max(cursor - 1, pair_block),
+        "transfer_logs": len(transfer_logs), "receipts_checked": receipts_checked,
+        "observations": len(observations),
+        "eligible": sum(1 for item in observations if item["filter_status"] == "eligible"),
+        "excluded": sum(1 for item in observations if item["filter_status"] == "excluded"),
+        "stop_reason": stop_reason,
+    }
+
+
+def load_evm_early_buyer_evidence(limit=100):
+    """Return ranked, zero-weight EVM early-buyer evidence and token coverage."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet,
+                    COUNT(DISTINCT token_address) AS early_tokens,
+                    COUNT(DISTINCT token_address) FILTER (WHERE entry_rank <= 25) AS top_25_tokens,
+                    ROUND(AVG(entry_rank)::numeric, 1) AS average_entry_rank,
+                    MIN(entry_rank) AS best_entry_rank,
+                    STRING_AGG(DISTINCT token_symbol, ', ' ORDER BY token_symbol) AS token_symbols,
+                    MIN(occurred_at) AS first_observed_at,
+                    MAX(occurred_at) AS last_observed_at
+                FROM evm_early_buyer_observations
+                WHERE filter_status = 'eligible'
+                GROUP BY wallet
+                ORDER BY early_tokens DESC, top_25_tokens DESC,
+                    average_entry_rank ASC, first_observed_at ASC
+                LIMIT %s
+            """, (limit,))
+            wallet_rows = cur.fetchall()
+            cur.execute("""
+                SELECT state.token_address, state.token_symbol, state.pair_address,
+                    state.pair_created_at, state.scan_status,
+                    state.provider_status, state.observations_retained,
+                    COUNT(observation.wallet) FILTER (
+                        WHERE observation.filter_status = 'eligible'
+                    ) AS eligible_wallets,
+                    COUNT(observation.wallet) FILTER (
+                        WHERE observation.filter_status = 'excluded'
+                    ) AS excluded_wallets,
+                    state.updated_at, state.last_error
+                FROM evm_early_buyer_token_state state
+                LEFT JOIN evm_early_buyer_observations observation
+                    ON observation.chain = state.chain
+                    AND LOWER(observation.token_address) = LOWER(state.token_address)
+                GROUP BY state.token_address, state.token_symbol, state.pair_address,
+                    state.pair_created_at, state.scan_status, state.provider_status,
+                    state.observations_retained, state.updated_at, state.last_error
+                ORDER BY state.updated_at DESC
+            """)
+            token_rows = cur.fetchall()
+            cur.execute("""
+                SELECT COUNT(DISTINCT wallet),
+                    COUNT(DISTINCT wallet) FILTER (WHERE filter_status = 'eligible'),
+                    COUNT(DISTINCT wallet) FILTER (WHERE filter_status = 'excluded'),
+                    COUNT(DISTINCT token_address),
+                    COUNT(DISTINCT wallet) FILTER (
+                        WHERE filter_status = 'eligible' AND wallet IN (
+                            SELECT wallet FROM evm_early_buyer_observations
+                            WHERE filter_status = 'eligible'
+                            GROUP BY wallet HAVING COUNT(DISTINCT token_address) >= 2
+                        )
+                    )
+                FROM evm_early_buyer_observations
+            """)
+            counts = cur.fetchone()
+            cur.execute("""
+                SELECT id, started_at, completed_at, tokens_selected,
+                    tokens_completed, wallets_observed, status, stop_reason, details
+                FROM evm_early_buyer_runs ORDER BY id DESC LIMIT 1
+            """)
+            run = cur.fetchone()
+    wallets = [{
+        "wallet": row[0], "early_tokens": row[1], "top_25_tokens": row[2],
+        "average_entry_rank": float(row[3]) if row[3] is not None else None,
+        "best_entry_rank": row[4], "token_symbols": row[5],
+        "first_observed_at": row[6], "last_observed_at": row[7],
+        "filter_result": "CROSS-TOKEN REVIEW" if row[1] >= 2 else "COLLECTING",
+        "screening_status": "AWAITING DEEP FILTER",
+        "consensus_weight": 0,
+    } for row in wallet_rows]
+    tokens = [{
+        "token_address": row[0], "token_symbol": row[1],
+        "pair_address": row[2], "pair_created_at": row[3],
+        "scan_status": row[4], "provider_status": row[5],
+        "observations_retained": row[6], "eligible_wallets": row[7],
+        "excluded_wallets": row[8], "updated_at": row[9], "last_error": row[10],
+    } for row in token_rows]
+    latest_run = None if not run else {
+        "id": run[0], "started_at": run[1], "completed_at": run[2],
+        "tokens_selected": run[3], "tokens_completed": run[4],
+        "wallets_observed": run[5], "status": run[6],
+        "stop_reason": run[7], "details": json.loads(run[8] or "{}"),
+    }
+    return {
+        "counts": {"observed": counts[0] or 0, "eligible": counts[1] or 0,
+                   "excluded": counts[2] or 0, "tokens_scanned": counts[3] or 0,
+                   "cross_token_wallets": counts[4] or 0},
+        "wallets": wallets, "tokens": tokens, "latest_run": latest_run,
+        "policy": {"consensus_weight": 0, "automatic_admission": False,
+                   "same_block_snipers_excluded": True,
+                   "pair_event_verification_required": True,
+                   "minimum_cross_token_evidence": 2,
+                   "deep_filter_required": True},
+    }
+
+
 def _pair_activity(pair):
     transactions = pair.get("txns") or {}
     h1 = transactions.get("h1") or {}
@@ -6561,6 +7013,141 @@ def refresh_evm_watchlist_endpoint():
     }), 200 if result["success"] else 207
 
 
+@app.post("/evm-early-buyer-discovery")
+def evm_early_buyer_discovery_endpoint():
+    """Admin-only bounded Robinhood early-buyer reconstruction."""
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    try:
+        limit = min(
+            max(int(request.args.get("limit", EVM_EARLY_BUYER_MAX_TOKENS)), 1),
+            EVM_EARLY_BUYER_MAX_TOKENS,
+        )
+    except ValueError:
+        return jsonify({"success": False, "error": "limit must be an integer"}), 400
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT watchlist.chain, watchlist.token_address,
+                    watchlist.token_symbol, watchlist.canonical_pair_address
+                FROM token_watchlist watchlist
+                LEFT JOIN evm_early_buyer_token_state state
+                    ON state.chain = watchlist.chain
+                    AND LOWER(state.token_address) = LOWER(watchlist.token_address)
+                WHERE watchlist.active = TRUE
+                    AND watchlist.chain = 'robinhood'
+                    AND watchlist.source <> 'benchmark'
+                    AND watchlist.canonical_pair_address IS NOT NULL
+                ORDER BY CASE WHEN state.token_address IS NULL THEN 0 ELSE 1 END,
+                    state.updated_at ASC NULLS FIRST, watchlist.token_symbol
+                LIMIT %s
+            """, (limit,))
+            tokens = cur.fetchall()
+            cur.execute("""
+                INSERT INTO evm_early_buyer_runs (tokens_selected, details)
+                VALUES (%s, %s) RETURNING id
+            """, (len(tokens), json.dumps({
+                "wallet_limit_per_token": EVM_EARLY_BUYER_LIMIT,
+                "receipt_limit_per_token": EVM_EARLY_BUYER_MAX_RECEIPTS,
+                "log_block_limit": EVM_EARLY_BUYER_LOG_BLOCKS,
+                "consensus_weight": 0,
+            })))
+            run_id = cur.fetchone()[0]
+        conn.commit()
+
+    deadline = time.monotonic() + EVM_EARLY_BUYER_MAX_SECONDS
+    results, errors = [], []
+    stop_reason = None
+    for token in tokens:
+        if time.monotonic() >= deadline:
+            stop_reason = "deadline_guard"
+            break
+        try:
+            result = scan_robinhood_early_buyers(token, deadline)
+            results.append(result)
+            if result.get("stop_reason") == "deadline_guard":
+                stop_reason = "deadline_guard"
+                break
+        except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
+            error = str(exc)[:160]
+            errors.append({"token_symbol": token[2], "error": error})
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO evm_early_buyer_token_state (
+                            chain, token_address, token_symbol, pair_address,
+                            scan_status, provider_status, last_error, updated_at
+                        ) VALUES (%s, %s, %s, %s, 'blocked', 'degraded', %s, NOW())
+                        ON CONFLICT (chain, token_address) DO UPDATE SET
+                            token_symbol = EXCLUDED.token_symbol,
+                            pair_address = EXCLUDED.pair_address,
+                            scan_status = 'blocked', provider_status = 'degraded',
+                            last_error = EXCLUDED.last_error, updated_at = NOW()
+                    """, (token[0], token[1], token[2], token[3], error))
+                conn.commit()
+            if "429" in error or "deadline" in error or "timeout" in error.lower():
+                stop_reason = "provider_guard"
+                break
+
+    wallets_observed = sum(item.get("observations", 0) for item in results)
+    status = (
+        "completed" if len(results) == len(tokens) and not errors
+        else "bounded_stop" if stop_reason
+        else "partial"
+    )
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE evm_early_buyer_runs SET completed_at = NOW(),
+                    tokens_completed = %s, wallets_observed = %s,
+                    status = %s, stop_reason = %s,
+                    details = details::jsonb || %s::jsonb
+                WHERE id = %s
+            """, (
+                len(results), wallets_observed, status, stop_reason,
+                json.dumps({"results": results, "errors": errors}), run_id,
+            ))
+        conn.commit()
+    return jsonify({
+        "success": status == "completed", "version": VERSION,
+        "run_id": run_id, "status": status, "stop_reason": stop_reason,
+        "tokens_selected": len(tokens), "tokens_completed": len(results),
+        "wallets_observed": wallets_observed, "results": results,
+        "errors": errors, "paper_mode": True, "actionable": False,
+        "consensus_weight": 0,
+    }), 200 if status == "completed" else 207
+
+
+@app.get("/evm-early-buyers")
+def evm_early_buyers_endpoint():
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 250)
+    except ValueError:
+        limit = 100
+    evidence = load_evm_early_buyer_evidence(limit)
+    return jsonify({
+        "success": True, "version": VERSION, **evidence,
+        "paper_mode": True, "actionable": False,
+        "warning": "Early-purchase evidence is observational and cannot vote or trigger admission.",
+    })
+
+
+@app.get("/evm-early-buyer-status")
+def evm_early_buyer_status_endpoint():
+    initialise_database()
+    evidence = load_evm_early_buyer_evidence(25)
+    return jsonify({
+        "success": True, "version": VERSION,
+        "provider": {"name": "Robinhood public JSON-RPC",
+                     "configured": bool(ROBINHOOD_RPC_URL)},
+        **evidence, "paper_mode": True, "actionable": False,
+    })
+
+
 @app.get("/evm-status")
 def evm_status_endpoint():
     initialise_database()
@@ -7630,6 +8217,7 @@ def build_dashboard_payload():
         "consensus_weight": 0,
     } for row in screened_wallet_rows]
     candidate_pipeline = load_dex_wallet_pipeline_status()
+    evm_early_buyers = load_evm_early_buyer_evidence(100)
     return {
         "success": True, "version": VERSION,
         "generated_at": now, "latest_refresh": latest_refresh,
@@ -7637,6 +8225,7 @@ def build_dashboard_payload():
         "solana_activity": solana_activity, "snapshot_quality": snapshot_quality,
         "screened_wallets": screened_wallets,
         "candidate_pipeline": candidate_pipeline,
+        "evm_early_buyers": evm_early_buyers,
         "observation_wallets": candidate_pipeline.get("observation_wallets", []),
         "initial_screening_policy": {
             "minimum_performance_score": 30,
@@ -7659,6 +8248,10 @@ def build_dashboard_payload():
             "evm_alert_states": sum(
                 1 for item in evm_signals if item["status"] in EVM_ALERT_STATUSES
             ),
+            "evm_early_buyer_wallets": evm_early_buyers["counts"]["eligible"],
+            "evm_cross_token_early_buyers": evm_early_buyers["counts"][
+                "cross_token_wallets"
+            ],
             "solana_signals": len(solana_signals),
             "solana_active": sum(
                 1 for item in solana_signals if item["status"] != "EXPIRED"
@@ -7700,10 +8293,11 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.15 · Forward Evidence</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Wide discovery + zero-weight observation + evidence-qualified probation recommendations</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.16 · Cross-chain Wallet Evidence</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana discovery + Robinhood early buyers + zero-weight evidence-qualified review</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
+    <div class="card"><span class="label">EVM early buyers</span><b id="evmEarlyBuyerCount">—</b><span class="muted"><span id="evmCrossTokenCount">—</span> cross-token · zero weight</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
     <div class="card"><span class="label">Dex candidates</span><b id="dexCandidateCount">—</b><span class="muted">Wide discovery cohort</span></div>
     <div class="card"><span class="label">Passed screening</span><b id="screenedCount">—</b><span class="muted">Candidates · zero consensus weight</span></div>
@@ -7714,6 +8308,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
   </section>
   <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair evidence; holder freshness and performance relative to ETH are explicit</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="13" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Robinhood early-purchaser wallets</h2><div class="muted">Pair-verified buyers are ranked across watchlist tokens; infrastructure and same-block sniper evidence is excluded, and every wallet remains zero weight</div></div><div class="links"><a href="/evm-early-buyers">Wallet evidence</a><a href="/evm-early-buyer-status">Scan status</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Early tokens</th><th>Top-25 tokens</th><th>Best rank</th><th>Average rank</th><th>Tokens</th><th>Filter result</th><th>Deep screening</th><th>Last observed</th></tr></thead><tbody id="evmEarlyBuyerBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana consensus windows</h2><div class="muted">Activity funnel across independent validated wallet clusters; probation activity cannot vote</div></div><div class="links"><a href="/solana-activity">Full diagnostics</a><a href="/dex-wallet-cohorts">Discovery cohorts</a><a href="/dex-wallet-discovery-history">Discovery runs</a><a href="/probation-wallet-activity">Probation activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Window</th><th>Events</th><th>Active wallets</th><th>Clusters</th><th>Tokens bought</th><th>2 buyers</th><th>3+ buyers</th><th>Missing symbols</th></tr></thead><tbody id="solWindowBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>DexScreener candidate processing pipeline</h2><div class="muted">Newly discovered wallets are prioritised through bounded scoring, screening and validation batches</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Pipeline JSON</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a><a href="/dex-wallet-cohorts">Discovery cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Discovered</th><th>Awaiting score</th><th>Scored</th><th>Performance ≥30</th><th>Screened</th><th>Low risk</th><th>Validated</th><th>Minimum gates</th><th>Recommended</th><th>In probation</th><th>Consensus validated</th></tr></thead><tbody id="pipelineBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana probation wallets</h2><div class="muted">Forward-only evidence is visible here but contributes zero buyer votes until manual validation</div></div><div class="links"><a href="/dex-wallet-cohorts">All cohorts</a><a href="/probation-wallet-activity">Probation activity</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Status</th><th>Admitted</th><th>Probation age</th><th>Performance</th><th>Risk</th><th>Early entries</th><th>Forward trades</th><th>Forward tokens</th><th>Last activity</th><th>Promotion review</th></tr></thead><tbody id="probationBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
@@ -7733,8 +8328,9 @@ const age=s=>s==null?'unknown age':s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m`:s<
 const stateLabel=s=>({EVM_PROVIDER_UNAVAILABLE:'Provider unavailable',EVM_DATA_ANOMALY:'Data anomaly',EVM_BENCHMARK:'Market benchmark',EVM_CONFIRMED_BREAKOUT:'Confirmed breakout',EVM_CONFIRMED_BREAKDOWN:'Confirmed breakdown',EVM_ACCUMULATION_WATCH:'Accumulation watch',EVM_HIGH_MOMENTUM:'High momentum',EVM_MOMENTUM:'Momentum',EVM_DISTRIBUTION:'Distribution',EVM_THIN_LIQUIDITY:'Thin liquidity',EVM_REBOUND:'Rebound',EVM_RISK:'Risk',EVM_OBSERVE:'Observe'}[s]||s);
 const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_BENCHMARK'?'benchmark':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(stateLabel(s))}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
-document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('observationCount').textContent=d.summary.observation_pool;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
+document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('evmEarlyBuyerCount').textContent=d.summary.evm_early_buyer_wallets;document.getElementById('evmCrossTokenCount').textContent=d.summary.evm_cross_token_early_buyers;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('observationCount').textContent=d.summary.observation_pool;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
 document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td><div>${num(x.holder_count)}</div><div class="address">${age(x.holder_data_age_seconds)} old</div></td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${trend(x.trends['24h'].relative_to_eth_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="13" class="empty">No EVM snapshots yet.</td></tr>';
+const evmBuyers=d.evm_early_buyers?.wallets||[];document.getElementById('evmEarlyBuyerBody').innerHTML=evmBuyers.length?evmBuyers.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/address/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,8))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">observation only · zero consensus weight</div></a></td><td>${num(x.early_tokens)}</td><td>${num(x.top_25_tokens)}</td><td>${num(x.best_entry_rank)}</td><td>${num(x.average_entry_rank)}</td><td>${esc(x.token_symbols||'—')}</td><td>${x.filter_result==='CROSS-TOKEN REVIEW'?'<span class="badge accumulation">CROSS-TOKEN REVIEW</span>':'<span class="badge expired">COLLECTING</span>'}</td><td>${esc(x.screening_status)}</td><td>${when(x.last_observed_at)}</td></tr>`).join(''):'<tr><td colspan="9" class="empty">No pair-verified Robinhood early buyers retained yet. The bounded backfill is ready to run.</td></tr>';
 const windows=d.solana_activity?.windows||{};document.getElementById('solWindowBody').innerHTML=['1h','6h','24h'].map(w=>{const x=windows[w]||{};return `<tr><td><div class="token">${w}</div></td><td>${num(x.events)}</td><td>${num(x.active_wallets)}</td><td>${num(x.independent_clusters)}</td><td>${num(x.unique_tokens_bought)}</td><td>${num(x.tokens_with_2_buyers)}</td><td>${num(x.tokens_with_3_plus_buyers)}</td><td>${num(x.missing_symbols)}</td></tr>`}).join('');
 const pc=d.candidate_pipeline?.counts||{};document.getElementById('pipelineBody').innerHTML=`<tr><td>${num(pc.discovered)}</td><td>${num(pc.awaiting_score)}</td><td>${num(pc.scored)}</td><td>${num(pc.performance_pass)}</td><td>${num(pc.screened)}</td><td>${num(pc.low_risk)}</td><td>${num(pc.validated)}</td><td>${num(pc.minimum_gates_passed)}</td><td>${num(pc.recommended_for_probation)}</td><td>${num(pc.probation)}</td><td>${num(pc.consensus_validated)}</td></tr>`;
 const screened=d.screened_wallets||[];document.getElementById('screenedWalletBody').innerHTML=screened.length?screened.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">provisional pass · zero consensus weight</div></a></td><td><span class="badge ${x.source==='DEX DISCOVERY'?'accumulation':'observe'}">${esc(x.source)}</span></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${money(x.realized_pnl_30d)}</td><td>${num(x.trades_30d)}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">No wallets have passed both initial performance and risk screening yet.</td></tr>';
