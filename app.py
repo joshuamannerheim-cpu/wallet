@@ -2676,6 +2676,19 @@ def load_historical_winner_leaderboard(limit=100):
             """, (HISTORICAL_TEN_X_RETURN_PCT, min(max(int(limit), 1), 250)))
             rows = cur.fetchall()
             cur.execute("""
+                SELECT COUNT(*),
+                    COUNT(*) FILTER (WHERE successful_calls >= 2),
+                    COUNT(*) FILTER (WHERE successful_calls = 1)
+                FROM (
+                    SELECT wallet,
+                        COUNT(*) FILTER (WHERE call_result = 'SUCCESS')
+                            AS successful_calls
+                    FROM historical_wallet_calls
+                    GROUP BY wallet
+                ) wallet_evidence
+            """)
+            wallet_count_row = cur.fetchone()
+            cur.execute("""
                 SELECT outcome_label, COUNT(*)
                 FROM discovery_token_cohorts GROUP BY outcome_label
             """)
@@ -2716,9 +2729,9 @@ def load_historical_winner_leaderboard(limit=100):
     return {
         "wallets": wallets,
         "counts": {
-            "wallets_reviewed": len(wallets),
-            "repeat_winners": sum(1 for item in wallets if item["successful_calls"] >= 2),
-            "one_proven_call": sum(1 for item in wallets if item["successful_calls"] == 1),
+            "wallets_reviewed": wallet_count_row[0] or 0,
+            "repeat_winners": wallet_count_row[1] or 0,
+            "one_proven_call": wallet_count_row[2] or 0,
             "winner_tokens": token_counts.get("WINNER", 0),
             "loser_tokens": token_counts.get("LOSER", 0),
             "control_tokens": token_counts.get("CONTROL", 0),
