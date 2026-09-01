@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.16.4-up-watchlist"
+VERSION = "4.17.0-robinhood-paper-signals"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -97,6 +97,12 @@ EVM_EARLY_BUYER_MAX_RECEIPTS = min(
 EVM_EARLY_BUYER_MAX_SECONDS = min(
     max(int(os.getenv("EVM_EARLY_BUYER_MAX_SECONDS", "70")), 20), 85
 )
+EVM_PAPER_SIGNAL_MIN_BUYERS = 2
+EVM_PAPER_SIGNAL_MIN_HISTORY_TOKENS = 2
+EVM_PAPER_SIGNAL_MIN_SUCCESSFUL_TOKENS = 1
+EVM_PAPER_SIGNAL_MAX_ENTRY_RANK = 25
+EVM_PAPER_SIGNAL_SUCCESS_RETURN_PCT = 50.0
+EVM_PAPER_SIGNAL_MAX_PAIR_AGE_DAYS = 14
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa"
     "952ba7f163c4a11628f55a4df523b3ef"
@@ -4889,6 +4895,191 @@ def load_evm_early_buyer_evidence(limit=100):
     }
 
 
+def load_evm_robinhood_paper_signals():
+    """Build zero-weight Robinhood signals from qualified cross-token buyers.
+
+    Historical success is deliberately a token-outcome proxy: the monitored
+    token must have traded at least 50% above its first trusted snapshot after
+    the wallet's early entry. It does not claim that the wallet realised that
+    return. A target token is never allowed to qualify its own buyers.
+    """
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT observation.wallet, LOWER(observation.token_address),
+                    observation.token_symbol, observation.entry_rank,
+                    observation.block_number, observation.occurred_at,
+                    state.pair_created_at, state.pair_address
+                FROM evm_early_buyer_observations observation
+                JOIN evm_early_buyer_token_state state
+                    ON state.chain = observation.chain
+                    AND LOWER(state.token_address) = LOWER(observation.token_address)
+                WHERE observation.chain = 'robinhood'
+                    AND observation.filter_status = 'eligible'
+            """)
+            observation_rows = cur.fetchall()
+            cur.execute("""
+                SELECT LOWER(token_address),
+                    (ARRAY_AGG(price_usd ORDER BY captured_at ASC))[1] AS first_price,
+                    MAX(price_usd) AS maximum_price
+                FROM evm_token_snapshots
+                WHERE chain = 'robinhood' AND price_usd > 0
+                    AND is_anomaly = FALSE AND is_provider_unavailable = FALSE
+                GROUP BY LOWER(token_address)
+            """)
+            outcome_rows = cur.fetchall()
+            cur.execute("""
+                SELECT DISTINCT ON (LOWER(token_address)) LOWER(token_address),
+                    token_symbol, pair_address, liquidity_usd, volume_h1_usd,
+                    COALESCE(buys_h1, 0) + COALESCE(sells_h1, 0) AS transactions_h1,
+                    captured_at
+                FROM evm_token_snapshots
+                WHERE chain = 'robinhood' AND is_anomaly = FALSE
+                    AND is_provider_unavailable = FALSE
+                ORDER BY LOWER(token_address), captured_at DESC
+            """)
+            market_rows = cur.fetchall()
+
+    outcomes = {}
+    for address, first_price, maximum_price in outcome_rows:
+        first_price = safe_float(first_price)
+        maximum_price = safe_float(maximum_price)
+        gain = percentage_change(maximum_price, first_price)
+        outcomes[address] = gain
+    markets = {
+        row[0]: {
+            "token_symbol": row[1], "pair_address": row[2],
+            "liquidity_usd": safe_float(row[3]),
+            "volume_h1_usd": safe_float(row[4]),
+            "transactions_h1": safe_int(row[5]) or 0,
+            "captured_at": row[6],
+        }
+        for row in market_rows
+    }
+    observations = [{
+        "wallet": row[0], "token_address": row[1], "token_symbol": row[2],
+        "entry_rank": row[3], "block_number": row[4],
+        "occurred_at": row[5], "pair_created_at": row[6],
+        "pair_address": row[7],
+    } for row in observation_rows]
+
+    wallet_observations = {}
+    token_observations = {}
+    for item in observations:
+        wallet_observations.setdefault(item["wallet"], []).append(item)
+        token_observations.setdefault(item["token_address"], []).append(item)
+
+    now = datetime.now(timezone.utc)
+    signals = []
+    collecting_tokens = 0
+    for token_address, token_entries in token_observations.items():
+        representative = token_entries[0]
+        pair_created_at = representative["pair_created_at"]
+        if pair_created_at and pair_created_at.tzinfo is None:
+            pair_created_at = pair_created_at.replace(tzinfo=timezone.utc)
+        pair_age_seconds = (
+            max((now - pair_created_at).total_seconds(), 0)
+            if pair_created_at else None
+        )
+        if pair_age_seconds is None or pair_age_seconds > (
+            EVM_PAPER_SIGNAL_MAX_PAIR_AGE_DAYS * 86400
+        ):
+            continue
+        market = markets.get(token_address) or {}
+        market_quality_met = (
+            (market.get("liquidity_usd") or 0) >= EVM_MIN_MOMENTUM_LIQUIDITY_USD
+            and (market.get("volume_h1_usd") or 0) >= EVM_MIN_MOMENTUM_H1_VOLUME_USD
+            and (market.get("transactions_h1") or 0) >= EVM_MIN_MOMENTUM_H1_TRANSACTIONS
+        )
+        if not market_quality_met:
+            continue
+
+        qualified = []
+        for entry in token_entries:
+            if entry["entry_rank"] > EVM_PAPER_SIGNAL_MAX_ENTRY_RANK:
+                continue
+            history = [
+                prior for prior in wallet_observations.get(entry["wallet"], [])
+                if prior["token_address"] != token_address
+                and prior["entry_rank"] <= EVM_PAPER_SIGNAL_MAX_ENTRY_RANK
+                and (prior["occurred_at"] is None or entry["occurred_at"] is None
+                     or prior["occurred_at"] < entry["occurred_at"])
+            ]
+            successful = {
+                prior["token_address"] for prior in history
+                if (outcomes.get(prior["token_address"]) or 0)
+                >= EVM_PAPER_SIGNAL_SUCCESS_RETURN_PCT
+            }
+            history_tokens = {prior["token_address"] for prior in history}
+            if (len(history_tokens) < EVM_PAPER_SIGNAL_MIN_HISTORY_TOKENS
+                    or len(successful) < EVM_PAPER_SIGNAL_MIN_SUCCESSFUL_TOKENS):
+                continue
+            qualified.append({
+                **entry, "history_tokens": len(history_tokens),
+                "successful_history_tokens": len(successful),
+            })
+
+        unique_wallets = {item["wallet"] for item in qualified}
+        independent_blocks = {item["block_number"] for item in qualified}
+        if len(unique_wallets) < EVM_PAPER_SIGNAL_MIN_BUYERS:
+            collecting_tokens += 1
+            continue
+        if len(independent_blocks) < EVM_PAPER_SIGNAL_MIN_BUYERS:
+            # Same-block convergence is not treated as independent evidence.
+            continue
+        qualified.sort(key=lambda item: (item["entry_rank"], item["block_number"]))
+        signals.append({
+            "token_address": token_address,
+            "token_symbol": representative["token_symbol"],
+            "pair_address": representative["pair_address"] or market.get("pair_address"),
+            "pair_created_at": pair_created_at,
+            "pair_age_seconds": int(pair_age_seconds),
+            "qualified_buyers": len(unique_wallets),
+            "independent_purchase_blocks": len(independent_blocks),
+            "best_entry_rank": min(item["entry_rank"] for item in qualified),
+            "successful_history_tokens": sum(
+                item["successful_history_tokens"] for item in qualified
+            ),
+            "buyer_wallets": sorted(unique_wallets),
+            "last_qualified_purchase_at": max(
+                (item["occurred_at"] for item in qualified if item["occurred_at"]),
+                default=None,
+            ),
+            "liquidity_usd": market.get("liquidity_usd"),
+            "volume_h1_usd": market.get("volume_h1_usd"),
+            "transactions_h1": market.get("transactions_h1"),
+            "result": (
+                "3+ QUALIFIED BUYERS" if len(unique_wallets) >= 3
+                else "2 QUALIFIED BUYERS"
+            ),
+            "safety_status": "UNVERIFIED",
+            "paper_mode": True, "actionable": False, "consensus_weight": 0,
+            "independence_basis": "distinct wallets, distinct purchase blocks",
+        })
+    signals.sort(key=lambda item: (
+        -item["qualified_buyers"], item["pair_age_seconds"], item["best_entry_rank"]
+    ))
+    return {
+        "signals": signals,
+        "counts": {"active": len(signals), "collecting": collecting_tokens},
+        "policy": {
+            "minimum_qualified_buyers": EVM_PAPER_SIGNAL_MIN_BUYERS,
+            "maximum_entry_rank": EVM_PAPER_SIGNAL_MAX_ENTRY_RANK,
+            "minimum_prior_early_tokens": EVM_PAPER_SIGNAL_MIN_HISTORY_TOKENS,
+            "minimum_successful_history_tokens": EVM_PAPER_SIGNAL_MIN_SUCCESSFUL_TOKENS,
+            "successful_token_return_proxy_pct": EVM_PAPER_SIGNAL_SUCCESS_RETURN_PCT,
+            "maximum_pair_age_days": EVM_PAPER_SIGNAL_MAX_PAIR_AGE_DAYS,
+            "minimum_liquidity_usd": EVM_MIN_MOMENTUM_LIQUIDITY_USD,
+            "minimum_h1_volume_usd": EVM_MIN_MOMENTUM_H1_VOLUME_USD,
+            "minimum_h1_transactions": EVM_MIN_MOMENTUM_H1_TRANSACTIONS,
+            "same_block_convergence_excluded": True,
+            "target_token_excluded_from_buyer_history": True,
+            "realised_wallet_returns_not_assumed": True,
+            "paper_mode": True, "actionable": False, "consensus_weight": 0,
+        },
+    }
+
+
 def _pair_activity(pair):
     transactions = pair.get("txns") or {}
     h1 = transactions.get("h1") or {}
@@ -7166,6 +7357,19 @@ def evm_early_buyer_status_endpoint():
     })
 
 
+@app.get("/evm-paper-signals")
+def evm_paper_signals_endpoint():
+    initialise_database()
+    evidence = load_evm_robinhood_paper_signals()
+    return jsonify({
+        "success": True, "version": VERSION, **evidence,
+        "warning": (
+            "Paper research only. Historical success is a token-outcome proxy, "
+            "not proof of realised wallet returns or unrelated ownership."
+        ),
+    })
+
+
 @app.get("/evm-status")
 def evm_status_endpoint():
     initialise_database()
@@ -8236,6 +8440,7 @@ def build_dashboard_payload():
     } for row in screened_wallet_rows]
     candidate_pipeline = load_dex_wallet_pipeline_status()
     evm_early_buyers = load_evm_early_buyer_evidence(100)
+    evm_paper_signals = load_evm_robinhood_paper_signals()
     return {
         "success": True, "version": VERSION,
         "generated_at": now, "latest_refresh": latest_refresh,
@@ -8244,6 +8449,7 @@ def build_dashboard_payload():
         "screened_wallets": screened_wallets,
         "candidate_pipeline": candidate_pipeline,
         "evm_early_buyers": evm_early_buyers,
+        "evm_paper_signals": evm_paper_signals,
         "observation_wallets": candidate_pipeline.get("observation_wallets", []),
         "initial_screening_policy": {
             "minimum_performance_score": 30,
@@ -8270,6 +8476,7 @@ def build_dashboard_payload():
             "evm_cross_token_early_buyers": evm_early_buyers["counts"][
                 "cross_token_wallets"
             ],
+            "evm_active_paper_signals": evm_paper_signals["counts"]["active"],
             "solana_signals": len(solana_signals),
             "solana_active": sum(
                 1 for item in solana_signals if item["status"] != "EXPIRED"
@@ -8311,11 +8518,12 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.16 · Cross-chain Wallet Evidence</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana discovery + Robinhood early buyers + zero-weight evidence-qualified review</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.17 · Cross-chain Wallet Evidence</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana discovery + Robinhood qualified-buyer paper signals + zero-weight evidence review</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">EVM early buyers</span><b id="evmEarlyBuyerCount">—</b><span class="muted"><span id="evmCrossTokenCount">—</span> cross-token · zero weight</span></div>
+    <div class="card"><span class="label">Robinhood paper signals</span><b id="evmPaperSignalCount">—</b><span class="muted">Qualified convergence · zero weight</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
     <div class="card"><span class="label">Dex candidates</span><b id="dexCandidateCount">—</b><span class="muted">Wide discovery cohort</span></div>
     <div class="card"><span class="label">Passed screening</span><b id="screenedCount">—</b><span class="muted">Candidates · zero consensus weight</span></div>
@@ -8327,6 +8535,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   </section>
   <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair evidence; holder freshness and performance relative to ETH are explicit</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="13" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Active Solana paper signals</h2><div class="muted">Buyer labels count independent wallet clusters—not transactions</div></div><div class="links"><a href="/signals?include_expired=false">Active JSON</a><a href="/signals?include_expired=true">History</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Last activity</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Active Robinhood paper signals</h2><div class="muted">Requires 2+ distinct qualified early buyers in different blocks, successful prior token outcomes, and current market-quality gates; paper-only and zero weight</div></div><div class="links"><a href="/evm-paper-signals">Signal evidence</a><a href="/evm-early-buyers">Buyer history</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Qualified buyers</th><th>Successful history</th><th>Best entry rank</th><th>Liquidity</th><th>1h volume</th><th>Safety</th><th>Last qualified buy</th></tr></thead><tbody id="evmPaperSignalBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Robinhood early-purchaser wallets</h2><div class="muted">Pair-verified buyers are ranked across watchlist tokens; infrastructure and same-block sniper evidence is excluded, and every wallet remains zero weight</div></div><div class="links"><a href="/evm-early-buyers">Wallet evidence</a><a href="/evm-early-buyer-status">Scan status</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Early tokens</th><th>Top-25 tokens</th><th>Best rank</th><th>Average rank</th><th>Tokens</th><th>Filter result</th><th>Deep screening</th><th>Last observed</th></tr></thead><tbody id="evmEarlyBuyerBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana consensus windows</h2><div class="muted">Activity funnel across independent validated wallet clusters; probation activity cannot vote</div></div><div class="links"><a href="/solana-activity">Full diagnostics</a><a href="/dex-wallet-cohorts">Discovery cohorts</a><a href="/dex-wallet-discovery-history">Discovery runs</a><a href="/probation-wallet-activity">Probation activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Window</th><th>Events</th><th>Active wallets</th><th>Clusters</th><th>Tokens bought</th><th>2 buyers</th><th>3+ buyers</th><th>Missing symbols</th></tr></thead><tbody id="solWindowBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>DexScreener candidate processing pipeline</h2><div class="muted">Newly discovered wallets are prioritised through bounded scoring, screening and validation batches</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Pipeline JSON</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a><a href="/dex-wallet-cohorts">Discovery cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Discovered</th><th>Awaiting score</th><th>Scored</th><th>Performance ≥30</th><th>Screened</th><th>Low risk</th><th>Validated</th><th>Minimum gates</th><th>Recommended</th><th>In probation</th><th>Consensus validated</th></tr></thead><tbody id="pipelineBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
@@ -8346,9 +8555,10 @@ const age=s=>s==null?'unknown age':s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m`:s<
 const stateLabel=s=>({EVM_PROVIDER_UNAVAILABLE:'Provider unavailable',EVM_DATA_ANOMALY:'Data anomaly',EVM_BENCHMARK:'Market benchmark',EVM_CONFIRMED_BREAKOUT:'Confirmed breakout',EVM_CONFIRMED_BREAKDOWN:'Confirmed breakdown',EVM_ACCUMULATION_WATCH:'Accumulation watch',EVM_HIGH_MOMENTUM:'High momentum',EVM_MOMENTUM:'Momentum',EVM_DISTRIBUTION:'Distribution',EVM_THIN_LIQUIDITY:'Thin liquidity',EVM_REBOUND:'Rebound',EVM_RISK:'Risk',EVM_OBSERVE:'Observe'}[s]||s);
 const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_BENCHMARK'?'benchmark':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(stateLabel(s))}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
-document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('evmEarlyBuyerCount').textContent=d.summary.evm_early_buyer_wallets;document.getElementById('evmCrossTokenCount').textContent=d.summary.evm_cross_token_early_buyers;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('observationCount').textContent=d.summary.observation_pool;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
+document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('evmEarlyBuyerCount').textContent=d.summary.evm_early_buyer_wallets;document.getElementById('evmCrossTokenCount').textContent=d.summary.evm_cross_token_early_buyers;document.getElementById('evmPaperSignalCount').textContent=d.summary.evm_active_paper_signals;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('observationCount').textContent=d.summary.observation_pool;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
 document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td><div>${num(x.holder_count)}</div><div class="address">${age(x.holder_data_age_seconds)} old</div></td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${trend(x.trends['24h'].relative_to_eth_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="13" class="empty">No EVM snapshots yet.</td></tr>';
 const evmBuyers=d.evm_early_buyers?.wallets||[];document.getElementById('evmEarlyBuyerBody').innerHTML=evmBuyers.length?evmBuyers.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/address/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,8))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">observation only · zero consensus weight</div></a></td><td>${num(x.early_tokens)}</td><td>${num(x.top_25_tokens)}</td><td>${num(x.best_entry_rank)}</td><td>${num(x.average_entry_rank)}</td><td>${esc(x.token_symbols||'—')}</td><td>${x.filter_result==='CROSS-TOKEN REVIEW'?'<span class="badge accumulation">CROSS-TOKEN REVIEW</span>':'<span class="badge expired">COLLECTING</span>'}</td><td>${esc(x.screening_status)}</td><td>${when(x.last_observed_at)}</td></tr>`).join(''):'<tr><td colspan="9" class="empty">No pair-verified Robinhood early buyers retained yet. The bounded backfill is ready to run.</td></tr>';
+const evmPaperSignals=d.evm_paper_signals?.signals||[];document.getElementById('evmPaperSignalBody').innerHTML=evmPaperSignals.length?evmPaperSignals.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/token/${esc(x.token_address)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.token_symbol||'Unknown')}<span class="external">↗</span></div><div class="address">${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a></td><td><span class="badge accumulation">${esc(x.result)}</span></td><td><div class="token">${num(x.qualified_buyers)}</div><div class="address">${num(x.independent_purchase_blocks)} purchase blocks</div></td><td><div>${num(x.successful_history_tokens)} token outcomes</div><div class="address">target excluded</div></td><td>${num(x.best_entry_rank)}</td><td>${money(x.liquidity_usd)}</td><td>${money(x.volume_h1_usd)}</td><td><span class="badge provider">${esc(x.safety_status)}</span></td><td><div>${when(x.last_qualified_purchase_at)}</div><div class="address">${age(x.pair_age_seconds)} pair age</div></td></tr>`).join(''):'<tr><td colspan="9" class="empty">No active Robinhood paper signal currently meets all buyer-history, independence, freshness, and market-quality gates.</td></tr>';
 const windows=d.solana_activity?.windows||{};document.getElementById('solWindowBody').innerHTML=['1h','6h','24h'].map(w=>{const x=windows[w]||{};return `<tr><td><div class="token">${w}</div></td><td>${num(x.events)}</td><td>${num(x.active_wallets)}</td><td>${num(x.independent_clusters)}</td><td>${num(x.unique_tokens_bought)}</td><td>${num(x.tokens_with_2_buyers)}</td><td>${num(x.tokens_with_3_plus_buyers)}</td><td>${num(x.missing_symbols)}</td></tr>`}).join('');
 const pc=d.candidate_pipeline?.counts||{};document.getElementById('pipelineBody').innerHTML=`<tr><td>${num(pc.discovered)}</td><td>${num(pc.awaiting_score)}</td><td>${num(pc.scored)}</td><td>${num(pc.performance_pass)}</td><td>${num(pc.screened)}</td><td>${num(pc.low_risk)}</td><td>${num(pc.validated)}</td><td>${num(pc.minimum_gates_passed)}</td><td>${num(pc.recommended_for_probation)}</td><td>${num(pc.probation)}</td><td>${num(pc.consensus_validated)}</td></tr>`;
 const screened=d.screened_wallets||[];document.getElementById('screenedWalletBody').innerHTML=screened.length?screened.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">provisional pass · zero consensus weight</div></a></td><td><span class="badge ${x.source==='DEX DISCOVERY'?'accumulation':'observe'}">${esc(x.source)}</span></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${money(x.realized_pnl_30d)}</td><td>${num(x.trades_30d)}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">No wallets have passed both initial performance and risk screening yet.</td></tr>';
