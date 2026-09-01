@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.17.0-robinhood-paper-signals"
+VERSION = "4.18.0-historical-winner-miner"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -75,6 +75,18 @@ OBSERVATION_POOL_LIMIT = min(
 OBSERVATION_REPEAT_MIN_TOKENS = 2
 OBSERVATION_ENTRY_RANK_MAX = 10
 OBSERVATION_HORIZONS_HOURS = (0, 1, 6, 24, 168)
+HISTORICAL_MINER_MAX_TOKENS = min(
+    max(int(os.getenv("HISTORICAL_MINER_MAX_TOKENS", "10")), 1), 20
+)
+HISTORICAL_MINER_MAX_SECONDS = min(
+    max(int(os.getenv("HISTORICAL_MINER_MAX_SECONDS", "70")), 20), 85
+)
+HISTORICAL_MIN_TOKEN_AGE_HOURS = 24
+HISTORICAL_WINNER_RETURN_PCT = 400.0
+HISTORICAL_TEN_X_RETURN_PCT = 900.0
+HISTORICAL_LOSER_RETURN_PCT = -70.0
+HISTORICAL_EARLY_ENTRY_RANK = 25
+HISTORICAL_COPYABLE_DELAY_SECONDS = 30
 ROBINHOOD_BLOCKSCOUT_URL = "https://robinhoodchain.blockscout.com/api/v2"
 ROBINHOOD_RPC_URL = os.getenv(
     "ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"
@@ -538,6 +550,42 @@ def initialise_database():
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS historical_winner_runs (
+                    id BIGSERIAL PRIMARY KEY,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ,
+                    tokens_selected INTEGER NOT NULL DEFAULT 0,
+                    tokens_completed INTEGER NOT NULL DEFAULT 0,
+                    calls_recorded INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    stop_reason TEXT,
+                    details TEXT NOT NULL DEFAULT '{}'
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS historical_wallet_calls (
+                    wallet TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    token_symbol TEXT,
+                    outcome_label TEXT NOT NULL,
+                    call_result TEXT NOT NULL,
+                    outcome_return_pct DOUBLE PRECISION,
+                    current_return_pct DOUBLE PRECISION,
+                    entry_price_usd DOUBLE PRECISION,
+                    peak_price_usd DOUBLE PRECISION,
+                    current_price_usd DOUBLE PRECISION,
+                    entry_rank INTEGER,
+                    entry_delay_seconds DOUBLE PRECISION,
+                    discovery_liquidity_usd DOUBLE PRECISION,
+                    copyability_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    evidence_quality TEXT NOT NULL DEFAULT 'historical_proxy',
+                    details TEXT NOT NULL DEFAULT '{}',
+                    first_recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (wallet, token_address)
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS paper_signals (
                     token_address TEXT PRIMARY KEY,
                     token_symbol TEXT,
@@ -781,6 +829,8 @@ def initialise_database():
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_observation_wallet_time_idx ON wallet_observation_activity (wallet, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_observation_token_time_idx ON wallet_observation_activity (token_address, occurred_at ASC)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_observation_snapshot_due_idx ON wallet_observation_snapshots (captured_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS historical_wallet_calls_rank_idx ON historical_wallet_calls (call_result, outcome_return_pct DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS historical_winner_run_time_idx ON historical_winner_runs (started_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS notification_delivery_status_idx ON notification_deliveries (delivery_status, created_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS helius_sync_created_idx ON helius_sync_history (created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS evm_snapshot_token_time_idx ON evm_token_snapshots (chain, token_address, captured_at DESC)")
@@ -2539,6 +2589,389 @@ def dex_wallet_discovery_history():
             "status": row[5], "details": details,
         })
     return jsonify({"success": True, "version": VERSION, "runs": items})
+
+
+def historical_copyability(entry_rank, delay_seconds, liquidity_usd, volume_h24_usd):
+    """Score whether a historical entry could plausibly have been followed."""
+    rank = safe_int(entry_rank)
+    delay = safe_float(delay_seconds)
+    liquidity = safe_float(liquidity_usd) or 0
+    volume = safe_float(volume_h24_usd) or 0
+    score = 0.0
+    if rank is not None:
+        score += max(0.0, 55.0 - rank * 2.0)
+    if delay is not None and delay >= HISTORICAL_COPYABLE_DELAY_SECONDS:
+        score += 20.0 if delay <= 3600 else 10.0
+    if liquidity >= 25000:
+        score += 20.0
+    elif liquidity >= DEX_WALLET_MIN_LIQUIDITY_USD:
+        score += 10.0
+    if volume >= DEX_WALLET_MIN_VOLUME_H24_USD:
+        score += 5.0
+    qualified = bool(
+        rank is not None and rank <= HISTORICAL_EARLY_ENTRY_RANK
+        and delay is not None and delay >= HISTORICAL_COPYABLE_DELAY_SECONDS
+        and liquidity >= DEX_WALLET_MIN_LIQUIDITY_USD
+    )
+    return round(min(score, 100.0), 1), qualified
+
+
+def parse_historical_candles(payload):
+    candles = []
+    for item in find_list(payload):
+        if not isinstance(item, dict):
+            continue
+        opened = get_nested_number(item, [("o",), ("open",), ("open_price",)])
+        high = get_nested_number(item, [("h",), ("high",), ("high_price",)])
+        close = get_nested_number(item, [("c",), ("close",), ("close_price",)])
+        timestamp = get_nested_number(item, [
+            ("unixTime",), ("unix_time",), ("time",), ("timestamp",),
+        ])
+        reference = close if close and close > 0 else opened
+        if reference is None or reference <= 0:
+            continue
+        candles.append({
+            "timestamp": timestamp or 0,
+            "open": opened if opened and opened > 0 else reference,
+            "high": high if high and high > 0 else reference,
+            "close": reference,
+        })
+    candles.sort(key=lambda item: item["timestamp"])
+    return candles
+
+
+def load_historical_winner_leaderboard(limit=100):
+    """Rank repeat historical calls without granting admission or votes."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT calls.wallet,
+                    COUNT(DISTINCT calls.token_address) AS tokens_reviewed,
+                    COUNT(*) FILTER (WHERE calls.call_result = 'SUCCESS') AS successful_calls,
+                    COUNT(*) FILTER (
+                        WHERE calls.call_result = 'SUCCESS'
+                            AND calls.outcome_return_pct >= %s
+                    ) AS ten_x_calls,
+                    COUNT(*) FILTER (WHERE calls.call_result = 'FAILED') AS failed_calls,
+                    ROUND(AVG(calls.entry_rank) FILTER (
+                        WHERE calls.call_result IN ('SUCCESS', 'FAILED')
+                    )::numeric, 1) AS average_entry_rank,
+                    ROUND(AVG(calls.copyability_score) FILTER (
+                        WHERE calls.call_result IN ('SUCCESS', 'FAILED')
+                    )::numeric, 1) AS average_copyability,
+                    MAX(calls.outcome_return_pct) FILTER (
+                        WHERE calls.call_result = 'SUCCESS'
+                    ) AS best_call_return_pct,
+                    candidate.score, candidate.screening_risk_score,
+                    candidate.realized_pnl_30d, candidate.trades_30d,
+                    MAX(calls.updated_at) AS last_reviewed_at
+                FROM historical_wallet_calls calls
+                LEFT JOIN candidate_wallets candidate ON candidate.wallet = calls.wallet
+                GROUP BY calls.wallet, candidate.score, candidate.screening_risk_score,
+                    candidate.realized_pnl_30d, candidate.trades_30d
+                ORDER BY successful_calls DESC, ten_x_calls DESC,
+                    failed_calls ASC, average_copyability DESC NULLS LAST,
+                    best_call_return_pct DESC NULLS LAST
+                LIMIT %s
+            """, (HISTORICAL_TEN_X_RETURN_PCT, min(max(int(limit), 1), 250)))
+            rows = cur.fetchall()
+            cur.execute("""
+                SELECT outcome_label, COUNT(*)
+                FROM discovery_token_cohorts GROUP BY outcome_label
+            """)
+            token_counts = {row[0]: row[1] for row in cur.fetchall()}
+            cur.execute("""
+                SELECT id, started_at, completed_at, tokens_selected,
+                    tokens_completed, calls_recorded, status, stop_reason, details
+                FROM historical_winner_runs ORDER BY id DESC LIMIT 1
+            """)
+            latest_run_row = cur.fetchone()
+    wallets = []
+    for row in rows:
+        decisions = (row[2] or 0) + (row[4] or 0)
+        hit_rate = round((row[2] or 0) * 100 / decisions, 1) if decisions else None
+        wallets.append({
+            "wallet": row[0], "tokens_reviewed": row[1],
+            "successful_calls": row[2], "ten_x_calls": row[3],
+            "failed_calls": row[4], "hit_rate_pct": hit_rate,
+            "average_entry_rank": float(row[5]) if row[5] is not None else None,
+            "copyability_score": float(row[6]) if row[6] is not None else None,
+            "best_call_return_pct": row[7], "performance_score": row[8],
+            "screening_risk_score": row[9], "realized_pnl_30d": row[10],
+            "trades_30d": row[11], "last_reviewed_at": row[12],
+            "evidence_status": (
+                "REPEAT WINNER" if (row[2] or 0) >= 2
+                else "ONE PROVEN CALL" if (row[2] or 0) == 1
+                else "NO PROVEN CALL"
+            ),
+            "consensus_weight": 0,
+        })
+    latest_run = None if not latest_run_row else {
+        "id": latest_run_row[0], "started_at": latest_run_row[1],
+        "completed_at": latest_run_row[2], "tokens_selected": latest_run_row[3],
+        "tokens_completed": latest_run_row[4], "calls_recorded": latest_run_row[5],
+        "status": latest_run_row[6], "stop_reason": latest_run_row[7],
+        "details": json.loads(latest_run_row[8] or "{}"),
+    }
+    return {
+        "wallets": wallets,
+        "counts": {
+            "wallets_reviewed": len(wallets),
+            "repeat_winners": sum(1 for item in wallets if item["successful_calls"] >= 2),
+            "one_proven_call": sum(1 for item in wallets if item["successful_calls"] == 1),
+            "winner_tokens": token_counts.get("WINNER", 0),
+            "loser_tokens": token_counts.get("LOSER", 0),
+            "control_tokens": token_counts.get("CONTROL", 0),
+        },
+        "latest_run": latest_run,
+        "policy": {
+            "winner_peak_return_pct": HISTORICAL_WINNER_RETURN_PCT,
+            "ten_x_peak_return_pct": HISTORICAL_TEN_X_RETURN_PCT,
+            "loser_current_return_pct": HISTORICAL_LOSER_RETURN_PCT,
+            "maximum_early_entry_rank": HISTORICAL_EARLY_ENTRY_RANK,
+            "minimum_copyable_delay_seconds": HISTORICAL_COPYABLE_DELAY_SECONDS,
+            "token_outcome_is_not_realised_wallet_pnl": True,
+            "winner_and_loser_controls_required": True,
+            "automatic_probation_admission": False,
+            "paper_mode": True, "actionable": False, "consensus_weight": 0,
+        },
+    }
+
+
+def run_historical_winner_miner(limit):
+    """Label bounded discovery tokens and attribute early, copyable calls."""
+    limit = min(max(int(limit), 1), HISTORICAL_MINER_MAX_TOKENS)
+    deadline = time.monotonic() + HISTORICAL_MINER_MAX_SECONDS
+    now = datetime.now(timezone.utc)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO historical_winner_runs (tokens_selected, details)
+                VALUES (0, %s) RETURNING id
+            """, (json.dumps({"requested_limit": limit}),))
+            run_id = cur.fetchone()[0]
+            cur.execute("""
+                SELECT source.token_address, MIN(source.discovered_at),
+                    MAX(hit.token_symbol), MAX(source.liquidity_usd),
+                    MAX(source.volume_h24_usd), COUNT(DISTINCT source.wallet),
+                    MAX(cohort.labelled_at)
+                FROM wallet_discovery_sources source
+                LEFT JOIN wallet_token_hits hit
+                    ON hit.wallet = source.wallet
+                    AND hit.token_address = source.token_address
+                LEFT JOIN discovery_token_cohorts cohort
+                    ON cohort.token_address = source.token_address
+                WHERE NOT COALESCE(
+                    (cohort.details::jsonb ->> 'manual_review')::boolean, FALSE
+                )
+                GROUP BY source.token_address
+                HAVING MIN(source.discovered_at) <= NOW() - (%s * INTERVAL '1 hour')
+                ORDER BY MAX(cohort.labelled_at) ASC NULLS FIRST,
+                    MIN(source.discovered_at) ASC
+                LIMIT %s
+            """, (HISTORICAL_MIN_TOKEN_AGE_HOURS, limit))
+            tokens = cur.fetchall()
+            cur.execute(
+                "UPDATE historical_winner_runs SET tokens_selected = %s WHERE id = %s",
+                (len(tokens), run_id),
+            )
+        conn.commit()
+
+    results = []
+    calls_recorded = 0
+    stop_reason = None
+    for token_address, discovered_at, token_symbol, source_liquidity, source_volume, source_wallets, _ in tokens:
+        if time.monotonic() >= deadline:
+            stop_reason = "deadline_guard"
+            break
+        if discovered_at.tzinfo is None:
+            discovered_at = discovered_at.replace(tzinfo=timezone.utc)
+        try:
+            response = birdeye_get("/defi/v3/ohlcv", {
+                "address": token_address, "type": "1H", "mode": "range",
+                "time_from": int(discovered_at.timestamp()),
+                "time_to": int(now.timestamp()), "currency": "usd",
+                "chart_type": "price", "padding": "false",
+            }, retry_429=False)
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            results.append({"token_address": token_address,
+                            "status": type(exc).__name__})
+            stop_reason = "provider_guard"
+            break
+        if response.status_code == 429:
+            results.append({"token_address": token_address, "status": 429})
+            stop_reason = "birdeye_429"
+            break
+        if response.status_code != 200:
+            results.append({"token_address": token_address,
+                            "status": response.status_code})
+            continue
+        try:
+            candles = parse_historical_candles(response.json())
+        except ValueError:
+            candles = []
+        if not candles:
+            results.append({"token_address": token_address,
+                            "status": "ohlcv_unavailable"})
+            continue
+        entry_price = candles[0]["open"] or candles[0]["close"]
+        peak_price = max(item["high"] for item in candles)
+        current_price = candles[-1]["close"]
+        if not entry_price or entry_price <= 0:
+            results.append({"token_address": token_address,
+                            "status": "entry_price_unavailable"})
+            continue
+        peak_return = round((peak_price / entry_price - 1) * 100, 2)
+        current_return = round((current_price / entry_price - 1) * 100, 2)
+        outcome_label = (
+            "WINNER" if peak_return >= HISTORICAL_WINNER_RETURN_PCT
+            else "LOSER" if current_return <= HISTORICAL_LOSER_RETURN_PCT
+            else "CONTROL"
+        )
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO discovery_token_cohorts (
+                        token_address, token_symbol, outcome_label,
+                        outcome_return_pct, outcome_horizon_hours, details
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (token_address) DO UPDATE SET
+                        token_symbol = COALESCE(EXCLUDED.token_symbol,
+                            discovery_token_cohorts.token_symbol),
+                        outcome_label = EXCLUDED.outcome_label,
+                        outcome_return_pct = EXCLUDED.outcome_return_pct,
+                        outcome_horizon_hours = EXCLUDED.outcome_horizon_hours,
+                        labelled_at = NOW(), details = EXCLUDED.details
+                """, (
+                    token_address, token_symbol, outcome_label, peak_return,
+                    max(int((now - discovered_at).total_seconds() / 3600), 1),
+                    json.dumps({
+                        "automated_historical_miner": True,
+                        "discovered_at": discovered_at.isoformat(),
+                        "entry_price_usd": entry_price,
+                        "peak_price_usd": peak_price,
+                        "current_price_usd": current_price,
+                        "current_return_pct": current_return,
+                        "candles": len(candles), "source_wallets": source_wallets,
+                        "token_outcome_is_not_realised_wallet_pnl": True,
+                    }),
+                ))
+                cur.execute("""
+                    SELECT wallet, observed_entry_rank,
+                        observed_entry_delay_seconds, liquidity_usd,
+                        volume_h24_usd
+                    FROM wallet_discovery_sources WHERE token_address = %s
+                """, (token_address,))
+                source_rows = cur.fetchall()
+                token_calls = 0
+                for wallet, entry_rank, delay_seconds, liquidity_usd, volume_h24_usd in source_rows:
+                    copyability, qualified = historical_copyability(
+                        entry_rank, delay_seconds, liquidity_usd, volume_h24_usd
+                    )
+                    call_result = (
+                        "SUCCESS" if qualified and outcome_label == "WINNER"
+                        else "FAILED" if qualified and outcome_label == "LOSER"
+                        else "CONTROL" if qualified else "EXCLUDED"
+                    )
+                    cur.execute("""
+                        INSERT INTO historical_wallet_calls (
+                            wallet, token_address, token_symbol, outcome_label,
+                            call_result, outcome_return_pct, current_return_pct,
+                            entry_price_usd, peak_price_usd, current_price_usd,
+                            entry_rank, entry_delay_seconds,
+                            discovery_liquidity_usd, copyability_score, details
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s)
+                        ON CONFLICT (wallet, token_address) DO UPDATE SET
+                            token_symbol = EXCLUDED.token_symbol,
+                            outcome_label = EXCLUDED.outcome_label,
+                            call_result = EXCLUDED.call_result,
+                            outcome_return_pct = EXCLUDED.outcome_return_pct,
+                            current_return_pct = EXCLUDED.current_return_pct,
+                            entry_price_usd = EXCLUDED.entry_price_usd,
+                            peak_price_usd = EXCLUDED.peak_price_usd,
+                            current_price_usd = EXCLUDED.current_price_usd,
+                            entry_rank = EXCLUDED.entry_rank,
+                            entry_delay_seconds = EXCLUDED.entry_delay_seconds,
+                            discovery_liquidity_usd = EXCLUDED.discovery_liquidity_usd,
+                            copyability_score = EXCLUDED.copyability_score,
+                            details = EXCLUDED.details, updated_at = NOW()
+                    """, (
+                        wallet, token_address, token_symbol, outcome_label,
+                        call_result, peak_return, current_return, entry_price,
+                        peak_price, current_price, entry_rank, delay_seconds,
+                        liquidity_usd, copyability,
+                        json.dumps({
+                            "qualified_early_entry": qualified,
+                            "consensus_weight": 0,
+                            "automatic_probation_admission": False,
+                        }),
+                    ))
+                    token_calls += 1
+                calls_recorded += token_calls
+            conn.commit()
+        results.append({
+            "token_address": token_address, "token_symbol": token_symbol,
+            "status": "completed", "outcome_label": outcome_label,
+            "peak_return_pct": peak_return, "current_return_pct": current_return,
+            "calls_recorded": token_calls,
+        })
+
+    status = (
+        "completed" if len(results) == len(tokens) and not stop_reason
+        else "bounded_stop" if stop_reason else "partial"
+    )
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE historical_winner_runs SET completed_at = NOW(),
+                    tokens_completed = %s, calls_recorded = %s,
+                    status = %s, stop_reason = %s, details = %s
+                WHERE id = %s
+            """, (
+                sum(1 for item in results if item.get("status") == "completed"),
+                calls_recorded, status, stop_reason,
+                json.dumps({"results": results}), run_id,
+            ))
+        conn.commit()
+    return {
+        "success": status == "completed", "run_id": run_id,
+        "status": status, "stop_reason": stop_reason,
+        "tokens_selected": len(tokens),
+        "tokens_completed": sum(
+            1 for item in results if item.get("status") == "completed"
+        ),
+        "calls_recorded": calls_recorded, "results": results,
+        "paper_mode": True, "actionable": False, "consensus_weight": 0,
+    }
+
+
+@app.post("/historical-winner-mining")
+def historical_winner_mining_endpoint():
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    initialise_database()
+    try:
+        limit = int(request.args.get("limit", HISTORICAL_MINER_MAX_TOKENS))
+    except ValueError:
+        return jsonify({"success": False, "error": "limit must be an integer"}), 400
+    result = run_historical_winner_miner(limit)
+    return jsonify({"version": VERSION, **result}), 200 if result["success"] else 207
+
+
+@app.get("/historical-wallet-leaderboard")
+def historical_wallet_leaderboard_endpoint():
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 250)
+    except ValueError:
+        limit = 100
+    return jsonify({
+        "success": True, "version": VERSION,
+        **load_historical_winner_leaderboard(limit),
+    })
 
 
 @app.get("/discovery-token-cohorts")
@@ -8439,6 +8872,7 @@ def build_dashboard_payload():
         "consensus_weight": 0,
     } for row in screened_wallet_rows]
     candidate_pipeline = load_dex_wallet_pipeline_status()
+    historical_winners = load_historical_winner_leaderboard(100)
     evm_early_buyers = load_evm_early_buyer_evidence(100)
     evm_paper_signals = load_evm_robinhood_paper_signals()
     return {
@@ -8448,6 +8882,7 @@ def build_dashboard_payload():
         "solana_activity": solana_activity, "snapshot_quality": snapshot_quality,
         "screened_wallets": screened_wallets,
         "candidate_pipeline": candidate_pipeline,
+        "historical_winners": historical_winners,
         "evm_early_buyers": evm_early_buyers,
         "evm_paper_signals": evm_paper_signals,
         "observation_wallets": candidate_pipeline.get("observation_wallets", []),
@@ -8490,6 +8925,12 @@ def build_dashboard_payload():
                 "observation_repeat_evidence", 0
             ),
             "dex_candidates": candidate_pipeline["counts"]["discovered"],
+            "historical_wallets_reviewed": historical_winners["counts"][
+                "wallets_reviewed"
+            ],
+            "historical_repeat_winners": historical_winners["counts"][
+                "repeat_winners"
+            ],
             "minimum_gates_passed": candidate_pipeline["counts"][
                 "minimum_gates_passed"
             ],
@@ -8518,7 +8959,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.17 · Cross-chain Wallet Evidence</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Solana discovery + Robinhood qualified-buyer paper signals + zero-weight evidence review</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.18 · Historical Winner Mining</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Winner/loser reverse discovery + forward wallet evidence + zero-weight paper review</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
@@ -8526,6 +8967,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="card"><span class="label">Robinhood paper signals</span><b id="evmPaperSignalCount">—</b><span class="muted">Qualified convergence · zero weight</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
     <div class="card"><span class="label">Dex candidates</span><b id="dexCandidateCount">—</b><span class="muted">Wide discovery cohort</span></div>
+    <div class="card"><span class="label">Historical wallets reviewed</span><b id="historicalWalletCount">—</b><span class="muted"><span id="repeatWinnerCount">—</span> repeat winners · zero weight</span></div>
     <div class="card"><span class="label">Passed screening</span><b id="screenedCount">—</b><span class="muted">Candidates · zero consensus weight</span></div>
     <div class="card"><span class="label">Observation pool</span><b id="observationCount">—</b><span class="muted">Forward tracked · zero weight</span></div>
     <div class="card"><span class="label">Minimum gates passed</span><b id="minimumGatesCount">—</b><span class="muted">Baseline eligibility only</span></div>
@@ -8539,6 +8981,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <section class="section"><div class="section-head"><div><h2>Robinhood early-purchaser wallets</h2><div class="muted">Pair-verified buyers are ranked across watchlist tokens; infrastructure and same-block sniper evidence is excluded, and every wallet remains zero weight</div></div><div class="links"><a href="/evm-early-buyers">Wallet evidence</a><a href="/evm-early-buyer-status">Scan status</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Early tokens</th><th>Top-25 tokens</th><th>Best rank</th><th>Average rank</th><th>Tokens</th><th>Filter result</th><th>Deep screening</th><th>Last observed</th></tr></thead><tbody id="evmEarlyBuyerBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana consensus windows</h2><div class="muted">Activity funnel across independent validated wallet clusters; probation activity cannot vote</div></div><div class="links"><a href="/solana-activity">Full diagnostics</a><a href="/dex-wallet-cohorts">Discovery cohorts</a><a href="/dex-wallet-discovery-history">Discovery runs</a><a href="/probation-wallet-activity">Probation activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Window</th><th>Events</th><th>Active wallets</th><th>Clusters</th><th>Tokens bought</th><th>2 buyers</th><th>3+ buyers</th><th>Missing symbols</th></tr></thead><tbody id="solWindowBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>DexScreener candidate processing pipeline</h2><div class="muted">Newly discovered wallets are prioritised through bounded scoring, screening and validation batches</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Pipeline JSON</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a><a href="/dex-wallet-cohorts">Discovery cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Discovered</th><th>Awaiting score</th><th>Scored</th><th>Performance ≥30</th><th>Screened</th><th>Low risk</th><th>Validated</th><th>Minimum gates</th><th>Recommended</th><th>In probation</th><th>Consensus validated</th></tr></thead><tbody id="pipelineBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Historical meme-coin winner wallets</h2><div class="muted">Ranks early, copyable calls across winner and loser controls; token outcomes are proxies and do not assume realised wallet profit</div></div><div class="links"><a href="/historical-wallet-leaderboard">Wallet evidence</a><a href="/discovery-token-cohorts">Token outcomes</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Evidence</th><th>Successful calls</th><th>10× calls</th><th>Failed calls</th><th>Hit rate</th><th>Average entry</th><th>Copyability</th><th>Best call</th><th>30d realised P&amp;L</th><th>Risk</th></tr></thead><tbody id="historicalWinnerBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana probation wallets</h2><div class="muted">Forward-only evidence is visible here but contributes zero buyer votes until manual validation</div></div><div class="links"><a href="/dex-wallet-cohorts">All cohorts</a><a href="/probation-wallet-activity">Probation activity</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Status</th><th>Admitted</th><th>Probation age</th><th>Performance</th><th>Risk</th><th>Early entries</th><th>Forward trades</th><th>Forward tokens</th><th>Last activity</th><th>Promotion review</th></tr></thead><tbody id="probationBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Recommended for probation</h2><div class="muted">Requires strong token validation, WATCH or ASYMMETRIC classification, and repeat or cross-token early-entry evidence</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Recommendation evidence</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Classification</th><th>Validation strength</th><th>Performance</th><th>Risk</th><th>Repeat early entries</th><th>Cross-token evidence</th><th>Early-entry score</th></tr></thead><tbody id="recommendedBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Wallets passing minimum probation gates</h2><div class="muted">Baseline performance, risk and trade-history gates only; this does not mean the wallet is recommended</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Gate details</a><a href="/dex-wallet-cohorts">All cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Performance</th><th>Risk</th><th>30-day realised P&amp;L</th><th>Trades</th><th>Validation</th><th>Strength</th><th>Classification</th><th>Repeat early entries</th><th>Early-entry score</th></tr></thead><tbody id="minimumGatesBody"><tr><td colspan="10" class="empty">Loading…</td></tr></tbody></table></div></section>
@@ -8555,12 +8998,13 @@ const age=s=>s==null?'unknown age':s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m`:s<
 const stateLabel=s=>({EVM_PROVIDER_UNAVAILABLE:'Provider unavailable',EVM_DATA_ANOMALY:'Data anomaly',EVM_BENCHMARK:'Market benchmark',EVM_CONFIRMED_BREAKOUT:'Confirmed breakout',EVM_CONFIRMED_BREAKDOWN:'Confirmed breakdown',EVM_ACCUMULATION_WATCH:'Accumulation watch',EVM_HIGH_MOMENTUM:'High momentum',EVM_MOMENTUM:'Momentum',EVM_DISTRIBUTION:'Distribution',EVM_THIN_LIQUIDITY:'Thin liquidity',EVM_REBOUND:'Rebound',EVM_RISK:'Risk',EVM_OBSERVE:'Observe'}[s]||s);
 const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_BENCHMARK'?'benchmark':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(stateLabel(s))}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
-document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('evmEarlyBuyerCount').textContent=d.summary.evm_early_buyer_wallets;document.getElementById('evmCrossTokenCount').textContent=d.summary.evm_cross_token_early_buyers;document.getElementById('evmPaperSignalCount').textContent=d.summary.evm_active_paper_signals;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('observationCount').textContent=d.summary.observation_pool;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
+document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('evmEarlyBuyerCount').textContent=d.summary.evm_early_buyer_wallets;document.getElementById('evmCrossTokenCount').textContent=d.summary.evm_cross_token_early_buyers;document.getElementById('evmPaperSignalCount').textContent=d.summary.evm_active_paper_signals;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('historicalWalletCount').textContent=d.summary.historical_wallets_reviewed;document.getElementById('repeatWinnerCount').textContent=d.summary.historical_repeat_winners;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('observationCount').textContent=d.summary.observation_pool;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
 document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td><div>${num(x.holder_count)}</div><div class="address">${age(x.holder_data_age_seconds)} old</div></td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${trend(x.trends['24h'].relative_to_eth_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="13" class="empty">No EVM snapshots yet.</td></tr>';
 const evmBuyers=d.evm_early_buyers?.wallets||[];document.getElementById('evmEarlyBuyerBody').innerHTML=evmBuyers.length?evmBuyers.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/address/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,8))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">observation only · zero consensus weight</div></a></td><td>${num(x.early_tokens)}</td><td>${num(x.top_25_tokens)}</td><td>${num(x.best_entry_rank)}</td><td>${num(x.average_entry_rank)}</td><td>${esc(x.token_symbols||'—')}</td><td>${x.filter_result==='CROSS-TOKEN REVIEW'?'<span class="badge accumulation">CROSS-TOKEN REVIEW</span>':'<span class="badge expired">COLLECTING</span>'}</td><td>${esc(x.screening_status)}</td><td>${when(x.last_observed_at)}</td></tr>`).join(''):'<tr><td colspan="9" class="empty">No pair-verified Robinhood early buyers retained yet. The bounded backfill is ready to run.</td></tr>';
 const evmPaperSignals=d.evm_paper_signals?.signals||[];document.getElementById('evmPaperSignalBody').innerHTML=evmPaperSignals.length?evmPaperSignals.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/token/${esc(x.token_address)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.token_symbol||'Unknown')}<span class="external">↗</span></div><div class="address">${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a></td><td><span class="badge accumulation">${esc(x.result)}</span></td><td><div class="token">${num(x.qualified_buyers)}</div><div class="address">${num(x.independent_purchase_blocks)} purchase blocks</div></td><td><div>${num(x.successful_history_tokens)} token outcomes</div><div class="address">target excluded</div></td><td>${num(x.best_entry_rank)}</td><td>${money(x.liquidity_usd)}</td><td>${money(x.volume_h1_usd)}</td><td><span class="badge provider">${esc(x.safety_status)}</span></td><td><div>${when(x.last_qualified_purchase_at)}</div><div class="address">${age(x.pair_age_seconds)} pair age</div></td></tr>`).join(''):'<tr><td colspan="9" class="empty">No active Robinhood paper signal currently meets all buyer-history, independence, freshness, and market-quality gates.</td></tr>';
 const windows=d.solana_activity?.windows||{};document.getElementById('solWindowBody').innerHTML=['1h','6h','24h'].map(w=>{const x=windows[w]||{};return `<tr><td><div class="token">${w}</div></td><td>${num(x.events)}</td><td>${num(x.active_wallets)}</td><td>${num(x.independent_clusters)}</td><td>${num(x.unique_tokens_bought)}</td><td>${num(x.tokens_with_2_buyers)}</td><td>${num(x.tokens_with_3_plus_buyers)}</td><td>${num(x.missing_symbols)}</td></tr>`}).join('');
 const pc=d.candidate_pipeline?.counts||{};document.getElementById('pipelineBody').innerHTML=`<tr><td>${num(pc.discovered)}</td><td>${num(pc.awaiting_score)}</td><td>${num(pc.scored)}</td><td>${num(pc.performance_pass)}</td><td>${num(pc.screened)}</td><td>${num(pc.low_risk)}</td><td>${num(pc.validated)}</td><td>${num(pc.minimum_gates_passed)}</td><td>${num(pc.recommended_for_probation)}</td><td>${num(pc.probation)}</td><td>${num(pc.consensus_validated)}</td></tr>`;
+const historical=d.historical_winners?.wallets||[];document.getElementById('historicalWinnerBody').innerHTML=historical.length?historical.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">historical proxy · zero consensus weight</div></a></td><td><span class="badge ${x.successful_calls>=2?'accumulation':x.successful_calls===1?'observe':'expired'}">${esc(x.evidence_status)}</span></td><td>${num(x.successful_calls)}</td><td>${num(x.ten_x_calls)}</td><td>${num(x.failed_calls)}</td><td>${x.hit_rate_pct==null?'—':`${num(x.hit_rate_pct)}%`}</td><td>${x.average_entry_rank==null?'—':`#${num(x.average_entry_rank)}`}</td><td>${x.copyability_score==null?'—':num(x.copyability_score)}</td><td>${x.best_call_return_pct==null?'—':trend(x.best_call_return_pct)}</td><td>${money(x.realized_pnl_30d)}</td><td>${x.screening_risk_score==null?'<span class="neutral">not screened</span>':num(x.screening_risk_score)}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No historical wallet calls have been labelled yet. The bounded winner/loser miner is ready to run.</td></tr>';
 const screened=d.screened_wallets||[];document.getElementById('screenedWalletBody').innerHTML=screened.length?screened.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">provisional pass · zero consensus weight</div></a></td><td><span class="badge ${x.source==='DEX DISCOVERY'?'accumulation':'observe'}">${esc(x.source)}</span></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${money(x.realized_pnl_30d)}</td><td>${num(x.trades_30d)}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">No wallets have passed both initial performance and risk screening yet.</td></tr>';
 const observed=d.observation_wallets||[];document.getElementById('observationBody').innerHTML=observed.length?observed.map(x=>{const o=x.forward_outcomes?.['24h'];return `<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">observation only · zero consensus weight</div></a></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${num(x.forward_buys)}</td><td>${num(x.forward_tokens)}</td><td>${num(x.early_forward_tokens)}</td><td>${o?`${trend(o.average_return_pct)}<div class="address">${num(o.samples)} samples</div>`:'<span class="neutral">collecting</span>'}</td><td>${x.independent_repeat_evidence?'<span class="badge accumulation">QUALIFYING</span>':'<span class="badge expired">COLLECTING</span>'}</td><td>${when(x.last_forward_entry_at)}</td></tr>`}).join(''):'<tr><td colspan="9" class="empty">Observation wallets are being enrolled after performance screening.</td></tr>';
 const minimum=d.candidate_pipeline?.minimum_gates_passed_wallets||[];document.getElementById('minimumGatesBody').innerHTML=minimum.length?minimum.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">baseline gates · zero consensus weight</div></a></td><td>${num(x.performance_score)}</td><td>${num(x.screening_risk_score)}</td><td>${money(x.realized_pnl_30d)}</td><td>${num(x.trades_30d)}</td><td>${esc(x.validation_status||'unvalidated')}</td><td>${esc(x.validation_strength||'none')}</td><td>${esc(x.classification||'REJECT')}</td><td>${num(x.repeat_early_entries)}</td><td>${num(x.average_early_entry_score)}</td></tr>`).join(''):'<tr><td colspan="10" class="empty">No newly discovered wallets currently pass all minimum probation gates.</td></tr>';
