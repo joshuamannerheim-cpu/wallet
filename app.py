@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.21.1-evm-outbound-priority"
+VERSION = "4.21.2-blockscout-request-compatibility"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -5889,7 +5889,11 @@ def run_evm_outbound_discovery(limit=None):
         try:
             response = upstream_request(
                 "GET", f"{ROBINHOOD_BLOCKSCOUT_URL}/addresses/{wallet}/token-transfers",
-                params={"type": "ERC-20"}, timeout=EVM_PROVIDER_TIMEOUT_SECONDS,
+                headers={
+                    "accept": "application/json",
+                    "user-agent": "WalletMonitor/4.21 (+https://wallet-api.sbzero.com)",
+                },
+                timeout=EVM_PROVIDER_TIMEOUT_SECONDS,
                 retries=0, provider="robinhood_blockscout",
             )
             if response.status_code == 429:
@@ -6035,6 +6039,9 @@ def run_evm_outbound_discovery(limit=None):
                 wallet, "blocked", "degraded", error,
                 wallet_examined, wallet_purchases, source,
             )
+            if "403" in error:
+                stop_reason = "provider_access_denied"
+                break
             if "429" in error or "timeout" in error.lower():
                 stop_reason = "provider_guard"
                 break
