@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.19.0-robinhood-signal-funnel"
+VERSION = "4.19.1-punch-watchlist"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -217,7 +217,7 @@ DEFAULT_TOKEN_WATCHLIST = (
     ("robinhood", "0xa9eFe2Fc94dE79734C03051515F48f254Ce61e18", "DOGGIE", "Doggie Mode", "research_watchlist", "evm_monitoring_ready"),
     ("robinhood", "0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc", "ROBINCAT", "RobinCat", "research_watchlist", "evm_monitoring_ready"),
     ("robinhood", "0xF6589F11Bc40b669e584073F428B05562F568733", "SNAP", "Snap Inc. Tokenized Stock", "research_watchlist", "evm_monitoring_ready"),
-    ("robinhood", "0xcaCB0e9caCcee63ec4d82952E561a291c68Bcb68", "GG", "Golden Goose", "research_watchlist", "evm_monitoring_ready"),
+    ("robinhood", "0xea87D1D2BCa64DB00a089bFe24FE0d9Bd234Bdf4", "PUNCH", "Punch", "research_watchlist", "evm_monitoring_ready"),
 )
 BASE58_ALPHABET = (
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -938,13 +938,13 @@ def initialise_database():
                     )
             """)
 
-            # V4.18.1 makes the configured ten-token list authoritative for
+            # V4.19.1 makes the configured ten-token list authoritative for
             # active monitoring. Historical snapshots, signals, transitions,
             # and early-purchaser evidence for removed tokens are preserved.
             cur.execute("""
                 UPDATE token_watchlist
                 SET active = FALSE,
-                    monitoring_status = 'removed_from_watchlist_v4_18_1',
+                    monitoring_status = 'removed_from_watchlist_v4_19_1',
                     updated_at = NOW()
                 WHERE active = TRUE
                     AND NOT (
@@ -960,7 +960,7 @@ def initialise_database():
                             LOWER('0xa9eFe2Fc94dE79734C03051515F48f254Ce61e18'),
                             LOWER('0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc'),
                             LOWER('0xF6589F11Bc40b669e584073F428B05562F568733'),
-                            LOWER('0xcaCB0e9caCcee63ec4d82952E561a291c68Bcb68'),
+                            LOWER('0xea87D1D2BCa64DB00a089bFe24FE0d9Bd234Bdf4'),
                             LOWER('0x298348d5b2e45C774E3ee4f1a0924071DfbDC8C7')
                         ))
                     )
@@ -9071,7 +9071,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.19 · Robinhood Signal Funnel</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Scheduled Robinhood discovery + visible near misses + evidence-qualified paper signals</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.19.1 · PUNCH Watchlist</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Scheduled Robinhood discovery + visible near misses + evidence-qualified paper signals</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
