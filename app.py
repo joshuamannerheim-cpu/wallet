@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.21.0-evm-outbound-discovery"
+VERSION = "4.21.1-evm-outbound-priority"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -9945,20 +9945,9 @@ def run_evm_refresh_once():
             "error": type(exc).__name__,
         }
     try:
-        # Rotate through the least-recently-scanned Robinhood token each run.
-        # This continuously feeds the paper-signal funnel without allowing the
-        # bounded archive reconstruction to dominate the market refresh.
-        early_buyer_discovery = run_evm_early_buyer_discovery(
-            limit=EVM_EARLY_BUYER_CRON_TOKENS
-        )
-    except Exception as exc:
-        early_buyer_discovery = {
-            "success": False, "tokens_selected": 0, "tokens_completed": 0,
-            "wallets_observed": 0, "error": type(exc).__name__,
-        }
-    try:
         # Scan only a couple of least-recently-checked, successful-history
-        # early buyers per cron. Wallet state prevents repeated provider work.
+        # early buyers per cron. Run this before the heavier archive scan so
+        # current off-watchlist evidence cannot be starved by reconstruction.
         outbound_discovery = run_evm_outbound_discovery(
             limit=EVM_OUTBOUND_CRON_WALLETS
         )
@@ -9966,6 +9955,18 @@ def run_evm_refresh_once():
         outbound_discovery = {
             "success": False, "wallets_selected": 0, "wallets_completed": 0,
             "purchases_verified": 0, "error": type(exc).__name__,
+        }
+    try:
+        # Rotate through the least-recently-scanned Robinhood token each run.
+        # This continuously feeds the paper-signal funnel after the current
+        # outbound-discovery stage has safely completed.
+        early_buyer_discovery = run_evm_early_buyer_discovery(
+            limit=EVM_EARLY_BUYER_CRON_TOKENS
+        )
+    except Exception as exc:
+        early_buyer_discovery = {
+            "success": False, "tokens_selected": 0, "tokens_completed": 0,
+            "wallets_observed": 0, "error": type(exc).__name__,
         }
     print(json.dumps({
         "success": cron_success, "refresh_complete": result["success"],
