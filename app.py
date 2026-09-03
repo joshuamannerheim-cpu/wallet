@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.21.3-rpc-outbound-fallback"
+VERSION = "4.21.4-rpc-block-time-fix"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -6005,7 +6005,7 @@ def run_evm_outbound_discovery(limit=None):
                     (datetime.now(timezone.utc) - pair_created_at).total_seconds(), 0
                 )
                 if (pair_age_seconds > EVM_OUTBOUND_MAX_PAIR_AGE_DAYS * 86400
-                        or occurred_at < pair_created_at):
+                        or (occurred_at is not None and occurred_at < pair_created_at)):
                     continue
                 if receipts_examined >= EVM_OUTBOUND_MAX_RECEIPTS:
                     stop_reason = "receipt_guard"
@@ -6034,7 +6034,8 @@ def run_evm_outbound_discovery(limit=None):
                             if block_timestamp is not None else None
                         )
                     occurred_at = block_time_cache.get(block_number)
-                    if occurred_at is None or occurred_at < cutoff:
+                    if (occurred_at is None or occurred_at < cutoff
+                            or occurred_at < pair_created_at):
                         continue
                 liquidity = safe_float((pair.get("liquidity") or {}).get("usd")) or 0.0
                 volume_h1 = safe_float((pair.get("volume") or {}).get("h1")) or 0.0
