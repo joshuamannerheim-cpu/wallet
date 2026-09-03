@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.19.1-punch-watchlist"
+VERSION = "4.20.0-bsc-watchlist"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -137,6 +137,13 @@ EVM_CHAIN_CONFIG = {
         "blockscout_url": "https://base.blockscout.com/api/v2",
         "explorer_url": "https://base.blockscout.com/token/{address}",
     },
+    "bsc": {
+        "chain_id": 56,
+        "label": "BNB Smart Chain",
+        "dex_chain_ids": {"bsc", "56"},
+        "blockscout_url": None,
+        "explorer_url": "https://bscscan.com/token/{address}",
+    },
 }
 SUPPORTED_EVM_CHAINS = tuple(EVM_CHAIN_CONFIG)
 EVM_REFRESH_MAX_SECONDS = min(
@@ -210,7 +217,7 @@ HARD_RELATIONSHIP_STRENGTHS = {"high", "moderate"}
 DEFAULT_TOKEN_WATCHLIST = (
     ("base", "0x4200000000000000000000000000000000000006", "ETH", "Ether / WETH", "benchmark", "evm_monitoring_ready"),
     ("robinhood", "0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1", "IF", "What IF", "portfolio", "evm_monitoring_ready"),
-    ("robinhood", "0x298348d5b2e45C774E3ee4f1a0924071DfbDC8C7", "SWAPPY", "Swappy", "research_test_case", "evm_monitoring_ready"),
+    ("bsc", "0x3EFBfFf95576e1d23cF6Ead0AcD2E73F4d6A7777", "BNBCAT", "Binance Cat", "research_watchlist", "evm_monitoring_ready"),
     ("base", "0xA4A2E2ca3fBfE21aed83471D28b6f65A233C6e00", "TIBBIR", "Ribbita by Virtuals", "research_test_case", "evm_monitoring_ready"),
     ("robinhood", "0x5f62c57e5c537887117eef828b7e3ad41c009feb", "GOOD", "Good In The Hood", "research_watchlist", "evm_monitoring_ready"),
     ("robinhood", "0xD2a577E92438Fd0c1F2485f4FB91B9F866EB1E6C", "PEPONS", "Pepons", "research_watchlist", "evm_monitoring_ready"),
@@ -938,19 +945,24 @@ def initialise_database():
                     )
             """)
 
-            # V4.19.1 makes the configured ten-token list authoritative for
-            # active monitoring. Historical snapshots, signals, transitions,
-            # and early-purchaser evidence for removed tokens are preserved.
+            # V4.20 makes the configured ten-token list authoritative across
+            # Robinhood Chain, Base and BNB Smart Chain. Historical snapshots,
+            # signals, transitions and early-purchaser evidence for removed
+            # tokens are preserved.
             cur.execute("""
                 UPDATE token_watchlist
                 SET active = FALSE,
-                    monitoring_status = 'removed_from_watchlist_v4_19_1',
+                    monitoring_status = 'removed_from_watchlist_v4_20',
                     updated_at = NOW()
                 WHERE active = TRUE
                     AND NOT (
                         (chain = 'base' AND LOWER(token_address) IN (
                             LOWER('0x4200000000000000000000000000000000000006'),
                             LOWER('0xA4A2E2ca3fBfE21aed83471D28b6f65A233C6e00')
+                        ))
+                        OR
+                        (chain = 'bsc' AND LOWER(token_address) IN (
+                            LOWER('0x3EFBfFf95576e1d23cF6Ead0AcD2E73F4d6A7777')
                         ))
                         OR
                         (chain = 'robinhood' AND LOWER(token_address) IN (
@@ -960,8 +972,7 @@ def initialise_database():
                             LOWER('0xa9eFe2Fc94dE79734C03051515F48f254Ce61e18'),
                             LOWER('0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc'),
                             LOWER('0xF6589F11Bc40b669e584073F428B05562F568733'),
-                            LOWER('0xea87D1D2BCa64DB00a089bFe24FE0d9Bd234Bdf4'),
-                            LOWER('0x298348d5b2e45C774E3ee4f1a0924071DfbDC8C7')
+                            LOWER('0xea87D1D2BCa64DB00a089bFe24FE0d9Bd234Bdf4')
                         ))
                     )
             """)
@@ -5731,23 +5742,35 @@ def fetch_evm_token_snapshot(token):
     except (requests.RequestException, ValueError, TypeError) as exc:
         snapshot["provider_errors"].append(f"dexscreener_{type(exc).__name__}")
 
-    try:
-        response = upstream_request(
-            "GET", f"{config['blockscout_url']}/tokens/{address}",
-            timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=0,
-            provider="blockscout",
-        )
-        if response.status_code == 200:
-            payload = response.json()
-            holder_count = safe_int(payload.get("holders_count")) if isinstance(payload, dict) else None
-            snapshot["holder_count"] = holder_count
-            holders_ok = holder_count is not None
-            if not holders_ok:
-                snapshot["provider_errors"].append("blockscout_holder_count_missing")
-        else:
-            snapshot["provider_errors"].append(f"blockscout_http_{response.status_code}")
-    except (requests.RequestException, ValueError, TypeError) as exc:
-        snapshot["provider_errors"].append(f"blockscout_{type(exc).__name__}")
+    if config.get("blockscout_url"):
+        try:
+            response = upstream_request(
+                "GET", f"{config['blockscout_url']}/tokens/{address}",
+                timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=0,
+                provider="blockscout",
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                holder_count = (
+                    safe_int(payload.get("holders_count"))
+                    if isinstance(payload, dict) else None
+                )
+                snapshot["holder_count"] = holder_count
+                holders_ok = holder_count is not None
+                if not holders_ok:
+                    snapshot["provider_errors"].append(
+                        "blockscout_holder_count_missing"
+                    )
+            else:
+                snapshot["provider_errors"].append(
+                    f"blockscout_http_{response.status_code}"
+                )
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            snapshot["provider_errors"].append(
+                f"blockscout_{type(exc).__name__}"
+            )
+    else:
+        snapshot["provider_errors"].append(f"{chain}_holder_provider_unavailable")
 
     snapshot["data_quality"] = (
         "complete" if market_ok and holders_ok
@@ -6605,7 +6628,7 @@ def refresh_evm_watchlist(limit=10, offset=0):
                 SELECT w.chain, w.token_address, w.token_symbol, w.token_name,
                     w.canonical_pair_address, w.canonical_pair_dex_id, w.source
                 FROM token_watchlist w
-                WHERE w.active = TRUE AND w.chain IN ('robinhood', 'base')
+                WHERE w.active = TRUE AND w.chain IN ('robinhood', 'base', 'bsc')
                     AND w.token_address LIKE '0x%%'
                 ORDER BY (
                     SELECT MAX(snapshot.captured_at)
@@ -7555,7 +7578,7 @@ def watchlist_endpoint():
         })
     return jsonify({
         "success": True, "count": len(items), "tokens": items,
-        "note": "V4.12 retains the expanded watchlist and adds evidence calibration, holder freshness and ETH-relative performance.",
+        "note": "V4.20 monitors Robinhood Chain, Base and BNB Smart Chain; BSC market data is available while holder counts remain unavailable.",
         "paper_mode": True, "actionable": False,
     })
 
@@ -7938,7 +7961,7 @@ def evm_status_endpoint():
             row = cur.fetchone()
             cur.execute("""
                 SELECT chain, COUNT(*) FROM token_watchlist
-                WHERE active = TRUE AND chain IN ('robinhood', 'base')
+                WHERE active = TRUE AND chain IN ('robinhood', 'base', 'bsc')
                     AND token_address LIKE '0x%%'
                 GROUP BY chain
             """)
@@ -7965,7 +7988,10 @@ def evm_status_endpoint():
         },
         "tracked_contracts": tracked_contracts,
         "signal_counts": counts, "latest_refresh": latest_run,
-        "providers": {"market": "DexScreener", "holders": "Blockscout"},
+        "providers": {
+            "market": "DexScreener",
+            "holders": "Blockscout on supported chains; unavailable on BSC",
+        },
         "paper_mode": True, "actionable": False,
     })
 
@@ -9071,9 +9097,9 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.19.1 · PUNCH Watchlist</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Scheduled Robinhood discovery + visible near misses + evidence-qualified paper signals</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.20 · BNB Chain Watchlist</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Robinhood, Base and BNB Chain market evidence + scheduled wallet discovery</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
-    <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
+    <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood + Base + BNB Chain</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">EVM early buyers</span><b id="evmEarlyBuyerCount">—</b><span class="muted"><span id="evmCrossTokenCount">—</span> cross-token · zero weight</span></div>
     <div class="card"><span class="label">Robinhood paper signals</span><b id="evmPaperSignalCount">—</b><span class="muted">Qualified convergence · zero weight</span></div>
@@ -9088,7 +9114,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="card"><span class="label">Probation wallets</span><b id="probationCount">—</b><span class="muted">Visible · zero consensus weight</span></div>
     <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
   </section>
-  <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair evidence; holder freshness and performance relative to ETH are explicit</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="13" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair market evidence across three chains; BSC holder counts remain explicitly unavailable</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="13" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Active Solana paper signals</h2><div class="muted">Buyer labels count independent wallet clusters—not transactions</div></div><div class="links"><a href="/signals?include_expired=false">Active JSON</a><a href="/signals?include_expired=true">History</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Last activity</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Active Robinhood paper signals</h2><div class="muted">Requires 2+ distinct qualified early buyers in different blocks, successful prior token outcomes, and current market-quality gates; paper-only and zero weight</div></div><div class="links"><a href="/evm-paper-signals">Signal evidence</a><a href="/evm-early-buyers">Buyer history</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Qualified buyers</th><th>Successful history</th><th>Best entry rank</th><th>Liquidity</th><th>1h volume</th><th>Safety</th><th>Last qualified buy</th></tr></thead><tbody id="evmPaperSignalBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Robinhood paper-signal candidates</h2><div class="muted">Wider funnel showing early-buyer evidence before every strict confirmation gate is met</div></div><div class="links"><a href="/evm-paper-signals">Full funnel JSON</a><a href="/evm-early-buyer-status">Scan status</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Stage</th><th>Observed buyers</th><th>Qualified buyers</th><th>Purchase blocks</th><th>Gates remaining</th><th>Liquidity</th><th>1h volume</th><th>Pair age</th></tr></thead><tbody id="evmPaperCandidateBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
