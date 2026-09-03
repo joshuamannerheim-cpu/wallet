@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.21.2-blockscout-request-compatibility"
+VERSION = "4.21.3-rpc-outbound-fallback"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -140,6 +140,7 @@ EVM_OUTBOUND_MAX_SECONDS = min(
     max(int(os.getenv("EVM_OUTBOUND_MAX_SECONDS", "70")), 20), 85
 )
 EVM_OUTBOUND_MAX_PAIR_AGE_DAYS = 14
+EVM_OUTBOUND_RPC_LOG_CHUNK = 100000
 ERC20_TRANSFER_TOPIC = (
     "0xddf252ad1be2c89b69c2b068fc378daa"
     "952ba7f163c4a11628f55a4df523b3ef"
@@ -5879,6 +5880,9 @@ def run_evm_outbound_discovery(limit=None):
     errors = []
     stop_reason = None
     pair_cache = {}
+    block_time_cache = {}
+    rpc_block_range = None
+    blockscout_access_denied = False
     seen_candidates = set()
     for source in sources:
         if time.monotonic() >= deadline:
@@ -5887,27 +5891,71 @@ def run_evm_outbound_discovery(limit=None):
         wallet = source["wallet"]
         wallet_examined = wallet_purchases = 0
         try:
-            response = upstream_request(
-                "GET", f"{ROBINHOOD_BLOCKSCOUT_URL}/addresses/{wallet}/token-transfers",
-                headers={
-                    "accept": "application/json",
-                    "user-agent": "WalletMonitor/4.21 (+https://wallet-api.sbzero.com)",
-                },
-                timeout=EVM_PROVIDER_TIMEOUT_SECONDS,
-                retries=0, provider="robinhood_blockscout",
-            )
-            if response.status_code == 429:
-                stop_reason = "blockscout_429"
-                _save_evm_outbound_wallet_state(
-                    wallet, "blocked", "rate_limited", "blockscout_http_429",
-                    0, 0, source,
+            transfers = []
+            provider_mode = "blockscout"
+            if not blockscout_access_denied:
+                response = upstream_request(
+                    "GET", f"{ROBINHOOD_BLOCKSCOUT_URL}/addresses/{wallet}/token-transfers",
+                    headers={
+                        "accept": "application/json",
+                        "user-agent": "WalletMonitor/4.21 (+https://wallet-api.sbzero.com)",
+                    },
+                    timeout=EVM_PROVIDER_TIMEOUT_SECONDS,
+                    retries=0, provider="robinhood_blockscout",
                 )
-                break
-            if response.status_code != 200:
-                raise RuntimeError(f"blockscout_http_{response.status_code}")
-            payload = response.json()
-            transfers = payload.get("items") if isinstance(payload, dict) else []
-            transfers = transfers if isinstance(transfers, list) else []
+                if response.status_code == 429:
+                    stop_reason = "blockscout_429"
+                    _save_evm_outbound_wallet_state(
+                        wallet, "blocked", "rate_limited", "blockscout_http_429",
+                        0, 0, source,
+                    )
+                    break
+                if response.status_code == 403:
+                    blockscout_access_denied = True
+                elif response.status_code != 200:
+                    raise RuntimeError(f"blockscout_http_{response.status_code}")
+                else:
+                    payload = response.json()
+                    transfers = payload.get("items") if isinstance(payload, dict) else []
+                    transfers = transfers if isinstance(transfers, list) else []
+
+            if blockscout_access_denied:
+                provider_mode = "official_rpc_fallback"
+                if rpc_block_range is None:
+                    rpc_block_range = robinhood_block_at_or_after(cutoff.timestamp())
+                start_block, latest_block = rpc_block_range
+                cursor = start_block
+                recipient_topic = "0x" + ("0" * 24) + wallet.lower()[2:]
+                rpc_logs = []
+                while cursor <= latest_block and time.monotonic() < deadline:
+                    chunk_end = min(
+                        cursor + EVM_OUTBOUND_RPC_LOG_CHUNK - 1, latest_block
+                    )
+                    logs = robinhood_rpc("eth_getLogs", [{
+                        "fromBlock": hex(cursor), "toBlock": hex(chunk_end),
+                        "topics": [ERC20_TRANSFER_TOPIC, None, recipient_topic],
+                    }])
+                    if not isinstance(logs, list):
+                        raise RuntimeError("robinhood_rpc_logs_invalid")
+                    rpc_logs.extend(log for log in logs if isinstance(log, dict))
+                    cursor = chunk_end + 1
+                if cursor <= latest_block:
+                    stop_reason = "deadline_guard"
+                for log in sorted(rpc_logs, key=lambda item: (
+                    rpc_hex_int(item.get("blockNumber")) or 0,
+                    rpc_hex_int(item.get("transactionIndex")) or 0,
+                    rpc_hex_int(item.get("logIndex")) or 0,
+                ), reverse=True):
+                    topics = log.get("topics") or []
+                    transfers.append({
+                        "timestamp": None,
+                        "to": {"hash": wallet},
+                        "from": {"hash": topic_address(topics[1]) if len(topics) > 1 else None},
+                        "token": {"address_hash": log.get("address"), "symbol": None,
+                                  "type": "ERC-20"},
+                        "transaction_hash": log.get("transactionHash"),
+                        "block_number": rpc_hex_int(log.get("blockNumber")),
+                    })
             for transfer in transfers[:EVM_OUTBOUND_MAX_TRANSFERS_PER_WALLET]:
                 if time.monotonic() >= deadline:
                     stop_reason = "deadline_guard"
@@ -5917,7 +5965,7 @@ def run_evm_outbound_discovery(limit=None):
                 wallet_examined += 1
                 transfers_examined += 1
                 occurred_at = parse_iso_timestamp(transfer.get("timestamp"))
-                if not occurred_at or occurred_at < cutoff:
+                if occurred_at and occurred_at < cutoff:
                     continue
                 to_address = str((transfer.get("to") or {}).get("hash") or "").lower()
                 from_address = str((transfer.get("from") or {}).get("hash") or "").lower()
@@ -5951,6 +5999,8 @@ def run_evm_outbound_discovery(limit=None):
                 if not pair_result:
                     continue
                 pair, pair_created_at = pair_result
+                if not token_symbol:
+                    token_symbol = str((pair.get("baseToken") or {}).get("symbol") or "").strip()
                 pair_age_seconds = max(
                     (datetime.now(timezone.utc) - pair_created_at).total_seconds(), 0
                 )
@@ -5969,6 +6019,23 @@ def run_evm_outbound_discovery(limit=None):
                 if (not receipt_uses_pair(receipt, pair_address)
                         or receipt_token_delta(receipt, token_address, wallet) <= 0):
                     continue
+                if occurred_at is None:
+                    block_number = safe_int(transfer.get("block_number"))
+                    if block_number is None:
+                        continue
+                    if block_number not in block_time_cache:
+                        block = robinhood_rpc("eth_getBlockByNumber", [hex(block_number), False])
+                        block_timestamp = (
+                            rpc_hex_int(block.get("timestamp"))
+                            if isinstance(block, dict) else None
+                        )
+                        block_time_cache[block_number] = (
+                            datetime.fromtimestamp(block_timestamp, tz=timezone.utc)
+                            if block_timestamp is not None else None
+                        )
+                    occurred_at = block_time_cache.get(block_number)
+                    if occurred_at is None or occurred_at < cutoff:
+                        continue
                 liquidity = safe_float((pair.get("liquidity") or {}).get("usd")) or 0.0
                 volume_h1 = safe_float((pair.get("volume") or {}).get("h1")) or 0.0
                 h1 = (pair.get("txns") or {}).get("h1") or {}
@@ -6023,7 +6090,7 @@ def run_evm_outbound_discovery(limit=None):
                 wallet_purchases += 1
                 purchases_verified += 1
                 token_addresses.add(token_address)
-            provider_status = "healthy" if not stop_reason else "bounded"
+            provider_status = provider_mode if not stop_reason else "bounded"
             scan_status = "completed" if not stop_reason else "bounded_stop"
             _save_evm_outbound_wallet_state(
                 wallet, scan_status, provider_status, None,
@@ -6041,6 +6108,9 @@ def run_evm_outbound_discovery(limit=None):
             )
             if "403" in error:
                 stop_reason = "provider_access_denied"
+                break
+            if "robinhood_rpc" in error:
+                stop_reason = "rpc_provider_guard"
                 break
             if "429" in error or "timeout" in error.lower():
                 stop_reason = "provider_guard"
