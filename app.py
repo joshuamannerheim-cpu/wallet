@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.18.1-curated-evm-watchlist"
+VERSION = "4.19.0-robinhood-signal-funnel"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -93,6 +93,9 @@ ROBINHOOD_RPC_URL = os.getenv(
 ).rstrip("/")
 EVM_EARLY_BUYER_MAX_TOKENS = min(
     max(int(os.getenv("EVM_EARLY_BUYER_MAX_TOKENS", "2")), 1), 4
+)
+EVM_EARLY_BUYER_CRON_TOKENS = min(
+    max(int(os.getenv("EVM_EARLY_BUYER_CRON_TOKENS", "1")), 1), 2
 )
 EVM_EARLY_BUYER_LIMIT = min(
     max(int(os.getenv("EVM_EARLY_BUYER_LIMIT", "250")), 25), 250
@@ -1740,8 +1743,10 @@ def diagnostics():
                     },
                     "evm_early_buyer_discovery": {
                         "enabled": True,
+                        "scheduled_with_evm_refresh": True,
                         "provider_configured": bool(ROBINHOOD_RPC_URL),
                         "maximum_tokens_per_run": EVM_EARLY_BUYER_MAX_TOKENS,
+                        "scheduled_tokens_per_run": EVM_EARLY_BUYER_CRON_TOKENS,
                         "wallet_limit_per_token": EVM_EARLY_BUYER_LIMIT,
                         "receipt_limit_per_token": EVM_EARLY_BUYER_MAX_RECEIPTS,
                         "log_block_limit": EVM_EARLY_BUYER_LOG_BLOCKS,
@@ -5444,7 +5449,11 @@ def load_evm_robinhood_paper_signals():
 
     now = datetime.now(timezone.utc)
     signals = []
-    collecting_tokens = 0
+    candidates = []
+    funnel_counts = {
+        "pair_age": 0, "market_quality": 0, "buyer_history": 0,
+        "buyer_convergence": 0, "same_block": 0,
+    }
     for token_address, token_entries in token_observations.items():
         representative = token_entries[0]
         pair_created_at = representative["pair_created_at"]
@@ -5454,27 +5463,17 @@ def load_evm_robinhood_paper_signals():
             max((now - pair_created_at).total_seconds(), 0)
             if pair_created_at else None
         )
-        if pair_age_seconds is None or pair_age_seconds > (
-            EVM_PAPER_SIGNAL_MAX_PAIR_AGE_DAYS * 86400
-        ):
-            continue
         market = markets.get(token_address) or {}
-        market_quality_met = (
-            (market.get("liquidity_usd") or 0) >= EVM_MIN_MOMENTUM_LIQUIDITY_USD
-            and (market.get("volume_h1_usd") or 0) >= EVM_MIN_MOMENTUM_H1_VOLUME_USD
-            and (market.get("transactions_h1") or 0) >= EVM_MIN_MOMENTUM_H1_TRANSACTIONS
-        )
-        if not market_quality_met:
-            continue
-
         qualified = []
         for entry in token_entries:
-            if entry["entry_rank"] > EVM_PAPER_SIGNAL_MAX_ENTRY_RANK:
+            entry_rank = safe_int(entry["entry_rank"])
+            if entry_rank is None or entry_rank > EVM_PAPER_SIGNAL_MAX_ENTRY_RANK:
                 continue
             history = [
                 prior for prior in wallet_observations.get(entry["wallet"], [])
                 if prior["token_address"] != token_address
-                and prior["entry_rank"] <= EVM_PAPER_SIGNAL_MAX_ENTRY_RANK
+                and safe_int(prior["entry_rank"]) is not None
+                and safe_int(prior["entry_rank"]) <= EVM_PAPER_SIGNAL_MAX_ENTRY_RANK
                 and (prior["occurred_at"] is None or entry["occurred_at"] is None
                      or prior["occurred_at"] < entry["occurred_at"])
             ]
@@ -5492,21 +5491,78 @@ def load_evm_robinhood_paper_signals():
                 "successful_history_tokens": len(successful),
             })
 
+        observed_wallets = {item["wallet"] for item in token_entries}
         unique_wallets = {item["wallet"] for item in qualified}
         independent_blocks = {item["block_number"] for item in qualified}
-        if len(unique_wallets) < EVM_PAPER_SIGNAL_MIN_BUYERS:
-            collecting_tokens += 1
-            continue
-        if len(independent_blocks) < EVM_PAPER_SIGNAL_MIN_BUYERS:
-            # Same-block convergence is not treated as independent evidence.
-            continue
-        qualified.sort(key=lambda item: (item["entry_rank"], item["block_number"]))
-        signals.append({
+        gate_reasons = []
+        if pair_age_seconds is None:
+            gate_reasons.append("pair age unavailable")
+            funnel_counts["pair_age"] += 1
+        elif pair_age_seconds > EVM_PAPER_SIGNAL_MAX_PAIR_AGE_DAYS * 86400:
+            gate_reasons.append(f"pair older than {EVM_PAPER_SIGNAL_MAX_PAIR_AGE_DAYS} days")
+            funnel_counts["pair_age"] += 1
+        if (market.get("liquidity_usd") or 0) < EVM_MIN_MOMENTUM_LIQUIDITY_USD:
+            gate_reasons.append("liquidity below minimum")
+        if (market.get("volume_h1_usd") or 0) < EVM_MIN_MOMENTUM_H1_VOLUME_USD:
+            gate_reasons.append("1h volume below minimum")
+        if (market.get("transactions_h1") or 0) < EVM_MIN_MOMENTUM_H1_TRANSACTIONS:
+            gate_reasons.append("1h transactions below minimum")
+        if any(reason in gate_reasons for reason in (
+            "liquidity below minimum", "1h volume below minimum",
+            "1h transactions below minimum",
+        )):
+            funnel_counts["market_quality"] += 1
+        if not unique_wallets:
+            gate_reasons.append("qualified buyer history building")
+            funnel_counts["buyer_history"] += 1
+        elif len(unique_wallets) < EVM_PAPER_SIGNAL_MIN_BUYERS:
+            gate_reasons.append("needs a second qualified buyer")
+            funnel_counts["buyer_convergence"] += 1
+        elif len(independent_blocks) < EVM_PAPER_SIGNAL_MIN_BUYERS:
+            gate_reasons.append("qualified buys occurred in the same block")
+            funnel_counts["same_block"] += 1
+
+        candidate = {
             "token_address": token_address,
             "token_symbol": representative["token_symbol"],
             "pair_address": representative["pair_address"] or market.get("pair_address"),
             "pair_created_at": pair_created_at,
-            "pair_age_seconds": int(pair_age_seconds),
+            "pair_age_seconds": (
+                int(pair_age_seconds) if pair_age_seconds is not None else None
+            ),
+            "observed_buyers": len(observed_wallets),
+            "qualified_buyers": len(unique_wallets),
+            "independent_purchase_blocks": len(independent_blocks),
+            "best_entry_rank": min(
+                (safe_int(item["entry_rank"]) for item in token_entries
+                 if safe_int(item["entry_rank"]) is not None),
+                default=None,
+            ),
+            "successful_history_tokens": sum(
+                item["successful_history_tokens"] for item in qualified
+            ),
+            "last_observed_at": max(
+                (item["occurred_at"] for item in token_entries if item["occurred_at"]),
+                default=None,
+            ),
+            "liquidity_usd": market.get("liquidity_usd"),
+            "volume_h1_usd": market.get("volume_h1_usd"),
+            "transactions_h1": market.get("transactions_h1"),
+            "gate_reasons": gate_reasons,
+            "paper_mode": True, "actionable": False, "consensus_weight": 0,
+        }
+        if gate_reasons:
+            candidate["result"] = (
+                "1 QUALIFIED BUYER" if len(unique_wallets) == 1
+                else "HISTORY BUILDING" if not unique_wallets
+                else "NEAR MISS"
+            )
+            candidates.append(candidate)
+            continue
+
+        qualified.sort(key=lambda item: (item["entry_rank"], item["block_number"]))
+        signals.append({
+            **candidate,
             "qualified_buyers": len(unique_wallets),
             "independent_purchase_blocks": len(independent_blocks),
             "best_entry_rank": min(item["entry_rank"] for item in qualified),
@@ -5532,9 +5588,19 @@ def load_evm_robinhood_paper_signals():
     signals.sort(key=lambda item: (
         -item["qualified_buyers"], item["pair_age_seconds"], item["best_entry_rank"]
     ))
+    candidates.sort(key=lambda item: (
+        -item["qualified_buyers"], -item["observed_buyers"],
+        item["pair_age_seconds"] if item["pair_age_seconds"] is not None else float("inf"),
+    ))
     return {
         "signals": signals,
-        "counts": {"active": len(signals), "collecting": collecting_tokens},
+        "candidates": candidates,
+        "counts": {
+            "active": len(signals), "candidates": len(candidates),
+            "collecting": len(candidates),
+            "tokens_with_eligible_observations": len(token_observations),
+            **funnel_counts,
+        },
         "policy": {
             "minimum_qualified_buyers": EVM_PAPER_SIGNAL_MIN_BUYERS,
             "maximum_entry_rank": EVM_PAPER_SIGNAL_MAX_ENTRY_RANK,
@@ -7689,21 +7755,11 @@ def refresh_evm_watchlist_endpoint():
     }), 200 if result["success"] else 207
 
 
-@app.post("/evm-early-buyer-discovery")
-def evm_early_buyer_discovery_endpoint():
-    """Admin-only bounded Robinhood early-buyer reconstruction."""
-    if not os.getenv("ADMIN_API_KEY"):
-        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
-    if not admin_authorized():
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
+def run_evm_early_buyer_discovery(limit=None):
+    """Run one bounded, rotating Robinhood early-buyer reconstruction batch."""
     initialise_database()
-    try:
-        limit = min(
-            max(int(request.args.get("limit", EVM_EARLY_BUYER_MAX_TOKENS)), 1),
-            EVM_EARLY_BUYER_MAX_TOKENS,
-        )
-    except ValueError:
-        return jsonify({"success": False, "error": "limit must be an integer"}), 400
+    limit = EVM_EARLY_BUYER_MAX_TOKENS if limit is None else limit
+    limit = min(max(int(limit), 1), EVM_EARLY_BUYER_MAX_TOKENS)
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -7793,14 +7849,29 @@ def evm_early_buyer_discovery_endpoint():
                 json.dumps({"results": results, "errors": errors}, default=str), run_id,
             ))
         conn.commit()
-    return jsonify({
+    return {
         "success": status == "completed", "version": VERSION,
         "run_id": run_id, "status": status, "stop_reason": stop_reason,
         "tokens_selected": len(tokens), "tokens_completed": len(results),
         "wallets_observed": wallets_observed, "results": results,
         "errors": errors, "paper_mode": True, "actionable": False,
         "consensus_weight": 0,
-    }), 200 if status == "completed" else 207
+    }
+
+
+@app.post("/evm-early-buyer-discovery")
+def evm_early_buyer_discovery_endpoint():
+    """Admin-only bounded Robinhood early-buyer reconstruction."""
+    if not os.getenv("ADMIN_API_KEY"):
+        return jsonify({"success": False, "error": "ADMIN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    try:
+        limit = int(request.args.get("limit", EVM_EARLY_BUYER_MAX_TOKENS))
+    except ValueError:
+        return jsonify({"success": False, "error": "limit must be an integer"}), 400
+    result = run_evm_early_buyer_discovery(limit)
+    return jsonify(result), 200 if result["success"] else 207
 
 
 @app.get("/evm-early-buyers")
@@ -8952,6 +9023,7 @@ def build_dashboard_payload():
                 "cross_token_wallets"
             ],
             "evm_active_paper_signals": evm_paper_signals["counts"]["active"],
+            "evm_paper_signal_candidates": evm_paper_signals["counts"]["candidates"],
             "solana_signals": len(solana_signals),
             "solana_active": sum(
                 1 for item in solana_signals if item["status"] != "EXPIRED"
@@ -8999,12 +9071,13 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.18.1 · Curated EVM Watchlist</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Winner/loser reverse discovery + forward wallet evidence + zero-weight paper review</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.19 · Robinhood Signal Funnel</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Scheduled Robinhood discovery + visible near misses + evidence-qualified paper signals</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">EVM early buyers</span><b id="evmEarlyBuyerCount">—</b><span class="muted"><span id="evmCrossTokenCount">—</span> cross-token · zero weight</span></div>
     <div class="card"><span class="label">Robinhood paper signals</span><b id="evmPaperSignalCount">—</b><span class="muted">Qualified convergence · zero weight</span></div>
+    <div class="card"><span class="label">Robinhood candidates</span><b id="evmPaperCandidateCount">—</b><span class="muted">Near misses · wider funnel</span></div>
     <div class="card"><span class="label">Solana signals</span><b id="solCount">—</b><span class="muted">Active paper states</span></div>
     <div class="card"><span class="label">Dex candidates</span><b id="dexCandidateCount">—</b><span class="muted">Wide discovery cohort</span></div>
     <div class="card"><span class="label">Historical wallets reviewed</span><b id="historicalWalletCount">—</b><span class="muted"><span id="repeatWinnerCount">—</span> repeat winners · zero weight</span></div>
@@ -9018,6 +9091,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted">Canonical-pair evidence; holder freshness and performance relative to ETH are explicit</div></div><div class="links"><a href="/evm-signals">JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="13" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Active Solana paper signals</h2><div class="muted">Buyer labels count independent wallet clusters—not transactions</div></div><div class="links"><a href="/signals?include_expired=false">Active JSON</a><a href="/signals?include_expired=true">History</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Last activity</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Active Robinhood paper signals</h2><div class="muted">Requires 2+ distinct qualified early buyers in different blocks, successful prior token outcomes, and current market-quality gates; paper-only and zero weight</div></div><div class="links"><a href="/evm-paper-signals">Signal evidence</a><a href="/evm-early-buyers">Buyer history</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Qualified buyers</th><th>Successful history</th><th>Best entry rank</th><th>Liquidity</th><th>1h volume</th><th>Safety</th><th>Last qualified buy</th></tr></thead><tbody id="evmPaperSignalBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Robinhood paper-signal candidates</h2><div class="muted">Wider funnel showing early-buyer evidence before every strict confirmation gate is met</div></div><div class="links"><a href="/evm-paper-signals">Full funnel JSON</a><a href="/evm-early-buyer-status">Scan status</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Stage</th><th>Observed buyers</th><th>Qualified buyers</th><th>Purchase blocks</th><th>Gates remaining</th><th>Liquidity</th><th>1h volume</th><th>Pair age</th></tr></thead><tbody id="evmPaperCandidateBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Robinhood early-purchaser wallets</h2><div class="muted">Pair-verified buyers are ranked across watchlist tokens; infrastructure and same-block sniper evidence is excluded, and every wallet remains zero weight</div></div><div class="links"><a href="/evm-early-buyers">Wallet evidence</a><a href="/evm-early-buyer-status">Scan status</a></div></div><div class="table-wrap"><table><thead><tr><th>Wallet</th><th>Early tokens</th><th>Top-25 tokens</th><th>Best rank</th><th>Average rank</th><th>Tokens</th><th>Filter result</th><th>Deep screening</th><th>Last observed</th></tr></thead><tbody id="evmEarlyBuyerBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Solana consensus windows</h2><div class="muted">Activity funnel across independent validated wallet clusters; probation activity cannot vote</div></div><div class="links"><a href="/solana-activity">Full diagnostics</a><a href="/dex-wallet-cohorts">Discovery cohorts</a><a href="/dex-wallet-discovery-history">Discovery runs</a><a href="/probation-wallet-activity">Probation activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Window</th><th>Events</th><th>Active wallets</th><th>Clusters</th><th>Tokens bought</th><th>2 buyers</th><th>3+ buyers</th><th>Missing symbols</th></tr></thead><tbody id="solWindowBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>DexScreener candidate processing pipeline</h2><div class="muted">Newly discovered wallets are prioritised through bounded scoring, screening and validation batches</div></div><div class="links"><a href="/dex-wallet-pipeline-status">Pipeline JSON</a><a href="/dex-wallet-leaderboard">Candidate leaderboard</a><a href="/dex-wallet-cohorts">Discovery cohorts</a></div></div><div class="table-wrap"><table><thead><tr><th>Discovered</th><th>Awaiting score</th><th>Scored</th><th>Performance ≥30</th><th>Screened</th><th>Low risk</th><th>Validated</th><th>Minimum gates</th><th>Recommended</th><th>In probation</th><th>Consensus validated</th></tr></thead><tbody id="pipelineBody"><tr><td colspan="11" class="empty">Loading…</td></tr></tbody></table></div></section>
@@ -9038,10 +9112,11 @@ const age=s=>s==null?'unknown age':s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m`:s<
 const stateLabel=s=>({EVM_PROVIDER_UNAVAILABLE:'Provider unavailable',EVM_DATA_ANOMALY:'Data anomaly',EVM_BENCHMARK:'Market benchmark',EVM_CONFIRMED_BREAKOUT:'Confirmed breakout',EVM_CONFIRMED_BREAKDOWN:'Confirmed breakdown',EVM_ACCUMULATION_WATCH:'Accumulation watch',EVM_HIGH_MOMENTUM:'High momentum',EVM_MOMENTUM:'Momentum',EVM_DISTRIBUTION:'Distribution',EVM_THIN_LIQUIDITY:'Thin liquidity',EVM_REBOUND:'Rebound',EVM_RISK:'Risk',EVM_OBSERVE:'Observe'}[s]||s);
 const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_BENCHMARK'?'benchmark':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(stateLabel(s))}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
-document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('evmEarlyBuyerCount').textContent=d.summary.evm_early_buyer_wallets;document.getElementById('evmCrossTokenCount').textContent=d.summary.evm_cross_token_early_buyers;document.getElementById('evmPaperSignalCount').textContent=d.summary.evm_active_paper_signals;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('historicalWalletCount').textContent=d.summary.historical_wallets_reviewed;document.getElementById('repeatWinnerCount').textContent=d.summary.historical_repeat_winners;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('observationCount').textContent=d.summary.observation_pool;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
+document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('evmEarlyBuyerCount').textContent=d.summary.evm_early_buyer_wallets;document.getElementById('evmCrossTokenCount').textContent=d.summary.evm_cross_token_early_buyers;document.getElementById('evmPaperSignalCount').textContent=d.summary.evm_active_paper_signals;document.getElementById('evmPaperCandidateCount').textContent=d.summary.evm_paper_signal_candidates;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('historicalWalletCount').textContent=d.summary.historical_wallets_reviewed;document.getElementById('repeatWinnerCount').textContent=d.summary.historical_repeat_winners;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('observationCount').textContent=d.summary.observation_pool;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
 document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td><div>${num(x.holder_count)}</div><div class="address">${age(x.holder_data_age_seconds)} old</div></td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${trend(x.trends['24h'].relative_to_eth_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):'<tr><td colspan="13" class="empty">No EVM snapshots yet.</td></tr>';
 const evmBuyers=d.evm_early_buyers?.wallets||[];document.getElementById('evmEarlyBuyerBody').innerHTML=evmBuyers.length?evmBuyers.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/address/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,8))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">observation only · zero consensus weight</div></a></td><td>${num(x.early_tokens)}</td><td>${num(x.top_25_tokens)}</td><td>${num(x.best_entry_rank)}</td><td>${num(x.average_entry_rank)}</td><td>${esc(x.token_symbols||'—')}</td><td>${x.filter_result==='CROSS-TOKEN REVIEW'?'<span class="badge accumulation">CROSS-TOKEN REVIEW</span>':'<span class="badge expired">COLLECTING</span>'}</td><td>${esc(x.screening_status)}</td><td>${when(x.last_observed_at)}</td></tr>`).join(''):'<tr><td colspan="9" class="empty">No pair-verified Robinhood early buyers retained yet. The bounded backfill is ready to run.</td></tr>';
 const evmPaperSignals=d.evm_paper_signals?.signals||[];document.getElementById('evmPaperSignalBody').innerHTML=evmPaperSignals.length?evmPaperSignals.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/token/${esc(x.token_address)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.token_symbol||'Unknown')}<span class="external">↗</span></div><div class="address">${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a></td><td><span class="badge accumulation">${esc(x.result)}</span></td><td><div class="token">${num(x.qualified_buyers)}</div><div class="address">${num(x.independent_purchase_blocks)} purchase blocks</div></td><td><div>${num(x.successful_history_tokens)} token outcomes</div><div class="address">target excluded</div></td><td>${num(x.best_entry_rank)}</td><td>${money(x.liquidity_usd)}</td><td>${money(x.volume_h1_usd)}</td><td><span class="badge provider">${esc(x.safety_status)}</span></td><td><div>${when(x.last_qualified_purchase_at)}</div><div class="address">${age(x.pair_age_seconds)} pair age</div></td></tr>`).join(''):'<tr><td colspan="9" class="empty">No active Robinhood paper signal currently meets all buyer-history, independence, freshness, and market-quality gates.</td></tr>';
+const evmPaperCandidates=d.evm_paper_signals?.candidates||[];document.getElementById('evmPaperCandidateBody').innerHTML=evmPaperCandidates.length?evmPaperCandidates.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/token/${esc(x.token_address)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.token_symbol||'Unknown')}<span class="external">↗</span></div><div class="address">${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a></td><td><span class="badge observe">${esc(x.result)}</span></td><td>${num(x.observed_buyers)}</td><td>${num(x.qualified_buyers)}</td><td>${num(x.independent_purchase_blocks)}</td><td><div class="address">${esc((x.gate_reasons||[]).join(' · ')||'collecting')}</div></td><td>${money(x.liquidity_usd)}</td><td>${money(x.volume_h1_usd)}</td><td>${age(x.pair_age_seconds)}</td></tr>`).join(''):'<tr><td colspan="9" class="empty">No candidate evidence yet. Scheduled Robinhood discovery will populate this funnel as qualifying purchases are reconstructed.</td></tr>';
 const windows=d.solana_activity?.windows||{};document.getElementById('solWindowBody').innerHTML=['1h','6h','24h'].map(w=>{const x=windows[w]||{};return `<tr><td><div class="token">${w}</div></td><td>${num(x.events)}</td><td>${num(x.active_wallets)}</td><td>${num(x.independent_clusters)}</td><td>${num(x.unique_tokens_bought)}</td><td>${num(x.tokens_with_2_buyers)}</td><td>${num(x.tokens_with_3_plus_buyers)}</td><td>${num(x.missing_symbols)}</td></tr>`}).join('');
 const pc=d.candidate_pipeline?.counts||{};document.getElementById('pipelineBody').innerHTML=`<tr><td>${num(pc.discovered)}</td><td>${num(pc.awaiting_score)}</td><td>${num(pc.scored)}</td><td>${num(pc.performance_pass)}</td><td>${num(pc.screened)}</td><td>${num(pc.low_risk)}</td><td>${num(pc.validated)}</td><td>${num(pc.minimum_gates_passed)}</td><td>${num(pc.recommended_for_probation)}</td><td>${num(pc.probation)}</td><td>${num(pc.consensus_validated)}</td></tr>`;
 const historical=d.historical_winners?.wallets||[];document.getElementById('historicalWinnerBody').innerHTML=historical.length?historical.map(x=>`<tr><td><a class="token-link" href="https://solscan.io/account/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,6))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">historical proxy · zero consensus weight</div></a></td><td><span class="badge ${x.successful_calls>=2?'accumulation':x.successful_calls===1?'observe':'expired'}">${esc(x.evidence_status)}</span></td><td>${num(x.successful_calls)}</td><td>${num(x.ten_x_calls)}</td><td>${num(x.failed_calls)}</td><td>${x.hit_rate_pct==null?'—':`${num(x.hit_rate_pct)}%`}</td><td>${x.average_entry_rank==null?'—':`#${num(x.average_entry_rank)}`}</td><td>${x.copyability_score==null?'—':num(x.copyability_score)}</td><td>${x.best_call_return_pct==null?'—':trend(x.best_call_return_pct)}</td><td>${money(x.realized_pnl_30d)}</td><td>${x.screening_risk_score==null?'<span class="neutral">not screened</span>':num(x.screening_risk_score)}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No historical wallet calls have been labelled yet. The bounded winner/loser miner is ready to run.</td></tr>';
@@ -9198,8 +9273,9 @@ def premium_funnel():
 
 
 def run_evm_refresh_once():
-    """Railway cron entrypoint with controlled partial-run semantics."""
+    """Railway cron entrypoint with market and rotating buyer discovery stages."""
     observation_outcomes = None
+    early_buyer_discovery = None
     try:
         # The scheduled run covers the full active watchlist. The refresh
         # function still applies its deadline guard and controlled partial-run
@@ -9224,6 +9300,18 @@ def run_evm_refresh_once():
             "selected": 0, "processed": 0,
             "error": type(exc).__name__,
         }
+    try:
+        # Rotate through the least-recently-scanned Robinhood token each run.
+        # This continuously feeds the paper-signal funnel without allowing the
+        # bounded archive reconstruction to dominate the market refresh.
+        early_buyer_discovery = run_evm_early_buyer_discovery(
+            limit=EVM_EARLY_BUYER_CRON_TOKENS
+        )
+    except Exception as exc:
+        early_buyer_discovery = {
+            "success": False, "tokens_selected": 0, "tokens_completed": 0,
+            "wallets_observed": 0, "error": type(exc).__name__,
+        }
     print(json.dumps({
         "success": cron_success, "refresh_complete": result["success"],
         "version": VERSION,
@@ -9234,7 +9322,8 @@ def run_evm_refresh_once():
         "chain_counts": result.get("chain_counts", {}),
         "stopped_reason": result["stopped_reason"], "mode": "evm_cron_once",
         "observation_outcomes": observation_outcomes,
-    }))
+        "early_buyer_discovery": early_buyer_discovery,
+    }, default=str))
     return 0 if cron_success else 1
 
 
