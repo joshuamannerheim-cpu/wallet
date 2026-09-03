@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.18.0-historical-winner-miner"
+VERSION = "4.18.1-curated-evm-watchlist"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -207,16 +207,14 @@ HARD_RELATIONSHIP_STRENGTHS = {"high", "moderate"}
 DEFAULT_TOKEN_WATCHLIST = (
     ("base", "0x4200000000000000000000000000000000000006", "ETH", "Ether / WETH", "benchmark", "evm_monitoring_ready"),
     ("robinhood", "0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1", "IF", "What IF", "portfolio", "evm_monitoring_ready"),
-    ("robinhood", "0xe934e36A439C94017B64a3FecE66AF12099aBF50", "STONKBROKER", "StonkBroker", "portfolio", "evm_monitoring_ready"),
-    ("robinhood", "0x020bfC650A365f8BB26819deAAbF3E21291018b4", "CASHCAT", "Cash Cat", "portfolio", "evm_monitoring_ready"),
-    ("robinhood", "0xfd181632e1F2335DaB74535E6dD29082d3191bb2", "RFLX", "RFLIX", "portfolio", "evm_monitoring_ready"),
     ("robinhood", "0x298348d5b2e45C774E3ee4f1a0924071DfbDC8C7", "SWAPPY", "Swappy", "research_test_case", "evm_monitoring_ready"),
     ("base", "0xA4A2E2ca3fBfE21aed83471D28b6f65A233C6e00", "TIBBIR", "Ribbita by Virtuals", "research_test_case", "evm_monitoring_ready"),
     ("robinhood", "0x5f62c57e5c537887117eef828b7e3ad41c009feb", "GOOD", "Good In The Hood", "research_watchlist", "evm_monitoring_ready"),
     ("robinhood", "0xD2a577E92438Fd0c1F2485f4FB91B9F866EB1E6C", "PEPONS", "Pepons", "research_watchlist", "evm_monitoring_ready"),
     ("robinhood", "0xa9eFe2Fc94dE79734C03051515F48f254Ce61e18", "DOGGIE", "Doggie Mode", "research_watchlist", "evm_monitoring_ready"),
-    ("robinhood", "0x57C0E45cB534413D1C20A4240955d6bB250BB4F1", "UP", "up", "research_watchlist", "evm_monitoring_ready"),
-    ("base", "0x0F61Edbfe6Cd86024C0f210c0695B08df55fdfc9", "BSTONK", "BaseStonk", "research_watchlist", "evm_monitoring_ready"),
+    ("robinhood", "0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc", "ROBINCAT", "RobinCat", "research_watchlist", "evm_monitoring_ready"),
+    ("robinhood", "0xF6589F11Bc40b669e584073F428B05562F568733", "SNAP", "Snap Inc. Tokenized Stock", "research_watchlist", "evm_monitoring_ready"),
+    ("robinhood", "0xcaCB0e9caCcee63ec4d82952E561a291c68Bcb68", "GG", "Golden Goose", "research_watchlist", "evm_monitoring_ready"),
 )
 BASE58_ALPHABET = (
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -901,6 +899,7 @@ def initialise_database():
                         token_symbol = EXCLUDED.token_symbol,
                         token_name = EXCLUDED.token_name,
                         source = EXCLUDED.source,
+                        active = TRUE,
                         monitoring_status = CASE
                             WHEN token_watchlist.monitoring_status IN (
                                 'live_evm_monitoring', 'partial_evm_monitoring',
@@ -933,6 +932,34 @@ def initialise_database():
                 WHERE chain = 'robinhood'
                     AND LOWER(token_address) = LOWER(
                         '0xeC45C6C413b498Cf5aCF5a1a889F1a95cA9b6bB3'
+                    )
+            """)
+
+            # V4.18.1 makes the configured ten-token list authoritative for
+            # active monitoring. Historical snapshots, signals, transitions,
+            # and early-purchaser evidence for removed tokens are preserved.
+            cur.execute("""
+                UPDATE token_watchlist
+                SET active = FALSE,
+                    monitoring_status = 'removed_from_watchlist_v4_18_1',
+                    updated_at = NOW()
+                WHERE active = TRUE
+                    AND NOT (
+                        (chain = 'base' AND LOWER(token_address) IN (
+                            LOWER('0x4200000000000000000000000000000000000006'),
+                            LOWER('0xA4A2E2ca3fBfE21aed83471D28b6f65A233C6e00')
+                        ))
+                        OR
+                        (chain = 'robinhood' AND LOWER(token_address) IN (
+                            LOWER('0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1'),
+                            LOWER('0x5f62c57e5c537887117eef828b7e3ad41c009feb'),
+                            LOWER('0xD2a577E92438Fd0c1F2485f4FB91B9F866EB1E6C'),
+                            LOWER('0xa9eFe2Fc94dE79734C03051515F48f254Ce61e18'),
+                            LOWER('0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc'),
+                            LOWER('0xF6589F11Bc40b669e584073F428B05562F568733'),
+                            LOWER('0xcaCB0e9caCcee63ec4d82952E561a291c68Bcb68'),
+                            LOWER('0x298348d5b2e45C774E3ee4f1a0924071DfbDC8C7')
+                        ))
                     )
             """)
 
@@ -8972,7 +8999,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.18 · Historical Winner Mining</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Winner/loser reverse discovery + forward wallet evidence + zero-weight paper review</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.18.1 · Curated EVM Watchlist</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Winner/loser reverse discovery + forward wallet evidence + zero-weight paper review</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
     <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood Chain + Base</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
