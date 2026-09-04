@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.22.3-watchlist-refresh"
+VERSION = "4.22.4-watchlist-refresh"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -246,7 +246,6 @@ DEFAULT_TOKEN_WATCHLIST = (
     ("robinhood", "0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc", "ROBINCAT", "RobinCat", "research_watchlist", "evm_monitoring_ready"),
     ("robinhood", "0xF6589F11Bc40b669e584073F428B05562F568733", "SNAP", "Snap Inc. Tokenized Stock", "research_watchlist", "evm_monitoring_ready"),
     ("robinhood", "0x3eC8A8174129D5cBeCef67eE2AF8621319c34c03", "DOGE-1", "DOGE-1", "research_watchlist", "evm_monitoring_ready"),
-    ("robinhood", "0xc32B91Fe216aF1B834dB02f33326E983Ad8Cf201", "CAMELTOE", "Cameltoe", "research_watchlist", "evm_monitoring_ready"),
     ("robinhood", "0x432C99bBD9dc1d9040087598d7Cf40502d7cC20b", "PONSHOOD", "Ponshood", "research_watchlist", "evm_monitoring_ready"),
     ("robinhood", "0xdEe52F2ab639b6942B0d0F0565400b93b7a0fbe5", "HARMONIC", "Harmonic Agent", "research_watchlist", "evm_monitoring_ready"),
 )
@@ -1025,7 +1024,7 @@ def initialise_database():
                     )
             """)
 
-            # V4.22.3 makes the configured eleven-token list authoritative across
+            # V4.22.4 makes the configured ten-token list authoritative across
             # Robinhood Chain, Base and BNB Smart Chain. Historical snapshots,
             # signals, transitions and early-purchaser evidence for removed
             # tokens are preserved.
@@ -1051,7 +1050,6 @@ def initialise_database():
                             LOWER('0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc'),
                             LOWER('0xF6589F11Bc40b669e584073F428B05562F568733'),
                             LOWER('0x3eC8A8174129D5cBeCef67eE2AF8621319c34c03'),
-                            LOWER('0xc32B91Fe216aF1B834dB02f33326E983Ad8Cf201'),
                             LOWER('0x432C99bBD9dc1d9040087598d7Cf40502d7cC20b'),
                             LOWER('0xdEe52F2ab639b6942B0d0F0565400b93b7a0fbe5')
                         ))
