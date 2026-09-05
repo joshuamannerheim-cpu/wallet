@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.22.5-watchlist-refresh"
+VERSION = "4.22.6-dexscreener-batch"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -42,6 +42,9 @@ HELIUS_WEBHOOKS_URL = "https://mainnet.helius-rpc.com/v0/webhooks"
 ROBINHOOD_CHAIN_ID = 4663
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 DEXSCREENER_BOOSTS_TOP_URL = "https://api.dexscreener.com/token-boosts/top/v1"
+DEXSCREENER_RPS = min(
+    max(float(os.getenv("DEXSCREENER_RPS", "1")), 0.25), 5.0
+)
 DEX_WALLET_DISCOVERY_MAX_TOKENS = min(
     max(int(os.getenv("DEX_WALLET_DISCOVERY_MAX_TOKENS", "20")), 1), 50
 )
@@ -256,6 +259,7 @@ BASE58_ALPHABET = (
 
 _rate_lock = threading.Lock()
 _next_birdeye_request = 0.0
+_next_dexscreener_request = 0.0
 _diagnostic_lock = threading.Lock()
 _diagnostics = {"birdeye_requests": 0, "helius_requests": 0,
                 "helius_syncs": 0, "helius_sync_failures": 0,
@@ -288,6 +292,20 @@ def throttle_birdeye():
         time.sleep(wait)
 
 
+def throttle_dexscreener():
+    """Serialize DexScreener calls to avoid bursts from concurrent pipelines."""
+    global _next_dexscreener_request
+    interval = 1.0 / DEXSCREENER_RPS
+    with _rate_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_dexscreener_request - now)
+        _next_dexscreener_request = max(
+            now, _next_dexscreener_request
+        ) + interval
+    if wait:
+        time.sleep(wait)
+
+
 # =========================================================
 # CONFIGURATION / DATABASE
 # =========================================================
@@ -309,8 +327,11 @@ def upstream_request(method, url, *, headers=None, params=None, json_body=None,
     """Bounded retry/backoff for 429s, 5xx responses and network timeouts."""
     last_error = None
     for attempt in range(retries + 1):
+        response = None
         if provider == "birdeye":
             throttle_birdeye()
+        elif provider == "dexscreener":
+            throttle_dexscreener()
         diagnostic_increment(f"{provider}_requests")
         try:
             response = requests.request(method, url, headers=headers, params=params,
@@ -328,7 +349,16 @@ def upstream_request(method, url, *, headers=None, params=None, json_body=None,
                     diagnostic_increment("upstream_errors")
                 return response
         diagnostic_increment("retries")
-        time.sleep(min(0.75 * (2 ** attempt) + random.uniform(0.05, 0.25), 5.0))
+        retry_after = None
+        if response is not None and response.status_code == 429:
+            try:
+                retry_after = float(response.headers.get("Retry-After", ""))
+            except (TypeError, ValueError):
+                retry_after = None
+        delay = retry_after if retry_after is not None else (
+            0.75 * (2 ** attempt) + random.uniform(0.05, 0.25)
+        )
+        time.sleep(min(max(delay, 0.25), 8.0))
     raise last_error
 
 
@@ -6322,7 +6352,32 @@ def select_evm_pair(chain_pairs, canonical_pair=None):
     ), "initial_active_liquidity" if active_pairs else "initial_unverified_liquidity"
 
 
-def fetch_evm_token_snapshot(token):
+def fetch_evm_market_batch(tokens):
+    """Fetch up to 30 EVM token markets in one rate-limited request."""
+    addresses = list(dict.fromkeys(str(token[1]) for token in tokens))[:30]
+    if not addresses:
+        return {"pairs": []}, None
+    try:
+        response = upstream_request(
+            "GET", DEXSCREENER_TOKEN_URL.format(address=",".join(addresses)),
+            headers={
+                "accept": "application/json",
+                "user-agent": f"wallet-monitor/{VERSION}",
+            },
+            timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=3,
+            provider="dexscreener",
+        )
+        if response.status_code != 200:
+            return None, f"dexscreener_http_{response.status_code}"
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None, "dexscreener_invalid_payload"
+        return payload, None
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        return None, f"dexscreener_{type(exc).__name__}"
+
+
+def fetch_evm_token_snapshot(token, market_payload=None, market_error=None):
     """Fetch one bounded market/holder snapshot for a configured EVM chain."""
     address = token[1]
     chain = str(token[0]).lower()
@@ -6341,13 +6396,24 @@ def fetch_evm_token_snapshot(token):
     holders_ok = False
 
     try:
-        response = upstream_request(
-            "GET", DEXSCREENER_TOKEN_URL.format(address=address),
-            timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=0,
-            provider="dexscreener",
-        )
-        if response.status_code == 200:
-            payload = response.json()
+        if market_payload is None and market_error is None:
+            response = upstream_request(
+                "GET", DEXSCREENER_TOKEN_URL.format(address=address),
+                headers={
+                    "accept": "application/json",
+                    "user-agent": f"wallet-monitor/{VERSION}",
+                },
+                timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=3,
+                provider="dexscreener",
+            )
+            if response.status_code == 200:
+                payload = response.json()
+            else:
+                market_error = f"dexscreener_http_{response.status_code}"
+                payload = None
+        else:
+            payload = market_payload
+        if payload is not None:
             pairs = payload.get("pairs") if isinstance(payload, dict) else []
             pairs = pairs if isinstance(pairs, list) else []
             chain_pairs = [
@@ -6392,7 +6458,9 @@ def fetch_evm_token_snapshot(token):
             else:
                 snapshot["provider_errors"].append(f"dexscreener_no_{chain}_base_pair")
         else:
-            snapshot["provider_errors"].append(f"dexscreener_http_{response.status_code}")
+            snapshot["provider_errors"].append(
+                market_error or "dexscreener_invalid_payload"
+            )
     except (requests.RequestException, ValueError, TypeError) as exc:
         snapshot["provider_errors"].append(f"dexscreener_{type(exc).__name__}")
 
@@ -7303,11 +7371,16 @@ def refresh_evm_watchlist(limit=10, offset=0):
         conn.commit()
 
     deadline = time.monotonic() + EVM_REFRESH_MAX_SECONDS
+    market_payload, market_error = fetch_evm_market_batch(tokens)
     results = []
     transitions = 0
     stopped_reason = None
     executor = ThreadPoolExecutor(max_workers=min(EVM_FETCH_WORKERS, len(tokens) or 1))
-    futures = {executor.submit(fetch_evm_token_snapshot, token): token for token in tokens}
+    futures = {
+        executor.submit(
+            fetch_evm_token_snapshot, token, market_payload, market_error
+        ): token for token in tokens
+    }
     try:
         for future in as_completed(futures):
             token = futures[future]
