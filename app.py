@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.22.6-dexscreener-batch"
+VERSION = "4.22.7-dexscreener-chain-batch"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -41,6 +41,9 @@ HELIUS_HISTORY_LIMIT = 100
 HELIUS_WEBHOOKS_URL = "https://mainnet.helius-rpc.com/v0/webhooks"
 ROBINHOOD_CHAIN_ID = 4663
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
+DEXSCREENER_CHAIN_TOKEN_URL = (
+    "https://api.dexscreener.com/tokens/v1/{chain}/{addresses}"
+)
 DEXSCREENER_BOOSTS_TOP_URL = "https://api.dexscreener.com/token-boosts/top/v1"
 DEXSCREENER_RPS = min(
     max(float(os.getenv("DEXSCREENER_RPS", "1")), 0.25), 5.0
@@ -6353,28 +6356,41 @@ def select_evm_pair(chain_pairs, canonical_pair=None):
 
 
 def fetch_evm_market_batch(tokens):
-    """Fetch up to 30 EVM token markets in one rate-limited request."""
-    addresses = list(dict.fromkeys(str(token[1]) for token in tokens))[:30]
-    if not addresses:
-        return {"pairs": []}, None
-    try:
-        response = upstream_request(
-            "GET", DEXSCREENER_TOKEN_URL.format(address=",".join(addresses)),
-            headers={
-                "accept": "application/json",
-                "user-agent": f"wallet-monitor/{VERSION}",
-            },
-            timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=3,
-            provider="dexscreener",
-        )
-        if response.status_code != 200:
-            return None, f"dexscreener_http_{response.status_code}"
-        payload = response.json()
-        if not isinstance(payload, dict):
-            return None, "dexscreener_invalid_payload"
-        return payload, None
-    except (requests.RequestException, ValueError, TypeError) as exc:
-        return None, f"dexscreener_{type(exc).__name__}"
+    """Fetch each EVM chain in one request using DexScreener's v1 batch route."""
+    addresses_by_chain = {}
+    for token in tokens:
+        chain = str(token[0]).lower()
+        addresses_by_chain.setdefault(chain, [])
+        address = str(token[1])
+        if address not in addresses_by_chain[chain]:
+            addresses_by_chain[chain].append(address)
+
+    pairs = []
+    errors = {}
+    for chain, addresses in addresses_by_chain.items():
+        try:
+            response = upstream_request(
+                "GET", DEXSCREENER_CHAIN_TOKEN_URL.format(
+                    chain=chain, addresses=",".join(addresses[:30])
+                ),
+                headers={
+                    "accept": "application/json",
+                    "user-agent": f"wallet-monitor/{VERSION}",
+                },
+                timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=3,
+                provider="dexscreener",
+            )
+            if response.status_code != 200:
+                errors[chain] = f"dexscreener_http_{response.status_code}"
+                continue
+            payload = response.json()
+            if not isinstance(payload, list):
+                errors[chain] = "dexscreener_invalid_payload"
+                continue
+            pairs.extend(item for item in payload if isinstance(item, dict))
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            errors[chain] = f"dexscreener_{type(exc).__name__}"
+    return {"pairs": pairs}, errors
 
 
 def fetch_evm_token_snapshot(token, market_payload=None, market_error=None):
@@ -6396,6 +6412,12 @@ def fetch_evm_token_snapshot(token, market_payload=None, market_error=None):
     holders_ok = False
 
     try:
+        token_market_error = (
+            market_error.get(chain) if isinstance(market_error, dict)
+            else market_error
+        )
+        if token_market_error:
+            market_payload = None
         if market_payload is None and market_error is None:
             response = upstream_request(
                 "GET", DEXSCREENER_TOKEN_URL.format(address=address),
@@ -6459,7 +6481,7 @@ def fetch_evm_token_snapshot(token, market_payload=None, market_error=None):
                 snapshot["provider_errors"].append(f"dexscreener_no_{chain}_base_pair")
         else:
             snapshot["provider_errors"].append(
-                market_error or "dexscreener_invalid_payload"
+                token_market_error or "dexscreener_invalid_payload"
             )
     except (requests.RequestException, ValueError, TypeError) as exc:
         snapshot["provider_errors"].append(f"dexscreener_{type(exc).__name__}")
