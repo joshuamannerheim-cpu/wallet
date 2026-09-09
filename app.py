@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.26.0-portfolio-discovery"
+VERSION = "4.26.1-portfolio-discovery"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -5832,7 +5832,18 @@ def erc20_raw_balances(chain, tokens, wallet):
             return balances
         except (requests.RequestException, RuntimeError, ValueError) as exc:
             last_error = exc
-    raise RuntimeError(str(last_error or f"{chain}_rpc_unavailable"))
+    # Some public RPCs (notably Base's default endpoint) reject JSON-RPC
+    # batches even though ordinary eth_call requests work. Fall back to
+    # bounded sequential reads so a provider quirk cannot hide holdings.
+    balances = {}
+    try:
+        for token_address in tokens:
+            balances[token_address.lower()] = erc20_raw_balance(
+                chain, token_address, wallet
+            )
+        return balances
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        raise RuntimeError(str(exc or last_error or f"{chain}_rpc_unavailable")) from exc
 
 
 def gmgn_activity_tokens(chain, wallet, pages=3):
@@ -6107,9 +6118,13 @@ def refresh_evm_wallet_holdings(force=False):
     errors = []
     discovery_errors = []
     discovered = {}
+    complete_inventory_chains = set()
     for chain in SUPPORTED_EVM_CHAINS:
         try:
-            for item in blockscout_token_holdings(chain, wallet):
+            blockscout_holdings = blockscout_token_holdings(chain, wallet)
+            if (EVM_CHAIN_CONFIG.get(chain) or {}).get("blockscout_url"):
+                complete_inventory_chains.add(chain)
+            for item in blockscout_holdings:
                 discovered[(chain, item["token_address"].lower())] = item
         except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
             discovery_errors.append({
@@ -6186,7 +6201,11 @@ def refresh_evm_wallet_holdings(force=False):
     balances = {}
     chain_errors = {}
     for chain in SUPPORTED_EVM_CHAINS:
-        addresses = [row[1] for row in tokens if row[0] == chain]
+        addresses = [
+            row[1] for row in tokens
+            if row[0] == chain
+            and chain not in complete_inventory_chains
+        ]
         if not addresses:
             continue
         try:
@@ -6197,8 +6216,15 @@ def refresh_evm_wallet_holdings(force=False):
         try:
             if chain in chain_errors:
                 raise RuntimeError(chain_errors[chain])
-            balance = balances[chain][token_address.lower()]
             metadata = discovered.get((chain, token_address.lower()), {})
+            if metadata.get("source") == "blockscout_token_balances":
+                balance = safe_int(metadata.get("raw_balance"))
+            elif chain in complete_inventory_chains:
+                balance = 0
+            else:
+                balance = balances[chain][token_address.lower()]
+            if balance is None:
+                raise RuntimeError(f"{chain}_balance_missing")
             decimals = safe_int(metadata.get("decimals"))
             ui_balance = balance / (10 ** decimals) if decimals is not None else None
             is_held, changed = persist_portfolio_holding(run_id, {
