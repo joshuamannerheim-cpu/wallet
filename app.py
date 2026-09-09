@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.26.1-portfolio-discovery"
+VERSION = "4.26.2-portfolio-discovery"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -6095,12 +6095,18 @@ def refresh_evm_wallet_holdings(force=False):
                     last_details = json.loads(last_row[1] or "{}")
                 except (TypeError, ValueError, json.JSONDecodeError):
                     last_details = {}
+                retry_solana = any(
+                    item.get("chain") == "solana"
+                    for item in (last_details.get("errors") or [])
+                    if isinstance(item, dict)
+                )
                 last_at = last_row[0]
                 if last_at.tzinfo is None:
                     last_at = last_at.replace(tzinfo=timezone.utc)
                 next_at = last_at + timedelta(hours=EVM_HOLDINGS_REFRESH_HOURS)
                 if (
                     last_details.get("portfolio_discovery_version") == VERSION
+                    and not retry_solana
                     and datetime.now(timezone.utc) < next_at
                 ):
                     return {
