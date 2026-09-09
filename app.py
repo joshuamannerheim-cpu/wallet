@@ -52,6 +52,9 @@ GMGN_RPS = min(max(float(os.getenv("GMGN_RPS", "0.8")), 0.1), 1.0)
 GMGN_ENRICHMENT_MAX_WALLETS = min(
     max(int(os.getenv("GMGN_ENRICHMENT_MAX_WALLETS", "5")), 1), 10
 )
+GMGN_CRON_WALLETS = min(
+    max(int(os.getenv("GMGN_CRON_WALLETS", "2")), 1), 3
+)
 GMGN_ENRICHMENT_STALE_HOURS = min(
     max(int(os.getenv("GMGN_ENRICHMENT_STALE_HOURS", "24")), 1), 168
 )
@@ -2209,6 +2212,7 @@ def diagnostics():
                         "read_only": True,
                         "private_key_used": False,
                         "maximum_wallets_per_run": GMGN_ENRICHMENT_MAX_WALLETS,
+                        "scheduled_wallets_per_run": GMGN_CRON_WALLETS,
                         "refresh_after_hours": GMGN_ENRICHMENT_STALE_HOURS,
                         "requests_per_second": GMGN_RPS,
                     },
@@ -10595,6 +10599,7 @@ def run_evm_refresh_once():
     observation_outcomes = None
     early_buyer_discovery = None
     outbound_discovery = None
+    gmgn_enrichment = None
     try:
         # The scheduled run covers the full active watchlist. The refresh
         # function still applies its deadline guard and controlled partial-run
@@ -10612,6 +10617,13 @@ def run_evm_refresh_once():
         and result.get("failures", 0) == 0
     )
     cron_success = bool(result["success"] or controlled_partial)
+    if os.getenv("GMGN_API_KEY"):
+        try:
+            gmgn_enrichment = run_gmgn_enrichment_batch(limit=GMGN_CRON_WALLETS)
+        except Exception as exc:
+            gmgn_enrichment = {
+                "selected": 0, "processed": 0, "error": type(exc).__name__,
+            }
     try:
         observation_outcomes = refresh_observation_outcomes(limit=10)
     except Exception as exc:
@@ -10655,6 +10667,7 @@ def run_evm_refresh_once():
         "observation_outcomes": observation_outcomes,
         "early_buyer_discovery": early_buyer_discovery,
         "outbound_discovery": outbound_discovery,
+        "gmgn_enrichment": gmgn_enrichment,
     }, default=str))
     return 0 if cron_success else 1
 
