@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.25.0-wallet-holdings"
+VERSION = "4.26.0-portfolio-discovery"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -117,6 +117,9 @@ ROBINHOOD_HOLDINGS_RPC_URL = os.getenv(
 EVM_PORTFOLIO_WALLET = os.getenv(
     "EVM_PORTFOLIO_WALLET", "0x3f3bda5180ec0b5b3ae589e2749a039555bd2cca"
 ).strip().lower()
+SOLANA_PORTFOLIO_WALLET = os.getenv(
+    "SOLANA_PORTFOLIO_WALLET", "346ef9A3bkfGno5b7uQRn89ZhiPJFVCAma98VXYmyKrD"
+).strip()
 EVM_HOLDINGS_REFRESH_HOURS = min(
     max(int(os.getenv("EVM_HOLDINGS_REFRESH_HOURS", "12")), 1), 24
 )
@@ -862,7 +865,12 @@ def initialise_database():
                     chain TEXT NOT NULL,
                     token_address TEXT NOT NULL,
                     token_symbol TEXT NOT NULL,
+                    token_name TEXT,
                     raw_balance TEXT NOT NULL,
+                    decimals INTEGER,
+                    ui_balance DOUBLE PRECISION,
+                    usd_value DOUBLE PRECISION,
+                    discovery_source TEXT,
                     is_held BOOLEAN NOT NULL DEFAULT FALSE,
                     first_checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     last_checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -870,6 +878,11 @@ def initialise_database():
                     PRIMARY KEY (wallet, chain, token_address)
                 )
             """)
+            cur.execute("ALTER TABLE evm_wallet_holdings ADD COLUMN IF NOT EXISTS token_name TEXT")
+            cur.execute("ALTER TABLE evm_wallet_holdings ADD COLUMN IF NOT EXISTS decimals INTEGER")
+            cur.execute("ALTER TABLE evm_wallet_holdings ADD COLUMN IF NOT EXISTS ui_balance DOUBLE PRECISION")
+            cur.execute("ALTER TABLE evm_wallet_holdings ADD COLUMN IF NOT EXISTS usd_value DOUBLE PRECISION")
+            cur.execute("ALTER TABLE evm_wallet_holdings ADD COLUMN IF NOT EXISTS discovery_source TEXT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS evm_wallet_holding_changes (
                     id BIGSERIAL PRIMARY KEY,
@@ -2310,12 +2323,20 @@ def diagnostics():
                         chain: config["chain_id"] for chain, config in EVM_CHAIN_CONFIG.items()
                     },
                     "evm_supported_chains": list(SUPPORTED_EVM_CHAINS),
-                    "evm_portfolio_holdings": {
-                        "wallet": EVM_PORTFOLIO_WALLET,
+                    "portfolio_holdings": {
+                        "wallets": {
+                            "evm": EVM_PORTFOLIO_WALLET,
+                            "solana": SOLANA_PORTFOLIO_WALLET,
+                        },
                         "read_only": True,
                         "scheduled_with_evm_refresh": True,
                         "refresh_hours": EVM_HOLDINGS_REFRESH_HOURS,
-                        "scope": "active watchlist tokens",
+                        "scope": "all discovered nonzero wallet holdings",
+                        "discovery": {
+                            "robinhood_and_base": "Blockscout plus GMGN activity",
+                            "bsc": "GMGN activity plus public RPC",
+                            "solana": "Helius DAS",
+                        },
                     },
                     "evm_refresh_max_seconds": EVM_REFRESH_MAX_SECONDS,
                     "evm_fetch_workers": EVM_FETCH_WORKERS,
@@ -5718,25 +5739,33 @@ def evm_rpc(chain, method, params):
     rpc_urls = tuple(url for url in rpc_urls if url)
     if not rpc_urls:
         raise RuntimeError(f"{chain}_rpc_not_configured")
-    rpc_url = rpc_urls[0]
-    response = upstream_request(
-        "POST", rpc_url,
-        headers={
-            "content-type": "application/json",
-            "user-agent": f"wallet-monitor/{VERSION}",
-        },
-        json_body={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-        timeout=EVM_PROVIDER_TIMEOUT_SECONDS, retries=1,
-        provider=f"{chain}_holdings_rpc",
-    )
-    if response.status_code != 200:
-        raise RuntimeError(f"{chain}_rpc_http_{response.status_code}")
-    payload = response.json()
-    if not isinstance(payload, dict) or payload.get("error"):
-        error = payload.get("error") if isinstance(payload, dict) else None
-        code = error.get("code") if isinstance(error, dict) else "invalid_response"
-        raise RuntimeError(f"{chain}_rpc_error_{code}")
-    return payload.get("result")
+    last_error = None
+    for rpc_url in rpc_urls:
+        try:
+            response = upstream_request(
+                "POST", rpc_url,
+                headers={
+                    "content-type": "application/json",
+                    "user-agent": f"wallet-monitor/{VERSION}",
+                },
+                json_body={
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": method, "params": params,
+                },
+                timeout=EVM_HOLDINGS_RPC_TIMEOUT_SECONDS, retries=0,
+                provider=f"{chain}_holdings_rpc",
+            )
+            if response.status_code != 200:
+                raise RuntimeError(f"{chain}_rpc_http_{response.status_code}")
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("error"):
+                error = payload.get("error") if isinstance(payload, dict) else None
+                code = error.get("code") if isinstance(error, dict) else "invalid_response"
+                raise RuntimeError(f"{chain}_rpc_error_{code}")
+            return payload.get("result")
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            last_error = exc
+    raise RuntimeError(str(last_error or f"{chain}_rpc_unavailable"))
 
 
 def erc20_raw_balance(chain, token_address, wallet):
@@ -5806,36 +5835,267 @@ def erc20_raw_balances(chain, tokens, wallet):
     raise RuntimeError(str(last_error or f"{chain}_rpc_unavailable"))
 
 
+def gmgn_activity_tokens(chain, wallet, pages=3):
+    """Discover recently active token contracts with API-key-only GMGN reads."""
+    if not os.getenv("GMGN_API_KEY"):
+        return []
+    cursor = None
+    discovered = {}
+    for _ in range(min(max(int(pages), 1), 5)):
+        params = {
+            "chain": chain, "wallet_address": wallet, "limit": 100,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        data = gmgn_request("GET", "/v1/user/wallet_activity", params=params)
+        if not isinstance(data, dict):
+            break
+        for activity in data.get("activities") or []:
+            if not isinstance(activity, dict):
+                continue
+            token = activity.get("token") or {}
+            address = str(token.get("address") or token.get("token_address") or "").strip()
+            if len(address) != 42 or not address.lower().startswith("0x"):
+                continue
+            try:
+                int(address[2:], 16)
+            except ValueError:
+                continue
+            discovered[address.lower()] = {
+                "chain": chain, "token_address": address,
+                "token_symbol": str(token.get("symbol") or "UNKNOWN")[:32],
+                "token_name": str(token.get("name") or token.get("symbol") or "Unknown")[:120],
+                "decimals": safe_int(token.get("decimals")),
+                "source": "gmgn_activity",
+            }
+        cursor = data.get("next") or data.get("next_cursor")
+        if not cursor:
+            break
+    return list(discovered.values())
+
+
+def blockscout_token_holdings(chain, wallet):
+    """Discover the explorer's complete current ERC-20 balance inventory."""
+    base_url = (EVM_CHAIN_CONFIG.get(chain) or {}).get("blockscout_url")
+    if not base_url:
+        return []
+    response = upstream_request(
+        "GET", f"{base_url}/addresses/{wallet}/token-balances",
+        headers={"accept": "application/json", "user-agent": f"wallet-monitor/{VERSION}"},
+        timeout=EVM_HOLDINGS_RPC_TIMEOUT_SECONDS, retries=1,
+        provider=f"{chain}_blockscout",
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"{chain}_blockscout_http_{response.status_code}")
+    payload = response.json()
+    rows = payload.get("items") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise RuntimeError(f"{chain}_blockscout_invalid_response")
+    holdings = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        token = row.get("token") or {}
+        token_type = str(token.get("type") or "").upper()
+        if token_type and token_type not in {"ERC-20", "ERC20"}:
+            continue
+        address = str(
+            token.get("address_hash") or token.get("address")
+            or row.get("token_address") or ""
+        ).strip()
+        raw_balance = safe_int(row.get("value") or row.get("balance"))
+        if (
+            len(address) != 42 or not address.lower().startswith("0x")
+            or raw_balance is None or raw_balance <= 0
+        ):
+            continue
+        try:
+            int(address[2:], 16)
+        except ValueError:
+            continue
+        decimals = safe_int(token.get("decimals"))
+        holdings.append({
+            "chain": chain, "token_address": address,
+            "token_symbol": str(token.get("symbol") or "UNKNOWN")[:32],
+            "token_name": str(token.get("name") or token.get("symbol") or "Unknown")[:120],
+            "decimals": decimals, "raw_balance": str(raw_balance),
+            "ui_balance": (
+                raw_balance / (10 ** decimals) if decimals is not None else None
+            ),
+            "source": "blockscout_token_balances",
+        })
+    return holdings
+
+
+def helius_solana_holdings(wallet):
+    """Read all current fungible assets for a Solana owner through Helius DAS."""
+    api_key = os.getenv("HELIUS_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("helius_not_configured")
+    holdings = {}
+    page = 1
+    while page <= 5:
+        response = upstream_request(
+            "POST", f"https://mainnet.helius-rpc.com/?api-key={api_key}",
+            headers={"content-type": "application/json"},
+            json_body={
+                "jsonrpc": "2.0", "id": page, "method": "getAssetsByOwner",
+                "params": {
+                    "ownerAddress": wallet, "page": page, "limit": 100,
+                    "displayOptions": {
+                        "showFungible": True, "showNativeBalance": True,
+                    },
+                },
+            },
+            timeout=25, retries=1, provider="helius",
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"helius_assets_http_{response.status_code}")
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("error"):
+            error = payload.get("error") if isinstance(payload, dict) else None
+            code = error.get("code") if isinstance(error, dict) else "invalid_response"
+            raise RuntimeError(f"helius_assets_error_{code}")
+        result = payload.get("result") or {}
+        items = result.get("items") or []
+        for asset in items:
+            if not isinstance(asset, dict):
+                continue
+            interface = str(asset.get("interface") or "")
+            if interface and interface not in {"FungibleToken", "FungibleAsset"}:
+                continue
+            token_info = asset.get("token_info") or {}
+            raw_balance = safe_int(token_info.get("balance"))
+            if raw_balance is None or raw_balance <= 0:
+                continue
+            mint = str(asset.get("id") or "").strip()
+            if not mint:
+                continue
+            decimals = safe_int(token_info.get("decimals")) or 0
+            ui_balance = raw_balance / (10 ** decimals)
+            metadata = (asset.get("content") or {}).get("metadata") or {}
+            price_info = token_info.get("price_info") or {}
+            usd_value = safe_float(price_info.get("total_price"))
+            if usd_value is None:
+                price = safe_float(price_info.get("price_per_token"))
+                usd_value = ui_balance * price if price is not None else None
+            holdings[mint] = {
+                "chain": "solana", "wallet": wallet,
+                "token_address": mint,
+                "token_symbol": str(metadata.get("symbol") or "UNKNOWN")[:32],
+                "token_name": str(metadata.get("name") or metadata.get("symbol") or "Unknown")[:120],
+                "raw_balance": str(raw_balance), "decimals": decimals,
+                "ui_balance": ui_balance, "usd_value": usd_value,
+                "source": "helius_das",
+            }
+        native = result.get("nativeBalance") or result.get("native_balance") or {}
+        lamports = safe_int(native.get("lamports"))
+        if lamports and lamports > 0:
+            price = safe_float(native.get("price_per_sol") or native.get("price"))
+            holdings[SOL_MINT] = {
+                "chain": "solana", "wallet": wallet,
+                "token_address": SOL_MINT, "token_symbol": "SOL",
+                "token_name": "Solana", "raw_balance": str(lamports),
+                "decimals": 9, "ui_balance": lamports / 1_000_000_000,
+                "usd_value": safe_float(native.get("total_price")) or (
+                    lamports / 1_000_000_000 * price if price is not None else None
+                ),
+                "source": "helius_das",
+            }
+        if len(items) < 100:
+            break
+        page += 1
+    return list(holdings.values())
+
+
+def persist_portfolio_holding(run_id, holding):
+    """Upsert one current holding and record only held/not-held transitions."""
+    wallet = holding["wallet"]
+    chain = holding["chain"]
+    token_address = holding["token_address"]
+    token_symbol = holding["token_symbol"]
+    raw_balance = str(holding["raw_balance"])
+    is_held = safe_int(raw_balance) is not None and safe_int(raw_balance) > 0
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT raw_balance, is_held FROM evm_wallet_holdings
+                WHERE wallet = %s AND chain = %s AND token_address = %s
+            """, (wallet, chain, token_address))
+            previous = cur.fetchone()
+            change_type = None
+            if previous is not None and bool(previous[1]) != is_held:
+                change_type = "ADDED" if is_held else "REMOVED"
+            cur.execute("""
+                INSERT INTO evm_wallet_holdings (
+                    wallet, chain, token_address, token_symbol, token_name,
+                    raw_balance, decimals, ui_balance, usd_value,
+                    discovery_source, is_held, last_changed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    CASE WHEN %s THEN NOW() ELSE NULL END)
+                ON CONFLICT (wallet, chain, token_address) DO UPDATE SET
+                    token_symbol = EXCLUDED.token_symbol,
+                    token_name = COALESCE(EXCLUDED.token_name, evm_wallet_holdings.token_name),
+                    raw_balance = EXCLUDED.raw_balance,
+                    decimals = COALESCE(EXCLUDED.decimals, evm_wallet_holdings.decimals),
+                    ui_balance = COALESCE(EXCLUDED.ui_balance, evm_wallet_holdings.ui_balance),
+                    usd_value = EXCLUDED.usd_value,
+                    discovery_source = COALESCE(EXCLUDED.discovery_source,
+                        evm_wallet_holdings.discovery_source),
+                    is_held = EXCLUDED.is_held,
+                    last_checked_at = NOW(),
+                    last_changed_at = CASE
+                        WHEN evm_wallet_holdings.is_held <> EXCLUDED.is_held
+                        THEN NOW() ELSE evm_wallet_holdings.last_changed_at END
+            """, (
+                wallet, chain, token_address, token_symbol,
+                holding.get("token_name"), raw_balance, holding.get("decimals"),
+                holding.get("ui_balance"), holding.get("usd_value"),
+                holding.get("source"), is_held, previous is not None,
+            ))
+            if change_type:
+                cur.execute("""
+                    INSERT INTO evm_wallet_holding_changes (
+                        run_id, wallet, chain, token_address, token_symbol,
+                        previous_raw_balance, raw_balance, change_type
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    run_id, wallet, chain, token_address, token_symbol,
+                    previous[0], raw_balance, change_type,
+                ))
+        conn.commit()
+    return is_held, bool(change_type)
+
+
 def refresh_evm_wallet_holdings(force=False):
-    """Refresh monitored-token balances at most once per configured interval."""
+    """Discover and refresh EVM plus Solana portfolio holdings twice daily."""
     initialise_database()
     wallet = EVM_PORTFOLIO_WALLET
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT completed_at FROM evm_wallet_holding_runs
+                SELECT completed_at, details FROM evm_wallet_holding_runs
                 WHERE wallet = %s AND status IN ('completed', 'partial')
                 ORDER BY id DESC LIMIT 1
             """, (wallet,))
             last_row = cur.fetchone()
             if last_row and last_row[0] and not force:
+                try:
+                    last_details = json.loads(last_row[1] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    last_details = {}
                 last_at = last_row[0]
                 if last_at.tzinfo is None:
                     last_at = last_at.replace(tzinfo=timezone.utc)
                 next_at = last_at + timedelta(hours=EVM_HOLDINGS_REFRESH_HOURS)
-                if datetime.now(timezone.utc) < next_at:
+                if (
+                    last_details.get("portfolio_discovery_version") == VERSION
+                    and datetime.now(timezone.utc) < next_at
+                ):
                     return {
                         "success": True, "skipped": True, "wallet": wallet,
                         "last_checked_at": last_at, "next_check_at": next_at,
                     }
-            cur.execute("""
-                SELECT chain, token_address, token_symbol
-                FROM token_watchlist
-                WHERE active = TRUE AND chain IN ('robinhood', 'base', 'bsc')
-                    AND token_address LIKE '0x%%'
-                ORDER BY chain, token_symbol
-            """)
-            tokens = cur.fetchall()
             cur.execute("""
                 INSERT INTO evm_wallet_holding_runs (wallet)
                 VALUES (%s) RETURNING id
@@ -5845,6 +6105,84 @@ def refresh_evm_wallet_holdings(force=False):
 
     checked = held = changes = 0
     errors = []
+    discovery_errors = []
+    discovered = {}
+    for chain in SUPPORTED_EVM_CHAINS:
+        try:
+            for item in blockscout_token_holdings(chain, wallet):
+                discovered[(chain, item["token_address"].lower())] = item
+        except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
+            discovery_errors.append({
+                "chain": chain, "provider": "blockscout",
+                "error": str(exc)[:160],
+            })
+        try:
+            for item in gmgn_activity_tokens(chain, wallet):
+                key = (chain, item["token_address"].lower())
+                if key not in discovered:
+                    discovered[key] = item
+        except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
+            discovery_errors.append({
+                "chain": chain, "provider": "gmgn_activity",
+                "error": str(exc)[:160],
+            })
+
+    if discovered:
+        with db() as conn:
+            with conn.cursor() as cur:
+                for item in discovered.values():
+                    cur.execute("""
+                        SELECT token_address FROM token_watchlist
+                        WHERE chain = %s AND LOWER(token_address) = LOWER(%s)
+                        LIMIT 1
+                    """, (item["chain"], item["token_address"]))
+                    existing = cur.fetchone()
+                    if existing:
+                        item["token_address"] = existing[0]
+                        cur.execute("""
+                            UPDATE token_watchlist SET
+                                token_symbol = CASE WHEN %s <> 'UNKNOWN'
+                                    THEN %s ELSE token_symbol END,
+                                token_name = CASE WHEN %s <> 'Unknown'
+                                    THEN %s ELSE token_name END,
+                                active = TRUE, updated_at = NOW()
+                            WHERE chain = %s AND token_address = %s
+                        """, (
+                            item["token_symbol"], item["token_symbol"],
+                            item["token_name"], item["token_name"],
+                            item["chain"], existing[0],
+                        ))
+                    else:
+                        item["token_address"] = item["token_address"].lower()
+                        cur.execute("""
+                            INSERT INTO token_watchlist (
+                                chain, token_address, token_symbol, token_name,
+                                source, monitoring_status, active, updated_at
+                            ) VALUES (%s, %s, %s, %s, 'portfolio_discovery',
+                                'evm_monitoring_ready', TRUE, NOW())
+                        """, (
+                            item["chain"], item["token_address"],
+                            item["token_symbol"], item["token_name"],
+                        ))
+            conn.commit()
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT chain, token_address, token_symbol, token_name
+                FROM token_watchlist
+                WHERE active = TRUE AND chain IN ('robinhood', 'base', 'bsc')
+                    AND token_address LIKE '0x%%'
+                UNION
+                SELECT chain, token_address, token_symbol,
+                    COALESCE(token_name, token_symbol)
+                FROM evm_wallet_holdings
+                WHERE wallet = %s AND chain IN ('robinhood', 'base', 'bsc')
+                    AND token_address LIKE '0x%%'
+                ORDER BY chain, token_symbol
+            """, (wallet,))
+            tokens = cur.fetchall()
+
     balances = {}
     chain_errors = {}
     for chain in SUPPORTED_EVM_CHAINS:
@@ -5855,62 +6193,97 @@ def refresh_evm_wallet_holdings(force=False):
             balances[chain] = erc20_raw_balances(chain, addresses, wallet)
         except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
             chain_errors[chain] = str(exc)[:160]
-    for chain, token_address, token_symbol in tokens:
+    for chain, token_address, token_symbol, token_name in tokens:
         try:
             if chain in chain_errors:
                 raise RuntimeError(chain_errors[chain])
             balance = balances[chain][token_address.lower()]
-            is_held = balance > 0
-            with db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT raw_balance, is_held FROM evm_wallet_holdings
-                        WHERE wallet = %s AND chain = %s
-                            AND LOWER(token_address) = LOWER(%s)
-                    """, (wallet, chain, token_address))
-                    previous = cur.fetchone()
-                    change_type = None
-                    if previous is not None and bool(previous[1]) != is_held:
-                        change_type = "ADDED" if is_held else "REMOVED"
-                    cur.execute("""
-                        INSERT INTO evm_wallet_holdings (
-                            wallet, chain, token_address, token_symbol,
-                            raw_balance, is_held, last_changed_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s,
-                            CASE WHEN %s THEN NOW() ELSE NULL END)
-                        ON CONFLICT (wallet, chain, token_address) DO UPDATE SET
-                            token_symbol = EXCLUDED.token_symbol,
-                            raw_balance = EXCLUDED.raw_balance,
-                            is_held = EXCLUDED.is_held,
-                            last_checked_at = NOW(),
-                            last_changed_at = CASE
-                                WHEN evm_wallet_holdings.is_held <> EXCLUDED.is_held
-                                THEN NOW() ELSE evm_wallet_holdings.last_changed_at END
-                    """, (
-                        wallet, chain, token_address, token_symbol,
-                        str(balance), is_held, previous is not None,
-                    ))
-                    if change_type:
+            metadata = discovered.get((chain, token_address.lower()), {})
+            decimals = safe_int(metadata.get("decimals"))
+            ui_balance = balance / (10 ** decimals) if decimals is not None else None
+            is_held, changed = persist_portfolio_holding(run_id, {
+                "wallet": wallet, "chain": chain,
+                "token_address": token_address, "token_symbol": token_symbol,
+                "token_name": token_name, "raw_balance": str(balance),
+                "decimals": decimals, "ui_balance": ui_balance,
+                "usd_value": None,
+                "source": metadata.get("source") or "evm_rpc",
+            })
+            if not is_held:
+                with db() as conn:
+                    with conn.cursor() as cur:
                         cur.execute("""
-                            INSERT INTO evm_wallet_holding_changes (
-                                run_id, wallet, chain, token_address, token_symbol,
-                                previous_raw_balance, raw_balance, change_type
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        """, (
-                            run_id, wallet, chain, token_address, token_symbol,
-                            previous[0], str(balance), change_type,
-                        ))
-                conn.commit()
+                            UPDATE token_watchlist SET active = FALSE, updated_at = NOW()
+                            WHERE chain = %s AND token_address = %s
+                                AND source = 'portfolio_discovery'
+                        """, (chain, token_address))
+                    conn.commit()
             checked += 1
             held += int(is_held)
-            changes += int(bool(change_type))
+            changes += int(changed)
         except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
             errors.append({
                 "chain": chain, "token_symbol": token_symbol,
                 "error": str(exc)[:160],
             })
 
-    status = "completed" if not errors else "partial" if checked else "failed"
+    for chain in SUPPORTED_EVM_CHAINS:
+        symbol = "BNB" if chain == "bsc" else "ETH"
+        try:
+            native_balance = rpc_hex_int(evm_rpc(chain, "eth_getBalance", [wallet, "latest"]))
+            if native_balance is None:
+                raise RuntimeError(f"{chain}_native_balance_missing")
+            is_held, changed = persist_portfolio_holding(run_id, {
+                "wallet": wallet, "chain": chain,
+                "token_address": "native", "token_symbol": symbol,
+                "token_name": "BNB" if chain == "bsc" else "Ether",
+                "raw_balance": str(native_balance), "decimals": 18,
+                "ui_balance": native_balance / (10 ** 18), "usd_value": None,
+                "source": "evm_rpc_native",
+            })
+            checked += 1
+            held += int(is_held)
+            changes += int(changed)
+        except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
+            errors.append({
+                "chain": chain, "token_symbol": symbol,
+                "error": str(exc)[:160],
+            })
+
+    try:
+        solana_holdings = helius_solana_holdings(SOLANA_PORTFOLIO_WALLET)
+        current_sol_mints = {item["token_address"] for item in solana_holdings}
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT token_address, token_symbol, token_name, raw_balance,
+                        decimals, ui_balance, usd_value
+                    FROM evm_wallet_holdings
+                    WHERE wallet = %s AND chain = 'solana' AND is_held = TRUE
+                """, (SOLANA_PORTFOLIO_WALLET,))
+                prior_sol = cur.fetchall()
+        for item in solana_holdings:
+            is_held, changed = persist_portfolio_holding(run_id, item)
+            checked += 1
+            held += int(is_held)
+            changes += int(changed)
+        for row in prior_sol:
+            if row[0] in current_sol_mints:
+                continue
+            is_held, changed = persist_portfolio_holding(run_id, {
+                "wallet": SOLANA_PORTFOLIO_WALLET, "chain": "solana",
+                "token_address": row[0], "token_symbol": row[1],
+                "token_name": row[2], "raw_balance": "0",
+                "decimals": row[4], "ui_balance": 0, "usd_value": 0,
+                "source": "helius_das",
+            })
+            checked += 1
+            changes += int(changed)
+    except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
+        errors.append({"chain": "solana", "error": str(exc)[:160]})
+
+    all_errors = errors + discovery_errors
+    status = "completed" if not all_errors else "partial" if checked else "failed"
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -5920,7 +6293,13 @@ def refresh_evm_wallet_holdings(force=False):
                 WHERE id = %s
             """, (
                 status, checked, held, changes,
-                json.dumps({"tokens_selected": len(tokens), "errors": errors}), run_id,
+                json.dumps({
+                    "tokens_selected": len(tokens), "errors": errors,
+                    "discovered_evm_tokens": len(discovered),
+                    "discovery_errors": discovery_errors,
+                    "solana_wallet": SOLANA_PORTFOLIO_WALLET,
+                    "portfolio_discovery_version": VERSION,
+                }), run_id,
             ))
         conn.commit()
     return {
@@ -5928,6 +6307,8 @@ def refresh_evm_wallet_holdings(force=False):
         "run_id": run_id, "wallet": wallet, "status": status,
         "tokens_selected": len(tokens), "tokens_checked": checked,
         "held_tokens": held, "changes_detected": changes, "errors": errors,
+        "discovered_evm_tokens": len(discovered),
+        "discovery_errors": discovery_errors,
     }
 
 
@@ -9573,17 +9954,19 @@ def evm_status_endpoint():
 
 @app.get("/evm-wallet-holdings")
 def evm_wallet_holdings_endpoint():
-    """Read-only current monitored holdings and detected add/remove events."""
+    """Read-only multi-chain holdings and detected add/remove events."""
     initialise_database()
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT chain, token_address, token_symbol, raw_balance,
-                    is_held, first_checked_at, last_checked_at, last_changed_at
+                SELECT wallet, chain, token_address, token_symbol, token_name,
+                    raw_balance, decimals, ui_balance, usd_value,
+                    discovery_source, is_held, first_checked_at,
+                    last_checked_at, last_changed_at
                 FROM evm_wallet_holdings
-                WHERE wallet = %s
+                WHERE wallet IN (%s, %s)
                 ORDER BY is_held DESC, chain, token_symbol
-            """, (EVM_PORTFOLIO_WALLET,))
+            """, (EVM_PORTFOLIO_WALLET, SOLANA_PORTFOLIO_WALLET))
             holding_rows = cur.fetchall()
             cur.execute("""
                 SELECT id, started_at, completed_at, status, tokens_checked,
@@ -9594,10 +9977,11 @@ def evm_wallet_holdings_endpoint():
             run_row = cur.fetchone()
             cur.execute("""
                 SELECT id, run_id, chain, token_address, token_symbol,
-                    previous_raw_balance, raw_balance, change_type, detected_at
+                    previous_raw_balance, raw_balance, change_type, detected_at,
+                    wallet
                 FROM evm_wallet_holding_changes
-                WHERE wallet = %s ORDER BY id DESC LIMIT 50
-            """, (EVM_PORTFOLIO_WALLET,))
+                WHERE wallet IN (%s, %s) ORDER BY id DESC LIMIT 50
+            """, (EVM_PORTFOLIO_WALLET, SOLANA_PORTFOLIO_WALLET))
             change_rows = cur.fetchall()
     latest_run = None if not run_row else {
         "id": run_row[0], "started_at": run_row[1],
@@ -9611,13 +9995,20 @@ def evm_wallet_holdings_endpoint():
         ),
     }
     holdings = [{
-        "chain": row[0], "token_address": row[1], "token_symbol": row[2],
-        "raw_balance": row[3], "is_held": row[4],
-        "first_checked_at": row[5], "last_checked_at": row[6],
-        "last_changed_at": row[7],
+        "wallet": row[0], "chain": row[1], "token_address": row[2],
+        "token_symbol": row[3], "token_name": row[4],
+        "raw_balance": row[5], "decimals": row[6],
+        "ui_balance": row[7], "usd_value": row[8],
+        "discovery_source": row[9], "is_held": row[10],
+        "first_checked_at": row[11], "last_checked_at": row[12],
+        "last_changed_at": row[13],
     } for row in holding_rows]
     return jsonify({
-        "success": True, "version": VERSION, "wallet": EVM_PORTFOLIO_WALLET,
+        "success": True, "version": VERSION,
+        "wallets": {
+            "evm": EVM_PORTFOLIO_WALLET,
+            "solana": SOLANA_PORTFOLIO_WALLET,
+        },
         "read_only": True, "refresh_hours": EVM_HOLDINGS_REFRESH_HOURS,
         "latest_run": latest_run,
         "held_count": sum(1 for item in holdings if item["is_held"]),
@@ -9627,8 +10018,9 @@ def evm_wallet_holdings_endpoint():
             "token_address": row[3], "token_symbol": row[4],
             "previous_raw_balance": row[5], "raw_balance": row[6],
             "change_type": row[7], "detected_at": row[8],
+            "wallet": row[9],
         } for row in change_rows],
-        "scope": "active tokens in the Multi-chain EVM watchlist",
+        "scope": "all discovered nonzero holdings across Robinhood, Base, BSC, and Solana",
     })
 
 
@@ -10456,10 +10848,15 @@ def build_dashboard_payload():
             """)
             refresh_row = cur.fetchone()
             cur.execute("""
-                SELECT chain, token_address, raw_balance, last_checked_at
+                SELECT wallet, chain, token_address, token_symbol, token_name,
+                    raw_balance, decimals, ui_balance, usd_value,
+                    last_checked_at, discovery_source
                 FROM evm_wallet_holdings
-                WHERE wallet = %s AND is_held = TRUE
-            """, (EVM_PORTFOLIO_WALLET,))
+                WHERE is_held = TRUE AND (
+                    wallet = %s OR (wallet = %s AND chain = 'solana')
+                )
+                ORDER BY chain, token_symbol
+            """, (EVM_PORTFOLIO_WALLET, SOLANA_PORTFOLIO_WALLET))
             holding_rows = cur.fetchall()
             cur.execute("""
                 SELECT id, completed_at, status, tokens_checked,
@@ -10595,11 +10992,21 @@ def build_dashboard_payload():
                 if token_change is not None and eth_change is not None else None
             )
 
+    holding_items = [{
+        "wallet": row[0], "chain": row[1], "token_address": row[2],
+        "token_symbol": row[3], "token_name": row[4],
+        "raw_balance": row[5], "decimals": row[6],
+        "ui_balance": row[7], "usd_value": row[8],
+        "last_checked_at": row[9], "discovery_source": row[10],
+    } for row in holding_rows]
     held_by_token = {
-        (row[0], str(row[1]).lower()): {
-            "raw_balance": row[2], "last_checked_at": row[3],
+        (item["chain"], str(item["token_address"]).lower()): {
+            "raw_balance": item["raw_balance"],
+            "ui_balance": item["ui_balance"],
+            "usd_value": item["usd_value"],
+            "last_checked_at": item["last_checked_at"],
         }
-        for row in holding_rows
+        for item in holding_items if item["chain"] in SUPPORTED_EVM_CHAINS
     }
     evm_signals = [
         item for item in evm_signals
@@ -10608,13 +11015,84 @@ def build_dashboard_payload():
     for item in evm_signals:
         holding = held_by_token[(item["chain"], item["token_address"].lower())]
         item["wallet_raw_balance"] = holding["raw_balance"]
+        item["wallet_ui_balance"] = holding["ui_balance"]
+        item["wallet_usd_value"] = holding["usd_value"]
+        if (
+            item["wallet_usd_value"] is None
+            and safe_float(item["wallet_ui_balance"]) is not None
+            and safe_float(item.get("price_usd")) is not None
+        ):
+            item["wallet_usd_value"] = (
+                safe_float(item["wallet_ui_balance"])
+                * safe_float(item.get("price_usd"))
+            )
         item["wallet_balance_checked_at"] = holding["last_checked_at"]
 
+    represented = {
+        (item["chain"], str(item["token_address"]).lower()) for item in evm_signals
+    }
+    empty_trends = {
+        window: {
+            "available": False, "price_change_pct": None,
+            "liquidity_change_pct": None, "holder_change": None,
+            "baseline_at": None, "eth_change_pct": None,
+            "relative_to_eth_pct": None,
+        } for window in ("1h", "6h", "24h")
+    }
+    for holding in holding_items:
+        key = (holding["chain"], str(holding["token_address"]).lower())
+        if key in represented:
+            continue
+        chain = holding["chain"]
+        address = holding["token_address"]
+        chain_label = (
+            "Solana" if chain == "solana"
+            else EVM_CHAIN_CONFIG.get(chain, {}).get("label", chain.title())
+        )
+        ui_balance = safe_float(holding["ui_balance"])
+        usd_value = safe_float(holding["usd_value"])
+        price_usd = (
+            usd_value / ui_balance
+            if usd_value is not None and ui_balance not in {None, 0} else None
+        )
+        is_native = address == "native"
+        dex_url = None
+        if chain == "solana":
+            dex_url = f"https://dexscreener.com/solana/{address}"
+        elif not is_native:
+            dex_url = f"https://dexscreener.com/{chain}/{address}"
+        evm_signals.append({
+            "chain": chain, "chain_label": chain_label,
+            "token_address": address,
+            "token_symbol": holding["token_symbol"] or "UNKNOWN",
+            "token_name": holding["token_name"],
+            "status": "HELD", "structure_state": "WALLET HOLDING",
+            "structure_confidence": 100, "price_usd": price_usd,
+            "liquidity_usd": None, "liquidity_tier": "—",
+            "holder_count": None, "holder_data_age_seconds": None,
+            "volume_h1_usd": None, "data_quality": "wallet balance",
+            "trusted_snapshot_age_seconds": None, "is_benchmark": False,
+            "dexscreener_url": dex_url, "trends": empty_trends,
+            "wallet_raw_balance": holding["raw_balance"],
+            "wallet_ui_balance": ui_balance,
+            "wallet_usd_value": usd_value,
+            "wallet_balance_checked_at": holding["last_checked_at"],
+            "discovery_source": holding["discovery_source"],
+        })
+        represented.add(key)
+
     portfolio_holdings = {
-        "wallet": EVM_PORTFOLIO_WALLET,
+        "wallets": {
+            "evm": EVM_PORTFOLIO_WALLET,
+            "solana": SOLANA_PORTFOLIO_WALLET,
+        },
         "read_only": True,
-        "scope": "active tokens in the Multi-chain EVM watchlist",
+        "scope": "all discovered nonzero wallet holdings",
         "refresh_hours": EVM_HOLDINGS_REFRESH_HOURS,
+        "counts_by_chain": {
+            chain: sum(1 for item in holding_items if item["chain"] == chain)
+            for chain in sorted({item["chain"] for item in holding_items})
+        },
         "latest_run": None if not holding_run_row else {
             "id": holding_run_row[0], "completed_at": holding_run_row[1],
             "status": holding_run_row[2], "tokens_checked": holding_run_row[3],
@@ -10725,6 +11203,7 @@ def build_dashboard_payload():
         },
         "summary": {
             "evm_tokens": len(evm_signals),
+            "portfolio_tokens": len(evm_signals),
             "evm_chains": len({item["chain"] for item in evm_signals}),
             "evm_alert_states": sum(
                 1 for item in evm_signals if item["status"] in EVM_ALERT_STATUSES
@@ -10788,9 +11267,9 @@ DASHBOARD_HTML = r"""<!doctype html>
   </style>
 </head>
 <body><main class="wrap">
-  <header class="top"><div><div class="eyebrow">V4.25 · Wallet-held EVM watchlist</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Robinhood, Base and BNB Chain market evidence + scheduled wallet discovery</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
+  <header class="top"><div><div class="eyebrow">V4.26 · Complete multi-chain portfolio</div><h1>Wallet Monitor Dashboard</h1><div class="sub">Current Robinhood, Base, BNB Chain and Solana holdings · refreshed twice daily</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></header>
   <section class="cards">
-    <div class="card"><span class="label">EVM tokens</span><b id="evmCount">—</b><span class="muted">Robinhood + Base + BNB Chain</span></div>
+    <div class="card"><span class="label">Wallet-held tokens</span><b id="evmCount">—</b><span class="muted">Robinhood + Base + BNB Chain + Solana</span></div>
     <div class="card"><span class="label">EVM alert states</span><b id="evmAlerts">—</b><span class="muted">Configured evidence alerts</span></div>
     <div class="card"><span class="label">EVM early buyers</span><b id="evmEarlyBuyerCount">—</b><span class="muted"><span id="evmCrossTokenCount">—</span> cross-token · zero weight</span></div>
     <div class="card"><span class="label">Robinhood paper signals</span><b id="evmPaperSignalCount">—</b><span class="muted">Qualified convergence · zero weight</span></div>
@@ -10806,7 +11285,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="card"><span class="label">Probation wallets</span><b id="probationCount">—</b><span class="muted">Visible · zero consensus weight</span></div>
     <div class="card"><span class="label">Latest refresh</span><b id="runId">—</b><span class="muted" id="runTime">Waiting</span></div>
   </section>
-  <section class="section"><div class="section-head"><div><h2>Multi-chain EVM watchlist</h2><div class="muted" id="evmHoldingStatus">Only monitored tokens currently held by 0x3f3b…2cca; balances checked twice daily</div></div><div class="links"><a href="/evm-wallet-holdings">Wallet holdings</a><a href="/evm-signals">All JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="13" class="empty">Loading…</td></tr></tbody></table></div></section>
+  <section class="section"><div class="section-head"><div><h2>Multi-chain wallet watchlist</h2><div class="muted" id="evmHoldingStatus">Discovering every nonzero holding in both wallets; balances checked twice daily</div></div><div class="links"><a href="/evm-wallet-holdings">Wallet holdings</a><a href="/evm-signals">All JSON signals</a><a href="/evm-transition-history">Transitions</a><a href="/evm-snapshots?limit=100">Snapshots</a><a href="/evm-anomalies">Anomalies</a><a href="/evm-provider-events">Provider events</a></div></div><div class="table-wrap"><table><thead><tr><th>Token / chain</th><th>Wallet balance</th><th>Value</th><th>State</th><th>Structure</th><th>Price</th><th>Liquidity</th><th>Holders</th><th>1h price</th><th>6h price</th><th>24h price</th><th>24h vs ETH</th><th>24h holders</th><th>Volume 1h</th><th>Quality</th></tr></thead><tbody id="evmBody"><tr><td colspan="15" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Active Solana paper signals</h2><div class="muted">Buyer labels count independent wallet clusters—not transactions</div></div><div class="links"><a href="/signals?include_expired=false">Active JSON</a><a href="/signals?include_expired=true">History</a><a href="/wallet-activity?limit=100">Activity</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Buy score</th><th>Sell score</th><th>Buy clusters</th><th>Sell clusters</th><th>Safety</th><th>Last activity</th></tr></thead><tbody id="solBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Active Robinhood paper signals</h2><div class="muted">Requires 2+ distinct qualified early buyers in different blocks, successful prior token outcomes, and current market-quality gates; paper-only and zero weight</div></div><div class="links"><a href="/evm-paper-signals">Signal evidence</a><a href="/evm-early-buyers">Buyer history</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Result</th><th>Qualified buyers</th><th>Successful history</th><th>Best entry rank</th><th>Liquidity</th><th>1h volume</th><th>Safety</th><th>Last qualified buy</th></tr></thead><tbody id="evmPaperSignalBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
   <section class="section"><div class="section-head"><div><h2>Robinhood paper-signal candidates</h2><div class="muted">Wider funnel showing early-buyer evidence before every strict confirmation gate is met</div></div><div class="links"><a href="/evm-paper-signals">Full funnel JSON</a><a href="/evm-early-buyer-status">Scan status</a></div></div><div class="table-wrap"><table><thead><tr><th>Token</th><th>Stage</th><th>Observed buyers</th><th>Qualified buyers</th><th>Purchase blocks</th><th>Gates remaining</th><th>Liquidity</th><th>1h volume</th><th>Pair age</th></tr></thead><tbody id="evmPaperCandidateBody"><tr><td colspan="9" class="empty">Loading…</td></tr></tbody></table></div></section>
@@ -10825,6 +11304,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money=v=>v==null?'—':new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',notation:Math.abs(v)>=1e6?'compact':'standard',maximumFractionDigits:Math.abs(v)<1?8:2}).format(v);
 const num=v=>v==null?'—':new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(v);
+const balance=v=>v==null?'—':new Intl.NumberFormat('en-US',{notation:Math.abs(v)>=1e6?'compact':'standard',maximumFractionDigits:6}).format(v);
 const trend=v=>v==null?'<span class="neutral">collecting</span>':`<span class="${v>0?'pos':v<0?'neg':'neutral'}">${v>0?'+':''}${num(v)}%</span>`;
 const when=v=>v?new Date(v).toLocaleString():'—';
 const age=s=>s==null?'unknown age':s<60?`${s}s`:s<3600?`${Math.floor(s/60)}m`:s<86400?`${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`:`${Math.floor(s/86400)}d ${Math.floor((s%86400)/3600)}h`;
@@ -10832,8 +11312,8 @@ const stateLabel=s=>({EVM_PROVIDER_UNAVAILABLE:'Provider unavailable',EVM_DATA_A
 const badge=s=>{const c=s==='EVM_DATA_ANOMALY'||s==='EVM_RISK'||s==='EVM_CONFIRMED_BREAKDOWN'?'risk':s==='EVM_PROVIDER_UNAVAILABLE'?'provider':s==='EVM_BENCHMARK'?'benchmark':s==='EVM_DISTRIBUTION'?'distribution':s==='EVM_THIN_LIQUIDITY'?'thin':s==='EVM_REBOUND'?'rebound':s==='EVM_ACCUMULATION_WATCH'?'accumulation':s==='EVM_HIGH_MOMENTUM'||s==='EVM_CONFIRMED_BREAKOUT'?'high':s==='EVM_MOMENTUM'?'momentum':s==='EXPIRED'?'expired':'observe';return `<span class="badge ${c}">${esc(stateLabel(s))}</span>`};
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json();
 document.getElementById('evmCount').textContent=d.summary.evm_tokens;document.getElementById('evmAlerts').textContent=d.summary.evm_alert_states;document.getElementById('evmEarlyBuyerCount').textContent=d.summary.evm_early_buyer_wallets;document.getElementById('evmCrossTokenCount').textContent=d.summary.evm_cross_token_early_buyers;document.getElementById('evmPaperSignalCount').textContent=d.summary.evm_active_paper_signals;document.getElementById('evmPaperCandidateCount').textContent=d.summary.evm_paper_signal_candidates;document.getElementById('evmOutboundCount').textContent=d.summary.evm_off_watchlist_tokens;document.getElementById('evmOutboundMultiCount').textContent=d.summary.evm_multi_buyer_discoveries;document.getElementById('solCount').textContent=d.summary.solana_active;document.getElementById('dexCandidateCount').textContent=d.summary.dex_candidates;document.getElementById('historicalWalletCount').textContent=d.summary.historical_wallets_reviewed;document.getElementById('repeatWinnerCount').textContent=d.summary.historical_repeat_winners;document.getElementById('screenedCount').textContent=d.summary.screened_wallets;document.getElementById('observationCount').textContent=d.summary.observation_pool;document.getElementById('minimumGatesCount').textContent=d.summary.minimum_gates_passed;document.getElementById('recommendedCount').textContent=d.summary.recommended_for_probation;document.getElementById('probationCount').textContent=d.summary.probation_wallets;document.getElementById('runId').textContent=d.latest_refresh?`#${d.latest_refresh.id}`:'—';document.getElementById('runTime').textContent=d.latest_refresh?when(d.latest_refresh.completed_at):'No refresh yet';document.getElementById('refreshState').textContent='Live · updated '+new Date().toLocaleTimeString();
-const holdingRun=d.portfolio_holdings?.latest_run;document.getElementById('evmHoldingStatus').textContent=holdingRun?`Only monitored tokens held by ${d.portfolio_holdings.wallet.slice(0,6)}…${d.portfolio_holdings.wallet.slice(-4)} · last checked ${when(holdingRun.completed_at)} · next ${when(holdingRun.next_check_at)}`:`Checking monitored token balances for ${d.portfolio_holdings.wallet.slice(0,6)}…${d.portfolio_holdings.wallet.slice(-4)} on the next scheduled run`;
-document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact monitored pair on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td><div>${num(x.holder_count)}</div><div class="address">${age(x.holder_data_age_seconds)} old</div></td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${trend(x.trends['24h'].relative_to_eth_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):`<tr><td colspan="13" class="empty">${holdingRun?'None of the monitored EVM tokens are currently held in this wallet.':'Wallet balance check is pending.'}</td></tr>`;
+const holdingRun=d.portfolio_holdings?.latest_run,holdingWallets=d.portfolio_holdings?.wallets||{};document.getElementById('evmHoldingStatus').textContent=holdingRun?`All discovered nonzero holdings · EVM ${holdingWallets.evm?.slice(0,6)}…${holdingWallets.evm?.slice(-4)} · Solana ${holdingWallets.solana?.slice(0,6)}…${holdingWallets.solana?.slice(-4)} · checked ${when(holdingRun.completed_at)} · next ${when(holdingRun.next_check_at)}`:`Discovering all current holdings in both wallets on the next scheduled run`;
+document.getElementById('evmBody').innerHTML=d.evm_signals.length?d.evm_signals.map(x=>`<tr><td>${x.dexscreener_url?`<a class="token-link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener noreferrer" title="Open exact token on DexScreener"><div class="token">${esc(x.token_symbol)}<span class="external">↗</span></div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a>`:`<div class="token">${esc(x.token_symbol)}</div><div class="address">${esc(x.chain_label)} · ${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div>`}</td><td><div class="token">${balance(x.wallet_ui_balance)}</div><div class="address">checked ${when(x.wallet_balance_checked_at)}</div></td><td>${money(x.wallet_usd_value)}</td><td>${badge(x.status)}</td><td><div class="token">${esc(x.structure_state)}</div><div class="address">${num(x.structure_confidence)}% · 15m proxy</div></td><td>${money(x.price_usd)}</td><td><div>${money(x.liquidity_usd)}</div><div class="address">${esc(x.liquidity_tier)}</div></td><td><div>${num(x.holder_count)}</div><div class="address">${age(x.holder_data_age_seconds)} old</div></td><td>${trend(x.trends['1h'].price_change_pct)}</td><td>${trend(x.trends['6h'].price_change_pct)}</td><td>${trend(x.trends['24h'].price_change_pct)}</td><td>${trend(x.trends['24h'].relative_to_eth_pct)}</td><td>${x.trends['24h'].holder_change==null?'<span class="neutral">collecting</span>':`<span class="${x.trends['24h'].holder_change>0?'pos':x.trends['24h'].holder_change<0?'neg':'neutral'}">${x.trends['24h'].holder_change>0?'+':''}${num(x.trends['24h'].holder_change)}</span>`}</td><td>${money(x.volume_h1_usd)}</td><td>${x.status==='EVM_PROVIDER_UNAVAILABLE'?`<div class="token">Provider unavailable</div><div class="address">trusted snapshot ${age(x.trusted_snapshot_age_seconds)} ago</div>`:x.status==='EVM_DATA_ANOMALY'?'<div class="token">Anomaly quarantined</div><div class="address">last trusted data retained</div>':x.status==='EVM_BENCHMARK'?'<div class="token">Market benchmark</div><div class="address">excluded from token alerts</div>':esc(x.data_quality)}</td></tr>`).join(''):`<tr><td colspan="15" class="empty">${holdingRun?'No nonzero holdings were found in the configured wallets.':'Wallet balance discovery is pending.'}</td></tr>`;
 const evmBuyers=d.evm_early_buyers?.wallets||[];document.getElementById('evmEarlyBuyerBody').innerHTML=evmBuyers.length?evmBuyers.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/address/${esc(x.wallet)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.wallet.slice(0,8))}…${esc(x.wallet.slice(-6))}<span class="external">↗</span></div><div class="address">observation only · zero consensus weight</div></a></td><td>${num(x.early_tokens)}</td><td>${num(x.top_25_tokens)}</td><td>${num(x.best_entry_rank)}</td><td>${num(x.average_entry_rank)}</td><td>${esc(x.token_symbols||'—')}</td><td>${x.filter_result==='CROSS-TOKEN REVIEW'?'<span class="badge accumulation">CROSS-TOKEN REVIEW</span>':'<span class="badge expired">COLLECTING</span>'}</td><td>${esc(x.screening_status)}</td><td>${when(x.last_observed_at)}</td></tr>`).join(''):'<tr><td colspan="9" class="empty">No pair-verified Robinhood early buyers retained yet. The bounded backfill is ready to run.</td></tr>';
 const evmOutbound=d.evm_outbound_discoveries?.discoveries||[];document.getElementById('evmOutboundBody').innerHTML=evmOutbound.length?evmOutbound.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/token/${esc(x.token_address)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.token_symbol||'Unknown')}<span class="external">↗</span></div><div class="address">${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))} · off watchlist</div></a></td><td><span class="badge ${x.result==='MULTI-BUYER DISCOVERY'?'accumulation':x.result==='SINGLE QUALIFIED BUYER'?'observe':'expired'}">${esc(x.result)}</span></td><td><div class="token">${num(x.qualified_buyers)}</div><div class="address">verified receipts</div></td><td>${num(x.source_successful_history_tokens)} token outcomes</td><td>${num(x.independent_purchase_blocks)}</td><td>${age(x.pair_age_seconds)}</td><td>${money(x.liquidity_usd)}</td><td>${money(x.volume_h1_usd)}</td><td>${when(x.last_purchase_at)}</td></tr>`).join(''):'<tr><td colspan="9" class="empty">No verified recent off-watchlist purchases found yet. The bounded successful-buyer scan will populate this table.</td></tr>';
 const evmPaperSignals=d.evm_paper_signals?.signals||[];document.getElementById('evmPaperSignalBody').innerHTML=evmPaperSignals.length?evmPaperSignals.map(x=>`<tr><td><a class="token-link" href="https://robinhoodchain.blockscout.com/token/${esc(x.token_address)}" target="_blank" rel="noopener noreferrer"><div class="token">${esc(x.token_symbol||'Unknown')}<span class="external">↗</span></div><div class="address">${esc(x.token_address.slice(0,8))}…${esc(x.token_address.slice(-6))}</div></a></td><td><span class="badge accumulation">${esc(x.result)}</span></td><td><div class="token">${num(x.qualified_buyers)}</div><div class="address">${num(x.independent_purchase_blocks)} purchase blocks</div></td><td><div>${num(x.successful_history_tokens)} token outcomes</div><div class="address">target excluded</div></td><td>${num(x.best_entry_rank)}</td><td>${money(x.liquidity_usd)}</td><td>${money(x.volume_h1_usd)}</td><td><span class="badge provider">${esc(x.safety_status)}</span></td><td><div>${when(x.last_qualified_purchase_at)}</div><div class="address">${age(x.pair_age_seconds)} pair age</div></td></tr>`).join(''):'<tr><td colspan="9" class="empty">No active Robinhood paper signal currently meets all buyer-history, independence, freshness, and market-quality gates.</td></tr>';
