@@ -6,6 +6,7 @@ import statistics
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
@@ -16,7 +17,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.23.0-birdeye-free"
+VERSION = "4.24.0-gmgn-enrichment"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -45,6 +46,14 @@ DEXSCREENER_CHAIN_TOKEN_URL = (
 DEXSCREENER_BOOSTS_TOP_URL = "https://api.dexscreener.com/token-boosts/top/v1"
 DEXSCREENER_RPS = min(
     max(float(os.getenv("DEXSCREENER_RPS", "1")), 0.25), 5.0
+)
+GMGN_BASE_URL = os.getenv("GMGN_BASE_URL", "https://openapi.gmgn.ai").rstrip("/")
+GMGN_RPS = min(max(float(os.getenv("GMGN_RPS", "0.8")), 0.1), 1.0)
+GMGN_ENRICHMENT_MAX_WALLETS = min(
+    max(int(os.getenv("GMGN_ENRICHMENT_MAX_WALLETS", "5")), 1), 10
+)
+GMGN_ENRICHMENT_STALE_HOURS = min(
+    max(int(os.getenv("GMGN_ENRICHMENT_STALE_HOURS", "24")), 1), 168
 )
 DEX_WALLET_DISCOVERY_MAX_TOKENS = min(
     max(int(os.getenv("DEX_WALLET_DISCOVERY_MAX_TOKENS", "20")), 1), 50
@@ -260,6 +269,8 @@ BASE58_ALPHABET = (
 
 _rate_lock = threading.Lock()
 _next_dexscreener_request = 0.0
+_gmgn_rate_lock = threading.Lock()
+_next_gmgn_request = 0.0
 _diagnostic_lock = threading.Lock()
 _diagnostics = {"helius_requests": 0,
                 "helius_syncs": 0, "helius_sync_failures": 0,
@@ -272,7 +283,9 @@ _diagnostics = {"helius_requests": 0,
                 "timeouts": 0, "upstream_errors": 0,
                 "dex_wallet_discovery_runs": 0,
                 "dex_wallet_candidates_found": 0,
-                "probation_wallet_events": 0}
+                "probation_wallet_events": 0,
+                "gmgn_requests": 0, "gmgn_enrichments": 0,
+                "gmgn_failures": 0}
 
 
 def diagnostic_increment(name):
@@ -294,6 +307,18 @@ def throttle_dexscreener():
         time.sleep(wait)
 
 
+def throttle_gmgn():
+    """Keep GMGN below its published default limit of one request per second."""
+    global _next_gmgn_request
+    interval = 1.0 / GMGN_RPS
+    with _gmgn_rate_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_gmgn_request - now)
+        _next_gmgn_request = max(now, _next_gmgn_request) + interval
+    if wait:
+        time.sleep(wait)
+
+
 # =========================================================
 # CONFIGURATION / DATABASE
 # =========================================================
@@ -310,6 +335,8 @@ def upstream_request(method, url, *, headers=None, params=None, json_body=None,
         response = None
         if provider == "dexscreener":
             throttle_dexscreener()
+        elif provider == "gmgn":
+            throttle_gmgn()
         diagnostic_increment(f"{provider}_requests")
         try:
             response = requests.request(method, url, headers=headers, params=params,
@@ -343,6 +370,63 @@ def upstream_request(method, url, *, headers=None, params=None, json_body=None,
 def retired_provider_call(*_args, **_kwargs):
     """Guard unreachable legacy blocks from making retired provider calls."""
     raise RuntimeError("This provider-backed legacy path has been retired")
+
+
+def gmgn_request(method, path, *, params=None, json_body=None):
+    """Call GMGN OpenAPI using API-key-only authentication."""
+    api_key = os.getenv("GMGN_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("gmgn_not_configured")
+    auth_params = dict(params or {})
+    auth_params.update({
+        "timestamp": int(time.time()),
+        "client_id": str(uuid.uuid4()),
+    })
+    try:
+        response = upstream_request(
+            method, f"{GMGN_BASE_URL}{path}",
+            headers={
+                "X-APIKEY": api_key,
+                "Content-Type": "application/json",
+                "User-Agent": f"wallet-monitor/{VERSION}",
+            },
+            params=auth_params, json_body=json_body,
+            timeout=20, retries=1, provider="gmgn",
+        )
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        raise RuntimeError("gmgn_unavailable") from exc
+    if response.status_code == 429:
+        raise RuntimeError("gmgn_rate_limited")
+    if response.status_code in {401, 403}:
+        raise RuntimeError("gmgn_auth_failed")
+    if response.status_code != 200:
+        raise RuntimeError(f"gmgn_http_{response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("gmgn_invalid_response") from exc
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        error = str((payload or {}).get("error") or "api_error").lower()
+        error = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in error)
+        raise RuntimeError(f"gmgn_{error[:80] or 'api_error'}")
+    return payload.get("data")
+
+
+def gmgn_wallet_stats(wallet, period="30d"):
+    return gmgn_request(
+        "GET", "/v1/user/wallet_stats",
+        params={"chain": "sol", "wallet_address": wallet, "period": period},
+    )
+
+
+def gmgn_wallet_profits(wallets, period="30d"):
+    return gmgn_request(
+        "POST", "/v1/user/wallet_profits",
+        json_body={
+            "chain": "sol", "period": period,
+            "wallet_addresses": list(wallets),
+        },
+    )
 
 
 def helius_get_address_transactions(address, limit=HELIUS_HISTORY_LIMIT):
@@ -429,6 +513,27 @@ def initialise_database():
                     median_interval_seconds DOUBLE PRECISION,
                     screened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     details TEXT NOT NULL DEFAULT '{}'
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS gmgn_wallet_enrichments (
+                    wallet TEXT PRIMARY KEY,
+                    chain TEXT NOT NULL DEFAULT 'sol',
+                    period TEXT NOT NULL DEFAULT '30d',
+                    realized_pnl DOUBLE PRECISION,
+                    total_pnl DOUBLE PRECISION,
+                    win_rate DOUBLE PRECISION,
+                    trades INTEGER,
+                    tokens_traded INTEGER,
+                    total_invested DOUBLE PRECISION,
+                    average_holding_seconds DOUBLE PRECISION,
+                    wallet_tags TEXT NOT NULL DEFAULT '[]',
+                    risk_flags TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    error_code TEXT,
+                    stats_payload TEXT NOT NULL DEFAULT '{}',
+                    profits_payload TEXT NOT NULL DEFAULT '{}',
+                    enriched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
             cur.execute("""
@@ -905,6 +1010,8 @@ def initialise_database():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_token_time_idx ON wallet_activity (token_address, occurred_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS gmgn_wallet_enriched_idx ON gmgn_wallet_enrichments (enriched_at DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS gmgn_wallet_status_idx ON gmgn_wallet_enrichments (status, enriched_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_activity_wallet_time_idx ON wallet_activity (wallet, occurred_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS dex_wallet_run_time_idx ON dex_wallet_discovery_runs (started_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS wallet_cohort_status_idx ON wallet_discovery_cohorts (cohort_status, updated_at DESC)")
@@ -1351,6 +1458,157 @@ def calculate_score(realized_pnl, total_pnl, win_rate, trades, tokens_found, inv
         "flags": flags,
         "capital_efficiency": efficiency,
     }
+
+
+GMGN_HARD_RISK_TAGS = {
+    "sandwich_bot", "mev_bot", "rat_trader", "wash_trader", "bundler", "sybil",
+}
+
+
+def _gmgn_number(value):
+    try:
+        return float(value) if value is not None and value != "" else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _gmgn_first_row(payload):
+    if isinstance(payload, list):
+        return payload[0] if payload and isinstance(payload[0], dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    rows = payload.get("list")
+    if isinstance(rows, list):
+        return rows[0] if rows and isinstance(rows[0], dict) else {}
+    return payload
+
+
+def normalise_gmgn_wallet(wallet, stats_payload, profits_payload):
+    """Extract stable scoring fields while retaining the raw provider evidence."""
+    stats = _gmgn_first_row(stats_payload)
+    profit_rows = profits_payload.get("list") if isinstance(profits_payload, dict) else None
+    profit = next((row for row in profit_rows or []
+                   if isinstance(row, dict) and row.get("wallet_address") == wallet), {})
+    pnl_stat = stats.get("pnl_stat") if isinstance(stats.get("pnl_stat"), dict) else {}
+    common = stats.get("common") if isinstance(stats.get("common"), dict) else {}
+    tags = sorted({str(tag).strip().lower() for tag in (common.get("tags") or []) if str(tag).strip()})
+    risk_flags = sorted(f"gmgn_{tag}" for tag in tags if tag in GMGN_HARD_RISK_TAGS)
+    buy_count = int(_gmgn_number(stats.get("buy")) or 0)
+    sell_count = int(_gmgn_number(stats.get("sell")) or 0)
+    return {
+        "wallet": wallet,
+        "realized_pnl": _gmgn_number(stats.get("realized_profit")),
+        "total_pnl": _gmgn_number(profit.get("total_profit")),
+        "win_rate": _gmgn_number(pnl_stat.get("winrate")),
+        "trades": buy_count + sell_count,
+        "tokens_traded": int(_gmgn_number(pnl_stat.get("token_num")) or 0),
+        "invested": _gmgn_number(profit.get("total_cost") or stats.get("total_cost")),
+        "average_holding_seconds": _gmgn_number(pnl_stat.get("avg_holding_period")),
+        "wallet_tags": tags,
+        "risk_flags": risk_flags,
+        "indexed": bool(stats.get("wallet_address") or pnl_stat or common),
+    }
+
+
+def persist_gmgn_wallet_enrichment(wallet, metrics=None, *, stats_payload=None,
+                                   profits_payload=None, error_code=None):
+    metrics = metrics or {}
+    status = "enriched" if metrics.get("indexed") and not error_code else "failed"
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO gmgn_wallet_enrichments (
+                    wallet, chain, period, realized_pnl, total_pnl, win_rate,
+                    trades, tokens_traded, total_invested,
+                    average_holding_seconds, wallet_tags, risk_flags, status,
+                    error_code, stats_payload, profits_payload, enriched_at
+                ) VALUES (
+                    %s, 'sol', '30d', %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, NOW()
+                )
+                ON CONFLICT (wallet) DO UPDATE SET
+                    realized_pnl = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.realized_pnl ELSE gmgn_wallet_enrichments.realized_pnl END,
+                    total_pnl = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.total_pnl ELSE gmgn_wallet_enrichments.total_pnl END,
+                    win_rate = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.win_rate ELSE gmgn_wallet_enrichments.win_rate END,
+                    trades = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.trades ELSE gmgn_wallet_enrichments.trades END,
+                    tokens_traded = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.tokens_traded ELSE gmgn_wallet_enrichments.tokens_traded END,
+                    total_invested = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.total_invested ELSE gmgn_wallet_enrichments.total_invested END,
+                    average_holding_seconds = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.average_holding_seconds ELSE gmgn_wallet_enrichments.average_holding_seconds END,
+                    wallet_tags = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.wallet_tags ELSE gmgn_wallet_enrichments.wallet_tags END,
+                    risk_flags = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.risk_flags ELSE gmgn_wallet_enrichments.risk_flags END,
+                    status = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.status ELSE gmgn_wallet_enrichments.status END,
+                    error_code = EXCLUDED.error_code,
+                    stats_payload = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.stats_payload ELSE gmgn_wallet_enrichments.stats_payload END,
+                    profits_payload = CASE WHEN EXCLUDED.status = 'enriched' THEN EXCLUDED.profits_payload ELSE gmgn_wallet_enrichments.profits_payload END,
+                    enriched_at = CASE WHEN EXCLUDED.status = 'enriched' THEN NOW() ELSE gmgn_wallet_enrichments.enriched_at END
+            """, (
+                wallet, metrics.get("realized_pnl"), metrics.get("total_pnl"),
+                metrics.get("win_rate"), metrics.get("trades"),
+                metrics.get("tokens_traded"), metrics.get("invested"),
+                metrics.get("average_holding_seconds"),
+                json.dumps(metrics.get("wallet_tags") or []),
+                json.dumps(metrics.get("risk_flags") or []), status, error_code,
+                json.dumps(stats_payload or {}), json.dumps(profits_payload or {}),
+            ))
+            if status == "enriched":
+                cur.execute("SELECT tokens_found FROM candidate_wallets WHERE wallet = %s", (wallet,))
+                row = cur.fetchone()
+                if row:
+                    scoring = calculate_score(
+                        metrics.get("realized_pnl"), metrics.get("total_pnl"),
+                        metrics.get("win_rate"), metrics.get("trades"), row[0],
+                        metrics.get("invested"),
+                    )
+                    cur.execute("""
+                        UPDATE candidate_wallets SET realized_pnl_30d = %s,
+                            total_pnl_30d = %s, win_rate_30d = %s,
+                            trades_30d = %s, total_invested_30d = %s,
+                            score = %s, score_status = 'scored',
+                            score_source = 'gmgn_openapi_30d',
+                            last_scored = NOW(), updated_at = NOW()
+                        WHERE wallet = %s
+                    """, (
+                        metrics.get("realized_pnl"), metrics.get("total_pnl"),
+                        metrics.get("win_rate"), metrics.get("trades"),
+                        metrics.get("invested"), scoring["score"], wallet,
+                    ))
+        conn.commit()
+    if status == "enriched":
+        diagnostic_increment("gmgn_enrichments")
+    else:
+        diagnostic_increment("gmgn_failures")
+    return status
+
+
+def load_gmgn_enrichment_map():
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT wallet, realized_pnl, total_pnl, win_rate, trades,
+                    tokens_traded, total_invested, average_holding_seconds,
+                    wallet_tags, risk_flags, status, error_code, enriched_at
+                FROM gmgn_wallet_enrichments
+            """)
+            rows = cur.fetchall()
+    result = {}
+    for row in rows:
+        try:
+            tags = json.loads(row[8] or "[]")
+        except (TypeError, ValueError):
+            tags = []
+        try:
+            risk_flags = json.loads(row[9] or "[]")
+        except (TypeError, ValueError):
+            risk_flags = []
+        result[row[0]] = {
+            "realized_pnl_30d": row[1], "total_pnl_30d": row[2],
+            "win_rate_30d": row[3], "trades_30d": row[4],
+            "tokens_traded_30d": row[5], "total_invested_30d": row[6],
+            "average_holding_seconds": row[7], "wallet_tags": tags,
+            "risk_flags": risk_flags, "status": row[10],
+            "error_code": row[11], "enriched_at": row[12],
+        }
+    return result
 
 
 def calculate_onchain_evidence_score(wallet):
@@ -1931,6 +2189,8 @@ def health():
         "providers": {
             "solana_transactions": "helius",
             "market_data": "dexscreener",
+            "wallet_enrichment": "gmgn" if os.getenv("GMGN_API_KEY") else "not_configured",
+            "gmgn_read_only": True,
             "birdeye_required": False,
         },
     }), 200 if healthy else 503
@@ -1944,6 +2204,14 @@ def diagnostics():
     return jsonify({"success": True, "version": VERSION, "premium_mode": False,
                     "paper_mode": True, "signals_actionable": False,
                     "birdeye_required": False,
+                    "gmgn": {
+                        "configured": bool(os.getenv("GMGN_API_KEY")),
+                        "read_only": True,
+                        "private_key_used": False,
+                        "maximum_wallets_per_run": GMGN_ENRICHMENT_MAX_WALLETS,
+                        "refresh_after_hours": GMGN_ENRICHMENT_STALE_HOURS,
+                        "requests_per_second": GMGN_RPS,
+                    },
                     "discovery_max_tokens": DISCOVERY_MAX_TOKENS,
                     "pipeline_max_seconds": PIPELINE_MAX_SECONDS,
                     "signal_window_minutes": SIGNAL_WINDOW_MINUTES,
@@ -2163,6 +2431,7 @@ def candidate_probation_assessment(wallet):
     """Apply the existing evidence classifier to one discovery candidate."""
     validation_summaries = load_validation_summaries()
     repeat_evidence = load_repeat_evidence()
+    gmgn = load_gmgn_enrichment_map().get(wallet, {})
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -2188,6 +2457,7 @@ def candidate_probation_assessment(wallet):
         "total_pnl": row[3], "win_rate": row[4], "trades": row[5],
         "invested": row[6], "score": row[7], "score_status": row[8],
         "screening_status": row[9], "validation_status": row[11],
+        "gmgn_risk_flags": gmgn.get("risk_flags") or [],
     }
     classification = classify_candidate(
         candidate, {"risk_score": row[10], "risk_flags": risk_flags},
@@ -2203,7 +2473,9 @@ def candidate_probation_assessment(wallet):
     probation_requirements = {
         "scored_at_least_30": row[8] == "scored" and (row[7] or 0) >= 30,
         "screened_low_risk": row[9] == "screened" and row[10] is not None and row[10] <= 25,
-        "no_hard_service_or_bot_risk": not bool(set(risk_flags) & hard_risks),
+        "no_hard_service_or_bot_risk": not bool(
+            (set(risk_flags) & hard_risks) or gmgn.get("risk_flags")
+        ),
         "meaningful_performance_sample": (
             (row[5] is not None and row[5] >= 30)
             or provider_independent_performance
@@ -2326,6 +2598,7 @@ def load_dex_wallet_pipeline_status():
     counts = dict(zip(names, row or (0,) * len(names)))
     validation_summaries = load_validation_summaries()
     historical_evidence = load_repeat_evidence()
+    gmgn_enrichments = load_gmgn_enrichment_map()
     observation_evidence = {
         item["wallet"]: item for item in load_observation_evidence(
             limit=OBSERVATION_POOL_LIMIT
@@ -2345,6 +2618,7 @@ def load_dex_wallet_pipeline_status():
             "tokens_found": item[8], "total_pnl": item[9],
             "win_rate": item[10], "invested": item[11],
             "score_status": item[12], "screening_status": item[13],
+            "gmgn_risk_flags": (gmgn_enrichments.get(wallet, {}).get("risk_flags") or []),
         }
         validation = validation_summaries.get(wallet, {})
         evidence = historical_evidence.get(wallet, {})
@@ -2368,6 +2642,7 @@ def load_dex_wallet_pipeline_status():
             "wallet": wallet, "performance_score": item[1],
             "screening_risk_score": item[2],
             "realized_pnl_30d": item[3], "trades_30d": item[4],
+            "gmgn": gmgn_enrichments.get(wallet),
             "validation_status": item[5], "repeat_early_entries": item[6],
             "average_early_entry_score": item[7],
             "classification": classification["classification"],
@@ -2381,6 +2656,8 @@ def load_dex_wallet_pipeline_status():
             "discovery_confirmed": discovery_confirmed,
             "consensus_weight": 0,
         }
+        if candidate["gmgn_risk_flags"]:
+            continue
         minimum_gate_wallets.append(record)
         if (
             validation.get("validation_strength") == "strong"
@@ -2388,6 +2665,7 @@ def load_dex_wallet_pipeline_status():
             and discovery_confirmed
         ):
             recommended_wallets.append(record)
+    counts["minimum_gates_passed"] = len(minimum_gate_wallets)
     counts["recommended_for_probation"] = len(recommended_wallets)
     counts["observation_pool"] = len(observation_evidence)
     counts["observation_active"] = sum(
@@ -3619,6 +3897,113 @@ def discover():
 
 
 # =========================================================
+# GMGN READ-ONLY WALLET ENRICHMENT
+# =========================================================
+
+def run_gmgn_enrichment_batch(limit=GMGN_ENRICHMENT_MAX_WALLETS, force=False):
+    initialise_database()
+    limit = min(max(int(limit), 1), GMGN_ENRICHMENT_MAX_WALLETS)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT candidate.wallet
+                FROM candidate_wallets candidate
+                LEFT JOIN gmgn_wallet_enrichments gmgn ON gmgn.wallet = candidate.wallet
+                WHERE %s OR gmgn.wallet IS NULL OR gmgn.status <> 'enriched'
+                    OR gmgn.enriched_at < NOW() - (%s * INTERVAL '1 hour')
+                ORDER BY CASE candidate.discovery_tier
+                            WHEN 'VALIDATED' THEN 0 WHEN 'PROBATION' THEN 1 ELSE 2 END,
+                    candidate.repeat_early_entries DESC,
+                    candidate.early_entry_score DESC,
+                    candidate.tokens_found DESC,
+                    gmgn.enriched_at ASC NULLS FIRST
+                LIMIT %s
+            """, (force, GMGN_ENRICHMENT_STALE_HOURS, limit))
+            wallets = [row[0] for row in cur.fetchall()]
+
+    if not wallets:
+        return {"selected": 0, "processed": 0, "results": [], "profits_status": "not_needed"}
+
+    profits_payload = {}
+    profits_status = "available"
+    try:
+        profits_payload = gmgn_wallet_profits(wallets, "30d") or {}
+    except RuntimeError as exc:
+        profits_status = str(exc)
+
+    results = []
+    for wallet in wallets:
+        try:
+            stats_payload = gmgn_wallet_stats(wallet, "30d") or {}
+            metrics = normalise_gmgn_wallet(wallet, stats_payload, profits_payload)
+            if not metrics["indexed"]:
+                raise RuntimeError("gmgn_wallet_not_indexed")
+            persist_gmgn_wallet_enrichment(
+                wallet, metrics, stats_payload=stats_payload,
+                profits_payload=profits_payload,
+            )
+            results.append({
+                "wallet": wallet, "status": "enriched",
+                "score_source": "gmgn_openapi_30d",
+                "realized_pnl_30d": metrics["realized_pnl"],
+                "total_pnl_30d": metrics["total_pnl"],
+                "win_rate_30d": metrics["win_rate"],
+                "trades_30d": metrics["trades"],
+                "tokens_traded_30d": metrics["tokens_traded"],
+                "wallet_tags": metrics["wallet_tags"],
+                "risk_flags": metrics["risk_flags"],
+            })
+        except RuntimeError as exc:
+            error_code = str(exc)
+            persist_gmgn_wallet_enrichment(wallet, error_code=error_code)
+            results.append({"wallet": wallet, "status": "failed", "error_code": error_code})
+            if error_code in {"gmgn_rate_limited", "gmgn_auth_failed", "gmgn_not_configured"}:
+                break
+    return {
+        "selected": len(wallets), "processed": len(results),
+        "profits_status": profits_status, "results": results,
+    }
+
+
+@app.post("/enrich-gmgn-wallets")
+def enrich_gmgn_wallets_endpoint():
+    if not os.getenv("GMGN_API_KEY"):
+        return jsonify({"success": False, "error": "GMGN_API_KEY is not configured"}), 503
+    if not admin_authorized():
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    try:
+        limit = int(body.get("limit", GMGN_ENRICHMENT_MAX_WALLETS))
+    except (TypeError, ValueError):
+        limit = GMGN_ENRICHMENT_MAX_WALLETS
+    result = run_gmgn_enrichment_batch(limit=limit, force=bool(body.get("force", False)))
+    return jsonify({
+        "success": True, "version": VERSION, "provider": "gmgn_openapi",
+        "read_only": True, **result,
+    })
+
+
+@app.get("/gmgn-wallet-enrichments")
+def gmgn_wallet_enrichments_endpoint():
+    initialise_database()
+    try:
+        limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+    except ValueError:
+        limit = 100
+    enrichments = load_gmgn_enrichment_map()
+    items = sorted(
+        enrichments.items(),
+        key=lambda pair: pair[1].get("enriched_at") or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )[:limit]
+    return jsonify({
+        "success": True, "version": VERSION, "read_only": True,
+        "configured": bool(os.getenv("GMGN_API_KEY")), "count": len(items),
+        "wallets": [{"wallet": wallet, **item} for wallet, item in items],
+    })
+
+
+# =========================================================
 # SCORE ONE WALLET / BATCH
 # =========================================================
 
@@ -4233,6 +4618,7 @@ def classify_candidate(candidate, screening=None, validation=None, evidence=None
     validation_status = candidate.get("validation_status")
     risk_score = screening.get("risk_score")
     risk_flags = set(screening.get("risk_flags") or [])
+    gmgn_risk_flags = set(candidate.get("gmgn_risk_flags") or [])
 
     efficiency = None
     if realized is not None and invested is not None and invested > 0:
@@ -4253,6 +4639,8 @@ def classify_candidate(candidate, screening=None, validation=None, evidence=None
         blockers.append("bursty_automated_activity")
     if risk_score is not None and risk_score >= 60:
         blockers.append("high_screening_risk")
+    if gmgn_risk_flags:
+        blockers.extend(sorted(gmgn_risk_flags))
 
     if blockers:
         return {
@@ -4438,6 +4826,7 @@ def load_signal_eligible_wallets():
     """Return current WATCH/ASYMMETRIC wallets with conservative signal weights."""
     validation_summaries = load_validation_summaries()
     repeat_evidence = load_repeat_evidence()
+    gmgn_enrichments = load_gmgn_enrichment_map()
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -4471,6 +4860,7 @@ def load_signal_eligible_wallets():
             "total_pnl": row[3], "win_rate": row[4], "trades": row[5],
             "invested": row[6], "score": row[7], "score_status": row[8],
             "screening_status": row[9], "validation_status": row[11],
+            "gmgn_risk_flags": (gmgn_enrichments.get(wallet, {}).get("risk_flags") or []),
         }
         classification = classify_candidate(
             candidate,
@@ -4488,6 +4878,7 @@ def load_signal_eligible_wallets():
                 base_weight * CONFIDENCE_MULTIPLIERS.get(confidence, 0.5), 4
             ),
             "score": row[7], "screening_risk_score": row[10],
+            "gmgn": gmgn_enrichments.get(wallet),
             "discovery_evidence": repeat_evidence.get(wallet, {}),
         }
     return eligible
@@ -8137,6 +8528,7 @@ def shortlist():
 
     validation_summaries = load_validation_summaries()
     repeat_evidence = load_repeat_evidence()
+    gmgn_enrichments = load_gmgn_enrichment_map()
 
     with db() as conn:
         with conn.cursor() as cur:
@@ -8177,6 +8569,7 @@ def shortlist():
             "score_status": row[8],
             "screening_status": row[9],
             "validation_status": row[11],
+            "gmgn_risk_flags": (gmgn_enrichments.get(wallet, {}).get("risk_flags") or []),
         }
         screening = {
             "risk_score": row[10],
@@ -8206,6 +8599,7 @@ def shortlist():
             "validation_status": row[11],
             "validation_summary": validation,
             "discovery_evidence": evidence,
+            "gmgn": gmgn_enrichments.get(wallet),
             "last_scored": row[12],
             "last_screened": row[13],
             "last_validated": row[14],
@@ -8259,6 +8653,7 @@ def candidates():
     except ValueError:
         limit = 100
     limit = min(max(limit, 1), 500)
+    gmgn_enrichments = load_gmgn_enrichment_map()
 
     with db() as conn:
         with conn.cursor() as cur:
@@ -8267,7 +8662,7 @@ def candidates():
                     win_rate_30d, trades_30d, total_invested_30d, score,
                     score_status, created_at, last_scored, screening_status,
                     screening_risk_score, last_screened, validation_status,
-                    last_validated
+                    last_validated, score_source
                 FROM candidate_wallets
                 ORDER BY score DESC, tokens_found DESC, realized_pnl_30d DESC NULLS LAST
                 LIMIT %s
@@ -8288,6 +8683,8 @@ def candidates():
             "validation_status": row[14], "last_validated": row[15],
             "capital_efficiency": scoring["capital_efficiency"],
             "risk_flags": scoring["flags"] if row[8] == "scored" else [],
+            "score_source": row[16],
+            "gmgn": gmgn_enrichments.get(row[0]),
         })
     return jsonify({"success": True, "count": len(items), "candidates": items})
 
