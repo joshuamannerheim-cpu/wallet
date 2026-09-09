@@ -16,7 +16,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.22.8-watchlist-neko"
+VERSION = "4.23.0-birdeye-free"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -31,8 +31,6 @@ STABLE_MINTS = {
     "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
     "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",  # USD1
 }
-BIRDEYE_BASE = "https://public-api.birdeye.so"
-BIRDEYE_RPS = min(max(float(os.getenv("BIRDEYE_RPS", "7")), 1.0), 10.0)
 DISCOVERY_MAX_TOKENS = 50
 DISCOVERY_PAGE_SIZE = 10
 DISCOVERY_WALLETS_PER_TOKEN = 5
@@ -261,10 +259,9 @@ BASE58_ALPHABET = (
 )
 
 _rate_lock = threading.Lock()
-_next_birdeye_request = 0.0
 _next_dexscreener_request = 0.0
 _diagnostic_lock = threading.Lock()
-_diagnostics = {"birdeye_requests": 0, "helius_requests": 0,
+_diagnostics = {"helius_requests": 0,
                 "helius_syncs": 0, "helius_sync_failures": 0,
                 "dexscreener_requests": 0, "blockscout_requests": 0,
                 "evm_refreshes": 0, "evm_refresh_failures": 0,
@@ -281,18 +278,6 @@ _diagnostics = {"birdeye_requests": 0, "helius_requests": 0,
 def diagnostic_increment(name):
     with _diagnostic_lock:
         _diagnostics[name] = _diagnostics.get(name, 0) + 1
-
-
-def throttle_birdeye():
-    """Process-wide Premium limiter; defaults to 7 RPS and never exceeds 10 RPS."""
-    global _next_birdeye_request
-    interval = 1.0 / BIRDEYE_RPS
-    with _rate_lock:
-        now = time.monotonic()
-        wait = max(0.0, _next_birdeye_request - now)
-        _next_birdeye_request = max(now, _next_birdeye_request) + interval
-    if wait:
-        time.sleep(wait)
 
 
 def throttle_dexscreener():
@@ -313,27 +298,17 @@ def throttle_dexscreener():
 # CONFIGURATION / DATABASE
 # =========================================================
 
-def birdeye_headers():
-    return {
-        "accept": "application/json",
-        "X-API-KEY": os.getenv("BIRDEYE_API_KEY", ""),
-        "x-chain": "solana",
-    }
-
-
 def db():
     return psycopg.connect(os.environ["DATABASE_URL"])
 
 
 def upstream_request(method, url, *, headers=None, params=None, json_body=None,
-                     timeout=30, retries=2, provider="birdeye"):
+                     timeout=30, retries=2, provider="upstream"):
     """Bounded retry/backoff for 429s, 5xx responses and network timeouts."""
     last_error = None
     for attempt in range(retries + 1):
         response = None
-        if provider == "birdeye":
-            throttle_birdeye()
-        elif provider == "dexscreener":
+        if provider == "dexscreener":
             throttle_dexscreener()
         diagnostic_increment(f"{provider}_requests")
         try:
@@ -365,17 +340,9 @@ def upstream_request(method, url, *, headers=None, params=None, json_body=None,
     raise last_error
 
 
-def birdeye_get(path, params=None, retry_429=True):
-    return upstream_request("GET", f"{BIRDEYE_BASE}{path}",
-                            headers=birdeye_headers(), params=params, timeout=20,
-                            retries=2 if retry_429 else 0)
-
-
-def birdeye_post(path, body=None, retry_429=True):
-    return upstream_request("POST", f"{BIRDEYE_BASE}{path}",
-                            headers={**birdeye_headers(), "content-type": "application/json"},
-                            json_body=body or {}, timeout=25,
-                            retries=2 if retry_429 else 0)
+def retired_provider_call(*_args, **_kwargs):
+    """Guard unreachable legacy blocks from making retired provider calls."""
+    raise RuntimeError("This provider-backed legacy path has been retired")
 
 
 def helius_get_address_transactions(address, limit=HELIUS_HISTORY_LIMIT):
@@ -412,6 +379,7 @@ def initialise_database():
                     total_invested_30d DOUBLE PRECISION,
                     score DOUBLE PRECISION NOT NULL DEFAULT 0,
                     score_status TEXT NOT NULL DEFAULT 'unscored',
+                    score_source TEXT NOT NULL DEFAULT 'onchain_evidence',
                     early_entry_score DOUBLE PRECISION NOT NULL DEFAULT 0,
                     repeat_early_entries INTEGER NOT NULL DEFAULT 0,
                     discovery_tier TEXT NOT NULL DEFAULT 'CANDIDATE',
@@ -674,7 +642,7 @@ def initialise_database():
                     token_name TEXT,
                     safety_status TEXT NOT NULL DEFAULT 'unverified',
                     safety_details TEXT NOT NULL DEFAULT '{}',
-                    metadata_provider TEXT NOT NULL DEFAULT 'birdeye',
+                    metadata_provider TEXT NOT NULL DEFAULT 'dexscreener',
                     last_attempted_at TIMESTAMPTZ,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
@@ -964,6 +932,8 @@ def initialise_database():
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS total_pnl_30d DOUBLE PRECISION")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS total_invested_30d DOUBLE PRECISION")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS score_status TEXT NOT NULL DEFAULT 'unscored'")
+            cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS score_source TEXT NOT NULL DEFAULT 'legacy_pnl'")
+            cur.execute("ALTER TABLE candidate_wallets ALTER COLUMN score_source SET DEFAULT 'onchain_evidence'")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS last_scored TIMESTAMPTZ")
             cur.execute("ALTER TABLE candidate_wallets ADD COLUMN IF NOT EXISTS screening_status TEXT NOT NULL DEFAULT 'unscreened'")
@@ -1383,6 +1353,97 @@ def calculate_score(realized_pnl, total_pnl, win_rate, trades, tokens_found, inv
     }
 
 
+def calculate_onchain_evidence_score(wallet):
+    """Score repeat, early and forward outcomes without third-party PnL data."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT tokens_found, early_entry_score, repeat_early_entries
+                FROM candidate_wallets WHERE wallet = %s
+            """, (wallet,))
+            candidate = cur.fetchone()
+            if not candidate:
+                return None
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE call_result = 'SUCCESS'),
+                    COUNT(*) FILTER (WHERE call_result = 'FAILED'),
+                    COALESCE(AVG(copyability_score), 0)
+                FROM historical_wallet_calls WHERE wallet = %s
+            """, (wallet,))
+            historical = cur.fetchone() or (0, 0, 0)
+            cur.execute("""
+                SELECT COUNT(DISTINCT later.token_address),
+                    COUNT(DISTINCT later.token_address) FILTER (
+                        WHERE later.price_usd > baseline.price_usd
+                    )
+                FROM wallet_observation_snapshots later
+                JOIN wallet_observation_snapshots baseline
+                    ON baseline.signature = later.signature
+                    AND baseline.wallet = later.wallet
+                    AND baseline.token_address = later.token_address
+                    AND baseline.horizon_hours = 0
+                WHERE later.wallet = %s AND later.horizon_hours IN (6, 24)
+                    AND later.price_usd IS NOT NULL
+                    AND baseline.price_usd IS NOT NULL
+                    AND baseline.price_usd > 0
+            """, (wallet,))
+            outcomes = cur.fetchone() or (0, 0)
+
+    tokens_found = int(candidate[0] or 0)
+    early_score = float(candidate[1] or 0)
+    repeat_early = int(candidate[2] or 0)
+    successful_calls = int(historical[0] or 0)
+    failed_calls = int(historical[1] or 0)
+    copyability = float(historical[2] or 0)
+    outcome_tokens = int(outcomes[0] or 0)
+    positive_outcomes = int(outcomes[1] or 0)
+
+    score = 10.0
+    score += min(tokens_found * 8.0, 24.0)
+    score += min(early_score * 0.25, 25.0)
+    score += min(repeat_early * 8.0, 20.0)
+    score += min(successful_calls * 8.0, 20.0)
+    score -= min(failed_calls * 5.0, 20.0)
+    score += min(copyability * 0.05, 5.0)
+    if outcome_tokens:
+        score += min(positive_outcomes * 4.0, 12.0)
+        if positive_outcomes / outcome_tokens < 0.35:
+            score -= 8.0
+
+    flags = []
+    if tokens_found < 2:
+        flags.append("single_token_evidence")
+    if repeat_early < 2:
+        flags.append("repeat_early_entry_evidence_pending")
+    if outcome_tokens < 3:
+        flags.append("forward_outcome_sample_pending")
+    return {
+        "score": max(0, min(round(score, 1), 100)),
+        "flags": flags,
+        "source": "onchain_evidence",
+        "tokens_found": tokens_found,
+        "average_early_entry_score": round(early_score, 2),
+        "repeat_early_entries": repeat_early,
+        "historical_successful_calls": successful_calls,
+        "historical_failed_calls": failed_calls,
+        "forward_outcome_tokens": outcome_tokens,
+        "positive_forward_outcomes": positive_outcomes,
+    }
+
+
+def persist_onchain_evidence_score(wallet, scoring):
+    """Update the evidence score while preserving any historical PnL fields."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE candidate_wallets SET score = %s, score_status = 'scored',
+                    score_source = 'onchain_evidence', last_scored = NOW(),
+                    updated_at = NOW() WHERE wallet = %s
+            """, (scoring["score"], wallet))
+        conn.commit()
+
+
 def persist_score(wallet, metrics, score, score_status):
     with db() as conn:
         with conn.cursor() as cur:
@@ -1768,6 +1829,71 @@ def persist_token_validation(wallet, rows):
         conn.commit()
 
 
+def load_forward_validation_rows(wallet=None):
+    """Return per-token forward returns from our own stored checkpoints."""
+    parameters = () if wallet is None else (wallet,)
+    wallet_filter = "" if wallet is None else "AND later.wallet = %s"
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT later.wallet, later.token_address,
+                    MAX(activity.token_symbol),
+                    AVG((later.price_usd / baseline.price_usd - 1) * 100),
+                    COUNT(*), MAX(later.captured_at)
+                FROM wallet_observation_snapshots later
+                JOIN wallet_observation_snapshots baseline
+                    ON baseline.signature = later.signature
+                    AND baseline.wallet = later.wallet
+                    AND baseline.token_address = later.token_address
+                    AND baseline.horizon_hours = 0
+                LEFT JOIN wallet_observation_activity activity
+                    ON activity.signature = later.signature
+                    AND activity.wallet = later.wallet
+                    AND activity.token_address = later.token_address
+                WHERE later.horizon_hours IN (6, 24, 168)
+                    AND later.price_usd IS NOT NULL
+                    AND baseline.price_usd IS NOT NULL
+                    AND baseline.price_usd > 0
+                    {wallet_filter}
+                GROUP BY later.wallet, later.token_address
+            """, parameters)
+            rows = cur.fetchall()
+    return [{
+        "wallet": row[0], "token_address": row[1], "token_symbol": row[2],
+        "return_pct": float(row[3]), "checkpoints": row[4],
+        "validated_at": row[5],
+    } for row in rows]
+
+
+def summarize_forward_validation(rows):
+    returns = [row["return_pct"] for row in rows]
+    profitable = [value for value in returns if value > 0]
+    losing = [value for value in returns if value < 0]
+    gains = sum(profitable)
+    losses = abs(sum(losing))
+    sample = len(returns)
+    return {
+        "validation_source": "forward_observations",
+        "strategy_tokens": sample,
+        "material_tokens": sample,
+        "material_profitable_tokens": len(profitable),
+        "material_token_profit_rate": len(profitable) / sample if sample else None,
+        "material_profit_factor": gains / losses if losses else None,
+        "material_profit_factor_status": (
+            "calculated" if losses else
+            "no_material_losses" if gains else
+            "insufficient_material_outcomes"
+        ),
+        "validation_strength": (
+            "strong" if sample >= 5 else "moderate" if sample >= 3 else "limited"
+        ),
+        "average_forward_return_pct": (
+            round(sum(returns) / sample, 2) if sample else None
+        ),
+        "provider_independent": True,
+    }
+
+
 # =========================================================
 # HOME / HEALTH
 # =========================================================
@@ -1788,7 +1914,6 @@ def health():
     checks = {
         "database": False,
         "helius_key": bool(os.getenv("HELIUS_API_KEY")),
-        "birdeye_key": bool(os.getenv("BIRDEYE_API_KEY")),
     }
     try:
         initialise_database()
@@ -1802,7 +1927,12 @@ def health():
     healthy = all(checks.values())
     return jsonify({
         "status": "healthy" if healthy else "configuration_required",
-        "checks": checks, "version": VERSION, "birdeye_rps": BIRDEYE_RPS,
+        "checks": checks, "version": VERSION,
+        "providers": {
+            "solana_transactions": "helius",
+            "market_data": "dexscreener",
+            "birdeye_required": False,
+        },
     }), 200 if healthy else 503
 
 
@@ -1811,9 +1941,9 @@ def diagnostics():
     """Secret-free operational counters for this application process."""
     with _diagnostic_lock:
         counters = dict(_diagnostics)
-    return jsonify({"success": True, "version": VERSION, "premium_mode": True,
+    return jsonify({"success": True, "version": VERSION, "premium_mode": False,
                     "paper_mode": True, "signals_actionable": False,
-                    "birdeye_rps": BIRDEYE_RPS,
+                    "birdeye_required": False,
                     "discovery_max_tokens": DISCOVERY_MAX_TOKENS,
                     "pipeline_max_seconds": PIPELINE_MAX_SECONDS,
                     "signal_window_minutes": SIGNAL_WINDOW_MINUTES,
@@ -2063,13 +2193,25 @@ def candidate_probation_assessment(wallet):
         candidate, {"risk_score": row[10], "risk_flags": risk_flags},
         validation_summaries.get(wallet), repeat_evidence.get(wallet, {}),
     )
+    validation = validation_summaries.get(wallet) or {}
+    provider_independent_performance = bool(
+        validation.get("provider_independent")
+        and validation.get("validation_strength") in {"moderate", "strong"}
+        and (validation.get("material_token_profit_rate") or 0) >= 0.50
+    )
     hard_risks = {"service_like_activity", "bursty_automated_activity"}
     probation_requirements = {
         "scored_at_least_30": row[8] == "scored" and (row[7] or 0) >= 30,
         "screened_low_risk": row[9] == "screened" and row[10] is not None and row[10] <= 25,
         "no_hard_service_or_bot_risk": not bool(set(risk_flags) & hard_risks),
-        "meaningful_trade_history": row[5] is not None and row[5] >= 30,
-        "positive_realized_pnl": row[2] is not None and row[2] > 0,
+        "meaningful_performance_sample": (
+            (row[5] is not None and row[5] >= 30)
+            or provider_independent_performance
+        ),
+        "positive_performance_evidence": (
+            (row[2] is not None and row[2] > 0)
+            or provider_independent_performance
+        ),
     }
     classification["probation_requirements"] = probation_requirements
     classification["signal_ready"] = classification["classification"] in {"WATCH", "ASYMMETRIC"}
@@ -2121,8 +2263,6 @@ def load_dex_wallet_pipeline_status():
                             AND candidate.screening_status = 'screened'
                             AND candidate.screening_risk_score IS NOT NULL
                             AND candidate.screening_risk_score <= 25
-                            AND candidate.trades_30d >= 30
-                            AND candidate.realized_pnl_30d > 0
                             AND COALESCE(screening.risk_flags, '[]')
                                 NOT LIKE '%%service_like_activity%%'
                             AND COALESCE(screening.risk_flags, '[]')
@@ -2168,8 +2308,6 @@ def load_dex_wallet_pipeline_status():
                     AND candidate.screening_status = 'screened'
                     AND candidate.screening_risk_score IS NOT NULL
                     AND candidate.screening_risk_score <= 25
-                    AND candidate.trades_30d >= 30
-                    AND candidate.realized_pnl_30d > 0
                     AND COALESCE(screening.risk_flags, '[]')
                         NOT LIKE '%%service_like_activity%%'
                     AND COALESCE(screening.risk_flags, '[]')
@@ -2907,7 +3045,26 @@ def load_historical_winner_leaderboard(limit=100):
 
 
 def run_historical_winner_miner(limit):
-    """Label bounded discovery tokens and attribute early, copyable calls."""
+    """Historical OHLCV backfill was retired with the Birdeye dependency."""
+    return {
+        "success": True,
+        "run_id": None,
+        "status": "replaced_by_forward_observations",
+        "stop_reason": None,
+        "tokens_selected": 0,
+        "tokens_completed": 0,
+        "calls_recorded": 0,
+        "results": [],
+        "paper_mode": True,
+        "actionable": False,
+        "consensus_weight": 0,
+        "note": (
+            "Historical provider backfill is retired. Helius wallet activity "
+            "and DexScreener 0h/1h/6h/24h/7d forward checkpoints now build evidence."
+        ),
+    }
+
+    # Retained below for database migration compatibility with earlier builds.
     limit = min(max(int(limit), 1), HISTORICAL_MINER_MAX_TOKENS)
     deadline = time.monotonic() + HISTORICAL_MINER_MAX_SECONDS
     now = datetime.now(timezone.utc)
@@ -2955,7 +3112,7 @@ def run_historical_winner_miner(limit):
         if discovered_at.tzinfo is None:
             discovered_at = discovered_at.replace(tzinfo=timezone.utc)
         try:
-            response = birdeye_get("/defi/v3/ohlcv", {
+            response = retired_provider_call("/defi/v3/ohlcv", {
                 "address": token_address, "type": "1H", "mode": "range",
                 "time_from": int(discovered_at.timestamp()),
                 "time_to": int(now.timestamp()), "currency": "usd",
@@ -2968,7 +3125,7 @@ def run_historical_winner_miner(limit):
             break
         if response.status_code == 429:
             results.append({"token_address": token_address, "status": 429})
-            stop_reason = "birdeye_429"
+            stop_reason = "retired_provider_429"
             break
         if response.status_code != 200:
             results.append({"token_address": token_address,
@@ -3245,6 +3402,17 @@ def discover():
     - accepts ?offset=N so successive runs can rotate through the universe;
     - preserves cross-token observations in the existing evidence tables.
     """
+    return jsonify({
+        "success": False,
+        "status": "retired",
+        "replacement": "/discover-dex-wallets",
+        "method": "POST",
+        "providers": ["dexscreener", "helius"],
+        "birdeye_required": False,
+        "note": "Use the authenticated DexScreener + Helius discovery route.",
+    }), 410
+
+    # Retained below for database migration compatibility with earlier builds.
     initialise_database()
     try:
         token_limit = int(request.args.get("tokens", 25))
@@ -3273,7 +3441,7 @@ def discover():
     page_offset = start_offset
     while len(tokens) < token_limit:
         page_limit = min(DISCOVERY_PAGE_SIZE, token_limit - len(tokens))
-        trending_response = birdeye_get("/defi/token_trending", {
+        trending_response = retired_provider_call("/defi/token_trending", {
             "sort_by": "rank",
             "sort_type": "asc",
             "offset": page_offset,
@@ -3341,7 +3509,7 @@ def discover():
         token_symbol = token.get("symbol")
         token_name = token.get("name")
 
-        trader_response = birdeye_get("/defi/v2/tokens/top_traders", {
+        trader_response = retired_provider_call("/defi/v2/tokens/top_traders", {
             "address": token_address,
             "time_frame": "30d",
             "sort_type": "desc",
@@ -3459,66 +3627,26 @@ def score_wallet(wallet):
     initialise_database()
     if not is_valid_solana_address(wallet):
         return jsonify({"success": False, "error": "Invalid Solana wallet address"}), 400
-
-    response = birdeye_get("/wallet/v2/pnl/summary", {"wallet": wallet, "duration": "30d"})
-    if response.status_code != 200:
-        return jsonify({
-            "success": False,
-            "status_code": response.status_code,
-            "birdeye_error": response.text[:1000],
-        }), response.status_code
-
-    try:
-        parsed = parse_pnl_summary(response.json())
-    except Exception:
-        return jsonify({"success": False, "error": "Birdeye returned invalid JSON"}), 502
-
-    metrics = parsed["metrics"]
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT tokens_found FROM candidate_wallets WHERE wallet = %s", (wallet,))
-            row = cur.fetchone()
-            tokens_found = row[0] if row else 0
-
-    metrics_available = any(value is not None for value in metrics.values())
-    if metrics_available:
-        score_result = calculate_score(
-            metrics.get("realized_pnl"), metrics.get("total_pnl"),
-            metrics.get("win_rate"), metrics.get("trades"),
-            tokens_found, metrics.get("invested"),
-        )
-        score_status = "scored"
-    else:
-        score_result = {
-            "score": 0,
-            "flags": ["pnl_parse_incomplete"],
-            "capital_efficiency": None,
-        }
-        score_status = "parse_incomplete"
-
-    persist_score(wallet, metrics, score_result["score"], score_status)
+    score_result = calculate_onchain_evidence_score(wallet)
+    if score_result is None:
+        return jsonify({"success": False, "error": "Wallet is not a candidate"}), 404
+    persist_onchain_evidence_score(wallet, score_result)
     return jsonify({
         "success": True,
         "wallet": wallet,
-        "tokens_found": tokens_found,
+        "tokens_found": score_result["tokens_found"],
         "score": score_result["score"],
-        "score_status": score_status,
+        "score_status": "scored",
+        "score_source": score_result["source"],
         "risk_flags": score_result["flags"],
-        "capital_efficiency": score_result["capital_efficiency"],
-        "30d": {
-            "realized_pnl_usd": metrics.get("realized_pnl"),
-            "total_pnl_usd": metrics.get("total_pnl"),
-            "win_rate": metrics.get("win_rate"),
-            "trades": metrics.get("trades"),
-            "total_invested_usd": metrics.get("invested"),
-        },
-        "parser_debug": parsed.get("debug", {}),
+        "evidence": score_result,
+        "note": "Provider-independent research score; no wallet PnL is inferred.",
     })
 
 
 @app.get("/score-batch")
 def score_batch():
-    """Score at most five candidates, throttling requests and stopping on 429."""
+    """Score at most five candidates from persisted on-chain evidence."""
     initialise_database()
     try:
         limit = int(request.args.get("limit", 5))
@@ -3531,6 +3659,7 @@ def score_batch():
             cur.execute("""
                 SELECT wallet, tokens_found FROM candidate_wallets
                 WHERE last_scored IS NULL OR score_status = 'parse_incomplete'
+                    OR score_source <> 'onchain_evidence'
                 ORDER BY EXISTS (
                     SELECT 1 FROM wallet_discovery_cohorts cohort
                     WHERE cohort.wallet = candidate_wallets.wallet
@@ -3541,59 +3670,19 @@ def score_batch():
             wallets = cur.fetchall()
 
     results = []
-    stopped_on_429 = False
     for wallet, tokens_found in wallets:
-        # Batch mode must stop immediately on a 429, so it deliberately disables retry.
-        response = birdeye_get(
-            "/wallet/v2/pnl/summary",
-            {"wallet": wallet, "duration": "30d"},
-            retry_429=False,
-        )
-        if response.status_code == 429:
-            results.append({
-                "wallet": wallet,
-                "status": 429,
-                "message": "Birdeye rate limit reached; batch stopped",
-            })
-            stopped_on_429 = True
-            break
-        if response.status_code != 200:
-            results.append({"wallet": wallet, "status": response.status_code})
+        scoring = calculate_onchain_evidence_score(wallet)
+        if scoring is None:
+            results.append({"wallet": wallet, "status": 404})
             continue
-
-        try:
-            parsed = parse_pnl_summary(response.json())
-        except Exception:
-            results.append({"wallet": wallet, "status": "parse_error"})
-            continue
-
-        metrics = parsed["metrics"]
-        if any(value is not None for value in metrics.values()):
-            scoring = calculate_score(
-                metrics.get("realized_pnl"), metrics.get("total_pnl"),
-                metrics.get("win_rate"), metrics.get("trades"),
-                tokens_found, metrics.get("invested"),
-            )
-            score_status = "scored"
-        else:
-            scoring = {
-                "score": 0,
-                "flags": ["pnl_parse_incomplete"],
-                "capital_efficiency": None,
-            }
-            score_status = "parse_incomplete"
-
-        persist_score(wallet, metrics, scoring["score"], score_status)
+        persist_onchain_evidence_score(wallet, scoring)
         results.append({
             "wallet": wallet,
             "status": 200,
             "score": scoring["score"],
-            "score_status": score_status,
+            "score_status": "scored",
+            "score_source": scoring["source"],
             "tokens_found": tokens_found,
-            "realized_pnl": metrics.get("realized_pnl"),
-            "win_rate": metrics.get("win_rate"),
-            "trades": metrics.get("trades"),
-            "capital_efficiency": scoring["capital_efficiency"],
             "risk_flags": scoring["flags"],
         })
 
@@ -3602,7 +3691,8 @@ def score_batch():
         "requested": limit,
         "selected": len(wallets),
         "processed": len(results),
-        "stopped_on_429": stopped_on_429,
+        "stopped_on_429": False,
+        "score_source": "onchain_evidence",
         "results": results,
     })
 
@@ -3918,13 +4008,23 @@ def discovery_evidence():
 
 
 def validate_wallet_tokens(wallet, token_addresses=None):
-    body = {
-        "wallet": wallet, "duration": "30d", "position_scope": "duration_only",
-        "sort_type": "desc", "sort_by": "last_trade", "limit": 20, "offset": 0,
-    }
+    rows = load_forward_validation_rows(wallet)
     if token_addresses:
-        body["token_addresses"] = token_addresses[:20]
-    return birdeye_post("/wallet/v2/pnl/details", body)
+        allowed = set(token_addresses[:20])
+        rows = [row for row in rows if row["token_address"] in allowed]
+    return rows
+
+
+def persist_forward_validation_status(wallet, rows):
+    status = "validated" if len(rows) >= 3 else "evidence_collecting"
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE candidate_wallets SET validation_status = %s,
+                    last_validated = NOW(), updated_at = NOW() WHERE wallet = %s
+            """, (status, wallet))
+        conn.commit()
+    return status
 
 
 @app.get("/validate-wallet/<wallet>")
@@ -3936,21 +4036,16 @@ def validate_wallet(wallet):
     if not candidate:
         return jsonify({"success": False, "error": "Wallet is not a candidate"}), 404
 
-    response = validate_wallet_tokens(wallet)
-    if response.status_code != 200:
-        return jsonify({
-            "success": False, "status_code": response.status_code,
-            "birdeye_error": response.text[:1000],
-        }), response.status_code
-    try:
-        rows = parse_token_pnl_details(response.json())
-    except Exception:
-        return jsonify({"success": False, "error": "Birdeye returned invalid JSON"}), 502
-    persist_token_validation(wallet, rows)
+    rows = validate_wallet_tokens(wallet)
+    status = persist_forward_validation_status(wallet, rows)
+    summary = summarize_forward_validation(rows)
     return jsonify({
         "success": True, "wallet": wallet,
-        "summary": summarize_token_validation(rows), "tokens": rows,
-        "note": "Per-token results are a bounded 30-day sample and may omit unsupported protocol history.",
+        "validation_status": status, "summary": summary, "tokens": rows,
+        "note": (
+            "Validation uses stored 6h/24h/7d forward checkpoints. "
+            "At least three token outcomes are required for validation."
+        ),
     })
 
 
@@ -3971,7 +4066,9 @@ def validate_batch():
                 LEFT JOIN wallet_screenings ws ON ws.wallet = c.wallet
                     AND ws.screening_version = %s
                 WHERE c.score_status = 'scored' AND c.score >= 30
-                    AND c.validation_status IN ('unvalidated', 'parse_incomplete')
+                    AND c.validation_status IN (
+                        'unvalidated', 'parse_incomplete', 'evidence_collecting'
+                    )
                     AND COALESCE(ws.risk_score, 100) <= 45
                     AND COALESCE(ws.risk_flags, '[]') NOT LIKE '%%service_like_activity%%'
                 ORDER BY EXISTS (
@@ -3986,32 +4083,21 @@ def validate_batch():
             wallets = [row[0] for row in cur.fetchall()]
 
     results = []
-    stopped_on_429 = False
     for wallet in wallets:
-        response = validate_wallet_tokens(wallet)
-        if response.status_code == 429:
-            results.append({"wallet": wallet, "status": 429, "message": "Birdeye rate limit reached; batch stopped"})
-            stopped_on_429 = True
-            break
-        if response.status_code != 200:
-            results.append({"wallet": wallet, "status": response.status_code})
-            continue
-        try:
-            rows = parse_token_pnl_details(response.json())
-        except Exception:
-            results.append({"wallet": wallet, "status": "parse_error"})
-            continue
-        persist_token_validation(wallet, rows)
+        rows = validate_wallet_tokens(wallet)
+        validation_status = persist_forward_validation_status(wallet, rows)
         results.append({
             "wallet": wallet, "status": 200,
-            "summary": summarize_token_validation(rows),
+            "validation_status": validation_status,
+            "summary": summarize_forward_validation(rows),
             "tokens_preview": rows[:5],
             "tokens_preview_truncated": len(rows) > 5,
         })
 
     return jsonify({
         "success": True, "requested": limit, "selected": len(wallets),
-        "processed": len(results), "stopped_on_429": stopped_on_429,
+        "processed": len(results), "stopped_on_429": False,
+        "validation_source": "forward_observations",
         "results": results,
     })
 
@@ -4046,7 +4132,7 @@ def validations():
 # =========================================================
 
 def load_validation_summaries():
-    """Build current per-wallet validation summaries from persisted token rows."""
+    """Prefer provider-independent forward outcomes; retain legacy history."""
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -4069,10 +4155,16 @@ def load_validation_summaries():
             "win_rate": row[7],
             "validated_at": row[8],
         })
-    return {
+    summaries = {
         wallet: summarize_token_validation(token_rows)
         for wallet, token_rows in grouped.items()
     }
+    forward_grouped = {}
+    for row in load_forward_validation_rows():
+        forward_grouped.setdefault(row["wallet"], []).append(row)
+    for wallet, token_rows in forward_grouped.items():
+        summaries[wallet] = summarize_forward_validation(token_rows)
+    return summaries
 
 
 def load_repeat_evidence():
@@ -4189,6 +4281,19 @@ def classify_candidate(candidate, screening=None, validation=None, evidence=None
     material_rate = validation.get("material_token_profit_rate")
     profit_factor = validation.get("material_profit_factor")
     validation_strength = validation.get("validation_strength")
+    provider_independent = bool(validation.get("provider_independent"))
+    performance_sample_ready = (
+        (trades is not None and trades >= 30)
+        or (provider_independent and score >= 50)
+    )
+    positive_performance_ready = (
+        (realized is not None and realized > 0)
+        or (
+            provider_independent
+            and material_rate is not None
+            and material_rate >= 0.30
+        )
+    )
 
     if validation_status != "validated" or not validation:
         reasons.append("token_validation_required")
@@ -4272,10 +4377,8 @@ def classify_candidate(candidate, screening=None, validation=None, evidence=None
             profit_factor is None
             or profit_factor >= 2.0
         )
-        and trades is not None
-        and trades >= 30
-        and realized is not None
-        and realized > 0
+        and performance_sample_ready
+        and positive_performance_ready
     )
 
     # ASYMMETRIC preserves low-risk wallets whose hit rate is below WATCH
@@ -4292,10 +4395,8 @@ def classify_candidate(candidate, screening=None, validation=None, evidence=None
         and 0.30 <= material_rate < 0.60
         and profit_factor is not None
         and profit_factor >= 5.0
-        and trades is not None
-        and trades >= 30
-        and realized is not None
-        and realized > 0
+        and performance_sample_ready
+        and positive_performance_ready
     )
 
     if watch_core:
@@ -4832,17 +4933,6 @@ def solana_status_label(status, buy_clusters=0, sell_clusters=0):
     return status.replace("_", " ")
 
 
-def _birdeye_payload(response):
-    if response.status_code != 200:
-        return {}
-    try:
-        payload = response.json()
-    except ValueError:
-        return {}
-    data = payload.get("data") if isinstance(payload, dict) else None
-    return data if isinstance(data, dict) else {}
-
-
 def _solana_safety_status(security):
     """Conservative provider screening; it never upgrades a token to 'safe'."""
     if not security:
@@ -4879,9 +4969,9 @@ def _solana_safety_status(security):
 
 
 def enrich_solana_token_metadata(token_addresses, limit=None):
-    """Bounded Birdeye metadata/security enrichment with a persistent cache."""
+    """Bounded DexScreener metadata enrichment with a persistent cache."""
     limit = SOLANA_METADATA_PER_REFRESH if limit is None else max(int(limit), 0)
-    if not os.getenv("BIRDEYE_API_KEY") or limit == 0:
+    if limit == 0:
         return {}
     ordered = list(dict.fromkeys(address for address in token_addresses if address))
     if not ordered:
@@ -4914,31 +5004,44 @@ def enrich_solana_token_metadata(token_addresses, limit=None):
     ][:limit]
     for address in due:
         symbol = name = None
-        security_data = {}
+        safety_status = "unverified"
+        safety_details = {
+            "reason": "contract_security_data_unavailable",
+            "metadata_provider": "dexscreener",
+        }
         try:
-            overview = _birdeye_payload(birdeye_get(
-                "/defi/token_overview", {"address": address}, retry_429=False
-            ))
-            symbol = overview.get("symbol") or overview.get("tokenSymbol")
-            name = overview.get("name") or overview.get("tokenName")
-            security_data = _birdeye_payload(birdeye_get(
-                "/defi/token_security", {"address": address}, retry_429=False
-            ))
-        except (requests.Timeout, requests.ConnectionError):
+            response = upstream_request(
+                "GET", DEXSCREENER_TOKEN_URL.format(address=address),
+                timeout=10, retries=0, provider="dexscreener",
+            )
+            payload = response.json() if response.status_code == 200 else {}
+            pair = select_solana_discovery_pair(payload, address)
+            token = {}
+            if pair:
+                token = (
+                    pair.get("baseToken")
+                    if (pair.get("baseToken") or {}).get("address") == address
+                    else pair.get("quoteToken")
+                ) or {}
+            symbol = token.get("symbol")
+            name = token.get("name")
+            safety_details["pair_address"] = pair.get("pairAddress") if pair else None
+        except (requests.Timeout, requests.ConnectionError, ValueError):
             pass
-        safety_status, safety_details = _solana_safety_status(security_data)
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO solana_token_metadata (
                         token_address, token_symbol, token_name, safety_status,
-                        safety_details, last_attempted_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+                        safety_details, metadata_provider,
+                        last_attempted_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, 'dexscreener', NOW(), NOW())
                     ON CONFLICT (token_address) DO UPDATE SET
                         token_symbol = COALESCE(EXCLUDED.token_symbol, solana_token_metadata.token_symbol),
                         token_name = COALESCE(EXCLUDED.token_name, solana_token_metadata.token_name),
                         safety_status = EXCLUDED.safety_status,
                         safety_details = EXCLUDED.safety_details,
+                        metadata_provider = 'dexscreener',
                         last_attempted_at = NOW(), updated_at = NOW()
                 """, (address, symbol, name, safety_status, json.dumps(safety_details)))
             conn.commit()
@@ -10014,7 +10117,7 @@ def premium_funnel():
             if status != 200:
                 results.append(item)
                 if status == 429:
-                    stopped_reason = "birdeye_429"
+                    stopped_reason = "scoring_rate_limit"
                     break
                 continue
             candidate = candidate_for_screening(wallet)
@@ -10073,7 +10176,7 @@ def premium_funnel():
             response, status = result if isinstance(result, tuple) else (result, result.status_code)
             item["stages"]["validation"] = status
             if status == 429:
-                stopped_reason = "birdeye_429"
+                stopped_reason = "validation_rate_limit"
         else:
             item["stages"]["validation"] = "already_complete"
         results.append(item)
