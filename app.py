@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "5.0.0-decision-dashboard"
+VERSION = "5.0.1-gmgn-links"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -11671,7 +11671,7 @@ const age=s=>{if(s==null)return'unknown';if(s<3600)return Math.max(1,Math.round(
 const when=v=>v?new Date(v).toLocaleString():'—';
 const trend=v=>v==null?'<span class="neutral">—</span>':`<span class="${v>0?'pos':v<0?'neg':'neutral'}">${v>0?'+':''}${num(v)}%</span>`;
 const cls=v=>String(v||'').toLowerCase().replace(/[^a-z]+/g,'-');
-const tokenLink=x=>x.dexscreener_url?`<a class="link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener"><span class="token">${esc(x.token_symbol)}</span> ↗</a>`:`<span class="token">${esc(x.token_symbol)}</span>`;
+const tokenLink=x=>{const slug={solana:'sol',base:'base',bsc:'bsc',robinhood:'robinhood'}[x.chain],address=String(x.token_address||'');return slug&&address&&address!=='native'?`<a class="link" href="https://gmgn.ai/${slug}/token/${encodeURIComponent(address)}" target="_blank" rel="noopener" title="Open exact token in GMGN"><span class="token">${esc(x.token_symbol)}</span> ↗</a>`:`<span class="token">${esc(x.token_symbol)}</span>`};
 function decisionPill(v){return `<span class="pill ${cls(v)}">${esc(v)}</span>`}
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json(),s=d.v5_summary||{};
 document.getElementById('researchCount').textContent=num(s.research_now);document.getElementById('watchCount').textContent=num(s.watch);document.getElementById('emergingCount').textContent=num(s.emerging);document.getElementById('reviewCount').textContent=num(s.portfolio_review);document.getElementById('walletEdge').textContent=`${num(s.positive_wallets_24h)} / ${num(s.measured_wallets_24h)}`;document.getElementById('refreshState').textContent='Live · '+new Date().toLocaleTimeString();
