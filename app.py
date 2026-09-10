@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "4.26.2-portfolio-discovery"
+VERSION = "5.0.0-decision-dashboard"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -11365,14 +11365,328 @@ load();setInterval(load,60000);
 </script></body></html>"""
 
 
+def _v5_seconds_since(value, now):
+    """Return a bounded age for datetime or dashboard-serialized timestamps."""
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.strptime(value, "%a, %d %b %Y %H:%M:%S GMT").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return max(int((now - value).total_seconds()), 0)
+
+
+def build_v5_dashboard_views(payload):
+    """Convert the research pipelines into a small, decision-focused view."""
+    now = datetime.now(timezone.utc)
+    emerging = {}
+
+    def upsert(item):
+        address = str(item.get("token_address") or "").lower()
+        if not address:
+            return
+        key = (item.get("chain") or "unknown", address)
+        existing = emerging.get(key)
+        if existing is None or item.get("opportunity_score", 0) > existing.get(
+            "opportunity_score", 0
+        ):
+            emerging[key] = item
+
+    def finish(item):
+        score = max(0, min(int(round(item.pop("_score", 0))), 100))
+        signal_age = item.get("signal_age_seconds")
+        pair_age = item.get("pair_age_seconds")
+        liquidity = safe_float(item.get("liquidity_usd"))
+        volume = safe_float(item.get("volume_h1_usd"))
+        safety = str(item.get("safety_status") or "unverified").lower()
+        sellers = int(item.get("sell_clusters") or 0)
+        buyers = int(item.get("qualified_buyers") or item.get("buy_clusters") or 0)
+        reasons = list(item.get("reasons") or [])
+
+        if liquidity is not None and liquidity < 10000:
+            score = min(score, 29)
+            reasons.append("liquidity below $10k")
+        if volume is not None and volume < 500:
+            score = min(score, 34)
+            reasons.append("very low 1h volume")
+        if sellers > buyers and sellers:
+            score = min(score, 24)
+            reasons.append("selling outweighs buying")
+
+        stale = signal_age is not None and signal_age > 72 * 3600
+        old_pair = pair_age is not None and pair_age > 14 * 86400
+        if stale:
+            status = "EXPIRED"
+        elif sellers > buyers and sellers:
+            status = "AVOID"
+        elif old_pair and buyers < 2:
+            status = "TOO LATE"
+        elif score >= 75 and safety not in {"unverified", "unknown", "not checked"}:
+            status = "RESEARCH NOW"
+        elif score >= 35:
+            status = "WATCH"
+        else:
+            status = "AVOID"
+
+        if safety in {"unverified", "unknown", "not checked"}:
+            reasons.append("safety not verified")
+        item["opportunity_score"] = score
+        item["decision"] = status
+        item["reasons"] = list(dict.fromkeys(reasons))[:4]
+        item["actionable"] = False
+        item["paper_mode"] = True
+        return item
+
+    outbound = payload.get("evm_outbound_discoveries", {}).get("discoveries", [])
+    for row in outbound:
+        signal_age = _v5_seconds_since(row.get("last_purchase_at"), now)
+        pair_age = row.get("pair_age_seconds")
+        buyers = int(row.get("qualified_buyers") or 0)
+        successful = int(row.get("source_successful_history_tokens") or 0)
+        entry_rank = safe_float(row.get("best_source_entry_rank"))
+        liquidity = safe_float(row.get("liquidity_usd")) or 0
+        volume = safe_float(row.get("volume_h1_usd")) or 0
+        score = min(buyers * 10, 35) + min(successful * 4, 16)
+        if entry_rank is not None:
+            score += 10 if entry_rank <= 10 else 6 if entry_rank <= 25 else 0
+        score += 10 if liquidity >= 50000 else 6 if liquidity >= 25000 else 0
+        score += 9 if volume >= 25000 else 6 if volume >= 5000 else 2 if volume >= 1000 else 0
+        if signal_age is not None:
+            score += 15 if signal_age <= 3600 else 12 if signal_age <= 6 * 3600 else 8 if signal_age <= 24 * 3600 else 3 if signal_age <= 72 * 3600 else 0
+        upsert(finish({
+            "chain": "robinhood", "chain_label": "Robinhood Chain",
+            "token_address": row.get("token_address"),
+            "token_symbol": row.get("token_symbol") or "Unknown",
+            "source": "EARLY-BUYER DISCOVERY", "_score": score,
+            "qualified_buyers": buyers, "buy_clusters": buyers,
+            "sell_clusters": 0, "successful_history_tokens": successful,
+            "best_entry_rank": entry_rank,
+            "signal_age_seconds": signal_age, "pair_age_seconds": pair_age,
+            "liquidity_usd": row.get("liquidity_usd"),
+            "volume_h1_usd": row.get("volume_h1_usd"),
+            "safety_status": "not checked",
+            "last_activity_at": row.get("last_purchase_at"),
+            "dexscreener_url": (
+                f"https://dexscreener.com/robinhood/{row.get('token_address')}"
+            ),
+            "reasons": [
+                f"{buyers} qualified early buyer{'s' if buyers != 1 else ''}",
+                f"{successful} successful source-token outcome{'s' if successful != 1 else ''}",
+            ],
+        }))
+
+    paper = payload.get("evm_paper_signals", {})
+    for active, rows in ((True, paper.get("signals", [])), (False, paper.get("candidates", []))):
+        for row in rows:
+            signal_age = _v5_seconds_since(
+                row.get("last_qualified_purchase_at") or row.get("last_observed_at"), now
+            )
+            buyers = int(row.get("qualified_buyers") or 0)
+            successful = int(row.get("successful_history_tokens") or 0)
+            liquidity = safe_float(row.get("liquidity_usd")) or 0
+            volume = safe_float(row.get("volume_h1_usd")) or 0
+            score = min(buyers * 12, 36) + min(successful * 5, 15)
+            score += 12 if active else 4
+            score += 8 if liquidity >= 25000 else 0
+            score += 7 if volume >= 5000 else 2 if volume >= 1000 else 0
+            if signal_age is not None:
+                score += 12 if signal_age <= 6 * 3600 else 7 if signal_age <= 24 * 3600 else 0
+            upsert(finish({
+                "chain": "robinhood", "chain_label": "Robinhood Chain",
+                "token_address": row.get("token_address"),
+                "token_symbol": row.get("token_symbol") or "Unknown",
+                "source": "PAPER SIGNAL" if active else "PAPER CANDIDATE",
+                "_score": score, "qualified_buyers": buyers,
+                "buy_clusters": buyers, "sell_clusters": 0,
+                "successful_history_tokens": successful,
+                "best_entry_rank": row.get("best_entry_rank"),
+                "signal_age_seconds": signal_age,
+                "pair_age_seconds": row.get("pair_age_seconds"),
+                "liquidity_usd": row.get("liquidity_usd"),
+                "volume_h1_usd": row.get("volume_h1_usd"),
+                "safety_status": row.get("safety_status") or "not checked",
+                "last_activity_at": row.get("last_qualified_purchase_at") or row.get("last_observed_at"),
+                "dexscreener_url": f"https://dexscreener.com/robinhood/{row.get('token_address')}",
+                "reasons": list(row.get("gate_reasons") or []) or [str(row.get("result") or "collecting")],
+            }))
+
+    for row in payload.get("solana_signals", []):
+        buyers = int(row.get("independent_buy_clusters") or 0)
+        sellers = int(row.get("independent_sell_clusters") or 0)
+        signal_age = row.get("signal_age_seconds")
+        score = min(buyers * 18, 45) + min((safe_float(row.get("buy_score")) or 0) * 15, 15)
+        score -= min(sellers * 10, 25)
+        if signal_age is not None:
+            score += 15 if signal_age <= 3600 else 10 if signal_age <= 6 * 3600 else 5 if signal_age <= 24 * 3600 else 0
+        upsert(finish({
+            "chain": "solana", "chain_label": "Solana",
+            "token_address": row.get("token_address"),
+            "token_symbol": row.get("token_symbol") or "Unknown",
+            "source": "LIVE WALLET CONSENSUS", "_score": score,
+            "qualified_buyers": buyers, "buy_clusters": buyers,
+            "sell_clusters": sellers, "successful_history_tokens": None,
+            "best_entry_rank": None, "signal_age_seconds": signal_age,
+            "pair_age_seconds": None, "liquidity_usd": None,
+            "volume_h1_usd": None,
+            "safety_status": row.get("safety_status") or "unverified",
+            "last_activity_at": row.get("last_activity_at"),
+            "dexscreener_url": row.get("dexscreener_url"),
+            "reasons": [row.get("display_status") or row.get("status") or "collecting"],
+        }))
+
+    decision_order = {"RESEARCH NOW": 0, "WATCH": 1, "TOO LATE": 2, "AVOID": 3, "EXPIRED": 4}
+    emerging_rows = [row for row in emerging.values() if row["decision"] != "EXPIRED"]
+    emerging_rows.sort(key=lambda row: (
+        decision_order.get(row["decision"], 9), -row["opportunity_score"],
+        row.get("signal_age_seconds") if row.get("signal_age_seconds") is not None else 10**12,
+    ))
+    research_now = [
+        row for row in emerging_rows if row["decision"] in {"RESEARCH NOW", "WATCH"}
+    ][:5]
+
+    portfolio = []
+    urgency_order = {"REVIEW": 0, "WEAKENING": 1, "STRENGTHENING": 2, "STABLE": 3, "DATA PENDING": 4}
+    for row in payload.get("evm_signals", []):
+        trends = row.get("trends") or {}
+        one_hour = safe_float((trends.get("1h") or {}).get("price_change_pct"))
+        six_hour = safe_float((trends.get("6h") or {}).get("price_change_pct"))
+        six_liquidity = safe_float((trends.get("6h") or {}).get("liquidity_change_pct"))
+        status = str(row.get("status") or "")
+        if status in {"EVM_RISK", "EVM_DISTRIBUTION", "EVM_CONFIRMED_BREAKDOWN", "EVM_DATA_ANOMALY"}:
+            urgency = "REVIEW"
+        elif (six_hour is not None and six_hour <= -10) or (six_liquidity is not None and six_liquidity <= -10):
+            urgency = "WEAKENING"
+        elif status in {"EVM_MOMENTUM", "EVM_HIGH_MOMENTUM", "EVM_REBOUND", "EVM_CONFIRMED_BREAKOUT"} and (one_hour or 0) > 0:
+            urgency = "STRENGTHENING"
+        elif row.get("data_quality") in {"wallet balance", "provider_unavailable"}:
+            urgency = "DATA PENDING"
+        else:
+            urgency = "STABLE"
+        portfolio.append({
+            "chain": row.get("chain"), "chain_label": row.get("chain_label"),
+            "token_address": row.get("token_address"),
+            "token_symbol": row.get("token_symbol"),
+            "dexscreener_url": row.get("dexscreener_url"),
+            "wallet_ui_balance": row.get("wallet_ui_balance"),
+            "wallet_usd_value": row.get("wallet_usd_value"),
+            "price_usd": row.get("price_usd"),
+            "liquidity_usd": row.get("liquidity_usd"),
+            "price_1h_pct": one_hour, "price_6h_pct": six_hour,
+            "price_24h_pct": safe_float((trends.get("24h") or {}).get("price_change_pct")),
+            "liquidity_6h_pct": six_liquidity,
+            "holder_change_24h": (trends.get("24h") or {}).get("holder_change"),
+            "monitor_state": status, "urgency": urgency,
+            "data_quality": row.get("data_quality"),
+            "last_checked_at": row.get("wallet_balance_checked_at"),
+        })
+    portfolio.sort(key=lambda row: (
+        urgency_order.get(row["urgency"], 9),
+        -(safe_float(row.get("wallet_usd_value")) or 0),
+        str(row.get("token_symbol") or ""),
+    ))
+
+    observation = payload.get("observation_wallets", [])
+    measured_24h = [
+        row for row in observation
+        if ((row.get("forward_outcomes") or {}).get("24h") or {}).get("samples", 0) > 0
+    ]
+    positive_24h = [
+        row for row in measured_24h
+        if safe_float(((row.get("forward_outcomes") or {}).get("24h") or {}).get("average_return_pct")) is not None
+        and safe_float(((row.get("forward_outcomes") or {}).get("24h") or {}).get("average_return_pct")) > 0
+    ]
+    return {
+        "research_now": research_now,
+        "emerging_signals": emerging_rows[:30],
+        "portfolio": portfolio,
+        "v5_summary": {
+            "research_now": sum(1 for row in research_now if row["decision"] == "RESEARCH NOW"),
+            "watch": sum(1 for row in emerging_rows if row["decision"] == "WATCH"),
+            "emerging": len(emerging_rows),
+            "portfolio_tokens": len(portfolio),
+            "portfolio_review": sum(1 for row in portfolio if row["urgency"] in {"REVIEW", "WEAKENING"}),
+            "measured_wallets_24h": len(measured_24h),
+            "positive_wallets_24h": len(positive_24h),
+        },
+        "v5_method": {
+            "paper_mode": True, "actionable": False,
+            "maximum_research_rows": 5,
+            "research_requires_verified_safety": True,
+            "signal_expiry_hours": 72,
+            "note": "Scores prioritise qualified-wallet evidence, freshness, entry timing and market quality. They are research rankings, not buy instructions.",
+        },
+    }
+
+
 @app.get("/dashboard-data")
 def dashboard_data_endpoint():
-    return jsonify(build_dashboard_payload())
+    payload = build_dashboard_payload()
+    payload.update(build_v5_dashboard_views(payload))
+    return jsonify(payload)
+
+
+V5_DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wallet Monitor V5</title>
+<style>
+:root{--bg:#071019;--panel:#0d1925;--panel2:#112131;--line:#22364a;--text:#e9f2fb;--muted:#8fa5b9;--cyan:#32d5e6;--green:#39d98a;--amber:#f7b955;--red:#ff6b78;--blue:#71a7ff}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top right,#10283a 0,#071019 42%);color:var(--text);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:1480px;margin:auto;padding:28px 24px 70px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{color:var(--cyan);font-size:11px;font-weight:800;letter-spacing:.16em;text-transform:uppercase}.top h1{font-size:30px;margin:5px 0 4px;letter-spacing:-.035em}.sub{color:var(--muted);max-width:760px}.live{display:flex;align-items:center;gap:8px;color:var(--muted);white-space:nowrap}.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green)}
+.metrics{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:12px;margin-bottom:28px}.metric,.panel,.signal-card,details{background:rgba(13,25,37,.92);border:1px solid var(--line);border-radius:14px}.metric{padding:14px 16px}.metric .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.metric .value{font-size:25px;font-weight:800;margin-top:3px}.metric .note{font-size:11px;color:var(--muted)}
+.section{margin-top:28px}.section-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:12px}.section h2{font-size:20px;margin:0}.section-copy{color:var(--muted);font-size:12px;margin-top:3px}.cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}.signal-card{padding:16px;min-height:216px;position:relative;overflow:hidden}.signal-card:before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:var(--blue)}.signal-card.research:before{background:var(--green)}.signal-card.avoid:before{background:var(--red)}.signal-top{display:flex;justify-content:space-between;gap:10px}.token{font-weight:800;font-size:17px}.chain{color:var(--muted);font-size:11px}.score{font-weight:900;font-size:24px}.decision{display:inline-block;margin:14px 0 10px;padding:4px 8px;border-radius:999px;background:#15283a;color:var(--blue);font-size:10px;font-weight:900;letter-spacing:.08em}.decision.research{background:rgba(57,217,138,.13);color:var(--green)}.decision.avoid{background:rgba(255,107,120,.13);color:var(--red)}.decision.late{background:rgba(247,185,85,.13);color:var(--amber)}.reason{color:var(--muted);font-size:12px;margin:3px 0}.link{color:var(--cyan);text-decoration:none}.empty{padding:35px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:14px;grid-column:1/-1}
+.panel{overflow:hidden}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1000px}th{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);text-align:left;background:#0a1621;position:sticky;top:0}th,td{padding:11px 12px;border-bottom:1px solid rgba(34,54,74,.72);vertical-align:top}tr:last-child td{border-bottom:0}tbody tr:hover{background:rgba(50,213,230,.035)}.small{font-size:11px;color:var(--muted)}.pos{color:var(--green)}.neg{color:var(--red)}.neutral{color:var(--muted)}.pill{display:inline-block;padding:3px 7px;border-radius:999px;font-size:10px;font-weight:850;letter-spacing:.04em;background:#15283a;color:var(--blue)}.pill.review,.pill.weakening,.pill.avoid{color:var(--red);background:rgba(255,107,120,.12)}.pill.strengthening,.pill.research{color:var(--green);background:rgba(57,217,138,.12)}.pill.late{color:var(--amber);background:rgba(247,185,85,.12)}
+details{margin-top:30px;padding:0}summary{cursor:pointer;padding:16px 18px;font-weight:800;list-style:none}summary::-webkit-details-marker{display:none}summary:after{content:"+";float:right;color:var(--cyan)}details[open] summary:after{content:"−"}.diagnostics{padding:0 18px 18px}.diag-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}.diag{background:var(--panel2);border-radius:10px;padding:11px}.diag b{display:block;font-size:18px}.diag span{color:var(--muted);font-size:10px;text-transform:uppercase}.warning{margin-top:12px;padding:12px;border-radius:10px;background:rgba(247,185,85,.08);border:1px solid rgba(247,185,85,.24);color:#f5d69b}.footer{text-align:center;color:var(--muted);font-size:11px;margin-top:24px}
+@media(max-width:1100px){.cards{grid-template-columns:repeat(2,1fr)}.metrics{grid-template-columns:repeat(3,1fr)}.diag-grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:650px){.wrap{padding:20px 12px 50px}.top{display:block}.live{margin-top:10px}.metrics{grid-template-columns:repeat(2,1fr)}.cards{grid-template-columns:1fr}.diag-grid{grid-template-columns:repeat(2,1fr)}}
+</style></head><body><main class="wrap">
+<div class="top"><div><div class="eyebrow">Decision dashboard · paper research only</div><h1>Wallet Monitor V5</h1><div class="sub">A short list of what deserves attention now. Scores rank research priority; they are not buy instructions.</div></div><div class="live"><span class="dot"></span><span id="refreshState">Loading live data…</span></div></div>
+<div class="metrics">
+<div class="metric"><div class="label">Research now</div><div class="value" id="researchCount">—</div><div class="note">Safety-verified only</div></div>
+<div class="metric"><div class="label">Watch</div><div class="value" id="watchCount">—</div><div class="note">Promising, gate missing</div></div>
+<div class="metric"><div class="label">Emerging</div><div class="value" id="emergingCount">—</div><div class="note">Fresh cross-chain signals</div></div>
+<div class="metric"><div class="label">Portfolio review</div><div class="value" id="reviewCount">—</div><div class="note">Weakening or risk state</div></div>
+<div class="metric"><div class="label">24h wallet edge</div><div class="value" id="walletEdge">—</div><div class="note">Positive / measured wallets</div></div>
+</div>
+
+<section class="section"><div class="section-head"><div><h2>Research Now</h2><div class="section-copy">The five strongest current opportunities, including watches awaiting one key confirmation.</div></div></div><div class="cards" id="researchCards"></div></section>
+
+<section class="section"><div class="section-head"><div><h2>Emerging Signals</h2><div class="section-copy">Solana consensus, Robinhood paper candidates and off-watchlist early-buyer discoveries in one ranked feed.</div></div></div><div class="panel table-wrap"><table><thead><tr><th>Coin</th><th>Decision</th><th>Score</th><th>Signal</th><th>Buyers</th><th>Buyer history</th><th>Best entry</th><th>Liquidity</th><th>1h volume</th><th>Safety</th><th>Why / missing gate</th></tr></thead><tbody id="emergingBody"></tbody></table></div></section>
+
+<section class="section"><div class="section-head"><div><h2>My Portfolio</h2><div class="section-copy" id="portfolioStatus">All detected non-zero holdings across the configured wallets.</div></div></div><div class="panel table-wrap"><table><thead><tr><th>Coin</th><th>Review state</th><th>Balance</th><th>Value</th><th>Price</th><th>1h</th><th>6h</th><th>24h</th><th>Liquidity</th><th>Holder change</th><th>Data</th></tr></thead><tbody id="portfolioBody"></tbody></table></div></section>
+
+<details><summary>System &amp; Research Diagnostics</summary><div class="diagnostics"><div class="diag-grid" id="diagGrid"></div><div class="warning" id="qualityWarning"></div></div></details>
+<div class="footer" id="footer"></div>
+</main><script>
+const esc=v=>String(v??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+const num=v=>v==null||Number.isNaN(Number(v))?'—':Number(v).toLocaleString(undefined,{maximumFractionDigits:2});
+const money=v=>v==null||Number.isNaN(Number(v))?'—':Number(v)<.01?'$'+Number(v).toPrecision(3):'$'+Number(v).toLocaleString(undefined,{maximumFractionDigits:2});
+const balance=v=>v==null?'—':Number(v).toLocaleString(undefined,{maximumSignificantDigits:7});
+const age=s=>{if(s==null)return'unknown';if(s<3600)return Math.max(1,Math.round(s/60))+'m';if(s<86400)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d'};
+const when=v=>v?new Date(v).toLocaleString():'—';
+const trend=v=>v==null?'<span class="neutral">—</span>':`<span class="${v>0?'pos':v<0?'neg':'neutral'}">${v>0?'+':''}${num(v)}%</span>`;
+const cls=v=>String(v||'').toLowerCase().replace(/[^a-z]+/g,'-');
+const tokenLink=x=>x.dexscreener_url?`<a class="link" href="${esc(x.dexscreener_url)}" target="_blank" rel="noopener"><span class="token">${esc(x.token_symbol)}</span> ↗</a>`:`<span class="token">${esc(x.token_symbol)}</span>`;
+function decisionPill(v){return `<span class="pill ${cls(v)}">${esc(v)}</span>`}
+async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json(),s=d.v5_summary||{};
+document.getElementById('researchCount').textContent=num(s.research_now);document.getElementById('watchCount').textContent=num(s.watch);document.getElementById('emergingCount').textContent=num(s.emerging);document.getElementById('reviewCount').textContent=num(s.portfolio_review);document.getElementById('walletEdge').textContent=`${num(s.positive_wallets_24h)} / ${num(s.measured_wallets_24h)}`;document.getElementById('refreshState').textContent='Live · '+new Date().toLocaleTimeString();
+const research=d.research_now||[];document.getElementById('researchCards').innerHTML=research.length?research.map(x=>`<article class="signal-card ${cls(x.decision)}"><div class="signal-top"><div>${tokenLink(x)}<div class="chain">${esc(x.chain_label)} · ${esc(x.source)}</div></div><div class="score">${num(x.opportunity_score)}</div></div><div class="decision ${cls(x.decision)}">${esc(x.decision)}</div><div class="reason"><b>${num(x.qualified_buyers||x.buy_clusters)}</b> qualified buyers · signal ${age(x.signal_age_seconds)} ago</div><div class="reason">Liquidity ${money(x.liquidity_usd)} · 1h volume ${money(x.volume_h1_usd)}</div>${(x.reasons||[]).slice(0,3).map(v=>`<div class="reason">• ${esc(v)}</div>`).join('')}</article>`).join(''):'<div class="empty">No coin currently clears the minimum research threshold. That is a valid result—not a reason to lower the gates.</div>';
+const emerging=d.emerging_signals||[];document.getElementById('emergingBody').innerHTML=emerging.length?emerging.map(x=>`<tr><td>${tokenLink(x)}<div class="small">${esc(x.chain_label)} · ${esc(x.source)}</div></td><td>${decisionPill(x.decision)}</td><td><b>${num(x.opportunity_score)}</b>/100</td><td>${age(x.signal_age_seconds)} ago</td><td>${num(x.qualified_buyers||x.buy_clusters)}<div class="small">${num(x.sell_clusters)} sellers</div></td><td>${x.successful_history_tokens==null?'collecting':num(x.successful_history_tokens)+' wins'}</td><td>${x.best_entry_rank==null?'—':'#'+num(x.best_entry_rank)}</td><td>${money(x.liquidity_usd)}</td><td>${money(x.volume_h1_usd)}</td><td>${esc(x.safety_status)}</td><td class="small">${esc((x.reasons||[]).join(' · '))}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No fresh emerging signals.</td></tr>';
+const p=d.portfolio||[],run=d.portfolio_holdings?.latest_run,w=d.portfolio_holdings?.wallets||{};document.getElementById('portfolioStatus').textContent=run?`${p.length} detected holdings · checked ${when(run.completed_at)} · next ${when(run.next_check_at)}`:'Holdings discovery is pending.';document.getElementById('portfolioBody').innerHTML=p.length?p.map(x=>`<tr><td>${tokenLink(x)}<div class="small">${esc(x.chain_label)}</div></td><td>${decisionPill(x.urgency)}<div class="small">${esc(x.monitor_state)}</div></td><td>${balance(x.wallet_ui_balance)}</td><td>${money(x.wallet_usd_value)}</td><td>${money(x.price_usd)}</td><td>${trend(x.price_1h_pct)}</td><td>${trend(x.price_6h_pct)}</td><td>${trend(x.price_24h_pct)}</td><td>${money(x.liquidity_usd)}</td><td>${x.holder_change_24h==null?'—':num(x.holder_change_24h)}</td><td class="small">${esc(x.data_quality)}<br>${when(x.last_checked_at)}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No holdings discovered yet.</td></tr>';
+const pc=d.candidate_pipeline?.counts||{},q=d.snapshot_quality||{},items=[['Candidates',pc.discovered],['Scored',pc.scored],['Screened',pc.screened],['Validated',pc.validated],['Repeat evidence',pc.observation_repeat_evidence],['Probation',pc.probation],['Snapshots 24h',q.snapshots_24h],['Complete data',q.complete_pct==null?'—':q.complete_pct+'%'],['Provider available',q.provider_available_pct==null?'—':q.provider_available_pct+'%'],['Holder coverage',q.holder_coverage_pct==null?'—':q.holder_coverage_pct+'%'],['Anomalies',q.anomaly_pct==null?'—':q.anomaly_pct+'%'],['Refresh run',d.latest_refresh?'#'+d.latest_refresh.id:'—']];document.getElementById('diagGrid').innerHTML=items.map(x=>`<div class="diag"><b>${esc(x[1])}</b><span>${esc(x[0])}</span></div>`).join('');document.getElementById('qualityWarning').textContent=`Safety gating remains conservative. Complete snapshot coverage: ${q.complete_pct??'—'}%; holder coverage: ${q.holder_coverage_pct??'—'}%. Unverified safety prevents a Research Now label.`;document.getElementById('footer').textContent=`${esc(d.version)} · generated ${when(d.generated_at)} · auto-refreshes every 60 seconds · read-only paper research`;
+}catch(e){document.getElementById('refreshState').textContent='Dashboard unavailable';document.getElementById('researchCards').innerHTML='<div class="empty">Could not load live dashboard data. Monitoring continues independently.</div>';}}
+load();setInterval(load,60000);
+</script></body></html>"""
 
 
 @app.get("/dashboard")
 def dashboard_endpoint():
-    return render_template_string(DASHBOARD_HTML)
+    return render_template_string(V5_DASHBOARD_HTML)
 
 
 @app.get("/premium-funnel")
