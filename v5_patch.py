@@ -1,10 +1,12 @@
 """V5 portfolio enrichment bridge.
 
-Ensures wallet-discovered EVM holdings are enrolled in the normal EVM market
-snapshot/signal pipeline before each refresh. This prevents portfolio holdings
-from remaining indefinitely as wallet-balance-only / DATA PENDING rows.
+Wallet discovery and EVM market review are separate pipelines in app.py. This
+bridge keeps current EVM holdings enrolled and makes the refresh budget large
+enough to actually process the held portfolio rather than leaving most rows as
+wallet-balance-only / DATA PENDING.
 """
 
+import threading
 import app as wallet_app
 
 
@@ -46,13 +48,16 @@ def sync_portfolio_watchlist():
                         END,
                         token_name = COALESCE(EXCLUDED.token_name, token_watchlist.token_name),
                         active = TRUE,
+                        monitoring_status = CASE
+                            WHEN token_watchlist.monitoring_status = 'portfolio_not_held'
+                            THEN 'portfolio_enrichment_pending'
+                            ELSE token_watchlist.monitoring_status
+                        END,
                         updated_at = NOW()
                     """,
                     (chain, address, symbol or "UNKNOWN", name or symbol or "Unknown"),
                 )
 
-            # Stop spending provider calls on portfolio-auto tokens that are no
-            # longer held. Manually maintained/research watchlist rows are left alone.
             cur.execute(
                 """
                 UPDATE token_watchlist w
@@ -76,22 +81,28 @@ def sync_portfolio_watchlist():
 
 
 def refresh_evm_watchlist(limit=10, offset=0):
-    """Enroll portfolio holdings first, then run the existing trusted refresh."""
-    sync_portfolio_watchlist()
-    return _ORIGINAL_REFRESH_EVM_WATCHLIST(limit=limit, offset=offset)
+    """Enroll holdings and guarantee the refresh can cover the held portfolio."""
+    held_count = sync_portfolio_watchlist()
+    # The old cron commonly requests only 10 tokens. Once portfolio discovery
+    # grew beyond that, many holdings never reached snapshot enrichment.
+    effective_limit = max(int(limit or 0), held_count + 1, 20)
+    return _ORIGINAL_REFRESH_EVM_WATCHLIST(limit=effective_limit, offset=0)
 
 
-# Patch the module global used by Flask endpoints and cron routes.
 wallet_app.refresh_evm_watchlist = refresh_evm_watchlist
-wallet_app.VERSION = "5.0.2-portfolio-enrichment"
+wallet_app.VERSION = "5.0.3-portfolio-refresh-budget"
 
-# Enroll existing holdings immediately when the web process starts. The normal
-# refresh cron then prioritises tokens with no trusted snapshot (NULLS FIRST).
-try:
-    sync_portfolio_watchlist()
-except Exception:
-    # Startup must remain available even if the database/provider is transiently
-    # unavailable; the next refresh retries the sync.
-    pass
+
+def _initial_portfolio_refresh():
+    """Seed snapshots after deploy without delaying gunicorn startup."""
+    try:
+        refresh_evm_watchlist(limit=20, offset=0)
+    except Exception:
+        # Cron retries this path; web availability should not depend on a market
+        # data provider being healthy during process startup.
+        pass
+
+
+threading.Thread(target=_initial_portfolio_refresh, daemon=True).start()
 
 app = wallet_app.app
