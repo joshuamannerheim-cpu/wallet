@@ -1,13 +1,9 @@
-"""V5 portfolio enrichment bridge.
-
-Keeps held EVM tokens in the normal snapshot pipeline and adds a lightweight
-Solana portfolio review layer so wallet-only Solana rows do not remain
-permanently DATA PENDING.
-"""
+"""V5 portfolio enrichment bridge plus V5.1 wallet-first discovery."""
 
 import threading
 import requests
 import app as wallet_app
+import v51_bridge
 
 _ORIGINAL_REFRESH_EVM_WATCHLIST = wallet_app.refresh_evm_watchlist
 _ORIGINAL_BUILD_DASHBOARD_PAYLOAD = wallet_app.build_dashboard_payload
@@ -75,8 +71,7 @@ def _solana_market_snapshot(address):
         pairs = [p for p in pairs if str(p.get('chainId','')).lower() == 'solana']
         if not pairs:
             return None
-        pair = max(pairs, key=lambda p: float((p.get('liquidity') or {}).get('usd') or 0))
-        return pair
+        return max(pairs, key=lambda p: float((p.get('liquidity') or {}).get('usd') or 0))
     except Exception:
         return None
 
@@ -131,12 +126,27 @@ def build_dashboard_payload():
                 item['trends'][window]['available'] = change.get(key) is not None
         else:
             item['data_quality'] = 'solana market data unavailable'
+
+    # V5.1: wallet activity creates candidates immediately.  Failures here are
+    # intentionally non-fatal while the new engine is validated in parallel.
+    payload['v51_ingest'] = v51_bridge.ingest_payload(wallet_app, payload)
+    payload['early_discoveries'] = v51_bridge.dashboard_rows(wallet_app, limit=30)
     return payload
 
 
 wallet_app.refresh_evm_watchlist = refresh_evm_watchlist
 wallet_app.build_dashboard_payload = build_dashboard_payload
-wallet_app.VERSION = '5.0.4-solana-portfolio-review'
+wallet_app.VERSION = '5.1.0-early-discovery'
+
+
+@wallet_app.app.get('/api/v51/discoveries')
+def v51_discoveries_api():
+    rows = v51_bridge.dashboard_rows(wallet_app, limit=50)
+    return wallet_app.jsonify({
+        'version': wallet_app.VERSION,
+        'count': len(rows),
+        'discoveries': rows,
+    })
 
 
 def _initial_portfolio_refresh():
