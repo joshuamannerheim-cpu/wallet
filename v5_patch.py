@@ -1,5 +1,6 @@
 """V5 portfolio enrichment bridge plus V5.1 wallet-first discovery."""
 
+import html
 import threading
 import requests
 import app as wallet_app
@@ -63,9 +64,7 @@ def _solana_market_snapshot(address):
     if not address or address == 'native':
         return None
     try:
-        response = requests.get(
-            wallet_app.DEXSCREENER_TOKEN_URL.format(address=address), timeout=7
-        )
+        response = requests.get(wallet_app.DEXSCREENER_TOKEN_URL.format(address=address), timeout=7)
         response.raise_for_status()
         pairs = response.json().get('pairs') or []
         pairs = [p for p in pairs if str(p.get('chainId','')).lower() == 'solana']
@@ -105,15 +104,12 @@ def build_dashboard_payload():
         symbol = str(item.get('token_symbol') or '').upper()
         address = item.get('token_address')
         if symbol == 'SOL' or address == 'native':
-            item['status'] = 'BENCHMARK'
-            item['structure_state'] = 'CORE ASSET'
-            item['data_quality'] = 'benchmark'
-            item['is_benchmark'] = True
+            item['status'] = 'BENCHMARK'; item['structure_state'] = 'CORE ASSET'
+            item['data_quality'] = 'benchmark'; item['is_benchmark'] = True
             continue
         pair = _solana_market_snapshot(address)
         review, structure = _solana_review(pair)
-        item['status'] = structure
-        item['structure_state'] = review
+        item['status'] = structure; item['structure_state'] = review
         if pair:
             item['price_usd'] = wallet_app.safe_float(pair.get('priceUsd'))
             item['liquidity_usd'] = wallet_app.safe_float((pair.get('liquidity') or {}).get('usd'))
@@ -126,9 +122,6 @@ def build_dashboard_payload():
                 item['trends'][window]['available'] = change.get(key) is not None
         else:
             item['data_quality'] = 'solana market data unavailable'
-
-    # V5.1: wallet activity creates candidates immediately.  Failures here are
-    # intentionally non-fatal while the new engine is validated in parallel.
     payload['v51_ingest'] = v51_bridge.ingest_payload(wallet_app, payload)
     payload['early_discoveries'] = v51_bridge.dashboard_rows(wallet_app, limit=30)
     return payload
@@ -136,24 +129,61 @@ def build_dashboard_payload():
 
 wallet_app.refresh_evm_watchlist = refresh_evm_watchlist
 wallet_app.build_dashboard_payload = build_dashboard_payload
-wallet_app.VERSION = '5.1.0-early-discovery'
+wallet_app.VERSION = '5.1.1-new-discoveries-ui'
 
 
 @wallet_app.app.get('/api/v51/discoveries')
 def v51_discoveries_api():
     rows = v51_bridge.dashboard_rows(wallet_app, limit=50)
-    return wallet_app.jsonify({
-        'version': wallet_app.VERSION,
-        'count': len(rows),
-        'discoveries': rows,
-    })
+    return wallet_app.jsonify({'version': wallet_app.VERSION, 'count': len(rows), 'discoveries': rows})
+
+
+def _money(value):
+    if value is None: return '—'
+    value = float(value)
+    if value >= 1_000_000: return f'${value/1_000_000:.2f}m'
+    if value >= 1_000: return f'${value/1_000:.1f}k'
+    return f'${value:,.0f}'
+
+
+def _age(value):
+    if value is None: return '—'
+    value = float(value)
+    if value < 60: return f'{value:.0f}m'
+    if value < 1440: return f'{value/60:.1f}h'
+    return f'{value/1440:.1f}d'
+
+
+@wallet_app.app.get('/v51')
+def v51_dashboard():
+    # Building the normal payload first also feeds fresh wallet events into V5.1.
+    payload = build_dashboard_payload()
+    rows = payload.get('early_discoveries') or []
+    rows = sorted(rows, key=lambda r: (-(float(r.get('early_score') or 0)), r.get('discovered_at')), reverse=False)
+    body = []
+    for r in rows[:30]:
+        score = float(r.get('early_score') or 0)
+        band = 'high' if score >= 75 else 'mid' if score >= 55 else 'low'
+        symbol = html.escape(str(r.get('token_symbol') or 'Unknown'))
+        chain = html.escape(str(r.get('chain') or ''))
+        reason = html.escape(str(r.get('reason') or 'wallet activity'))
+        address = html.escape(str(r.get('token_address') or ''))
+        link = r.get('gmgn_url')
+        token = f'<a href="{html.escape(link)}" target="_blank">{symbol}</a>' if link else symbol
+        peak = r.get('peak_return_pct')
+        peak_text = '—' if peak is None else f'{float(peak):+.1f}%'
+        body.append(f'''<tr><td><strong>{token}</strong><small>{chain}<br>{address[:8]}…{address[-6:]}</small></td>
+<td><span class="score {band}">{score:.0f}</span></td><td>{int(r.get('independent_wallets') or 0)}</td>
+<td>{_age(r.get('token_age_minutes'))}</td><td>{_money(r.get('discovery_market_cap_usd'))}</td>
+<td>{_money(r.get('discovery_liquidity_usd'))}</td><td>{peak_text}</td><td class="why">{reason}</td></tr>''')
+    empty = '<tr><td colspan="8" class="empty">No wallet-first discoveries recorded yet. The engine is collecting candidates from proven-wallet activity.</td></tr>'
+    return f'''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>V5.1 Early Discovery</title>
+<style>body{{font-family:system-ui;background:#0b0d10;color:#e8edf2;margin:0;padding:22px}}.wrap{{max-width:1400px;margin:auto}}h1{{margin:0}}p{{color:#98a2ad}}.card{{background:#12161b;border:1px solid #252b33;border-radius:14px;padding:18px;margin-top:18px;overflow:auto}}table{{width:100%;border-collapse:collapse;min-width:950px}}th,td{{text-align:left;padding:12px;border-bottom:1px solid #252b33}}th{{color:#98a2ad;font-size:12px;text-transform:uppercase}}a{{color:#70b7ff;text-decoration:none}}small{{display:block;color:#727d89;margin-top:4px}}.score{{display:inline-block;min-width:38px;text-align:center;padding:6px 8px;border-radius:8px;font-weight:800}}.high{{background:#153b2a;color:#72e2a6}}.mid{{background:#403716;color:#f1d56b}}.low{{background:#3c2020;color:#f39898}}.why{{max-width:340px;color:#b9c1ca}}.empty{{padding:36px;text-align:center;color:#7f8994}}.note{{font-size:13px}} </style></head><body><div class="wrap"><h1>🔥 New Discoveries</h1><p>Wallet-first candidates ranked by evidence available at discovery — not a buy recommendation.</p><div class="card"><table><thead><tr><th>Token</th><th>Early score</th><th>Smart wallets</th><th>Age found</th><th>Entry MC</th><th>Liquidity</th><th>Peak since</th><th>Why detected</th></tr></thead><tbody>{''.join(body) if body else empty}</tbody></table></div><p class="note">V5.1.1 · Early Score is experimental. Forward outcomes will be used to recalibrate the weights.</p></div></body></html>'''
 
 
 def _initial_portfolio_refresh():
-    try:
-        refresh_evm_watchlist(limit=20, offset=0)
-    except Exception:
-        pass
+    try: refresh_evm_watchlist(limit=20, offset=0)
+    except Exception: pass
 
 threading.Thread(target=_initial_portfolio_refresh, daemon=True).start()
 app = wallet_app.app
