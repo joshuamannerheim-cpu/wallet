@@ -8,6 +8,37 @@ import early_discovery
 
 _ORIGINAL_REFRESH_EVM_WATCHLIST=wallet_app.refresh_evm_watchlist
 _ORIGINAL_BUILD_DASHBOARD_PAYLOAD=wallet_app.build_dashboard_payload
+_ORIGINAL_LOAD_EVM_OUTBOUND_SOURCE_WALLETS=wallet_app.load_evm_outbound_source_wallets
+
+# Hand-selected Robinhood early traders from ABUNDANCE (2026-09-18).
+# These are observation sources only; they do not bypass V5.2 confirmation gates.
+ABUNDANCE_EARLY_WALLETS=(
+    "0x81be8303581806ad97558b060e4ae630bcea5672",
+    "0xd861ddcbfdeb0b5181257949ab5f08a33f323928",
+    "0x5442ebac5bf0ed905ce83b3dabaa80a847092eb0",
+    "0x1b82b7b4e791e0802038af75db4faba3de42b0ad",
+    "0x07591d902e68503c113ac4beca8abb3e3f6b0ab3",
+    "0x8a2a3d6fcefd9427ac46b07c91d21207aaa0e168",
+)
+
+def load_evm_outbound_source_wallets(limit, include_recent=False):
+    """Prioritise selected ABUNDANCE early traders, then fill from learned sources."""
+    requested=max(int(limit or 1),len(ABUNDANCE_EARLY_WALLETS))
+    learned=_ORIGINAL_LOAD_EVM_OUTBOUND_SOURCE_WALLETS(requested,include_recent=include_recent)
+    by_wallet={str(item.get("wallet") or "").lower():item for item in learned}
+    seeded=[]
+    for wallet in ABUNDANCE_EARLY_WALLETS:
+        item=by_wallet.pop(wallet,None) or {
+            "wallet":wallet,"early_tokens":1,"successful_tokens":1,
+            "best_entry_rank":None,"token_symbols":["ABUNDANCE"],
+            "last_scanned_at":None,
+        }
+        item["source_cohort"]="abundance_profitable_early_trader"
+        seeded.append(item)
+    remainder=list(by_wallet.values())
+    return (seeded+remainder)[:requested]
+
+wallet_app.load_evm_outbound_source_wallets=load_evm_outbound_source_wallets
 
 
 def sync_portfolio_watchlist():
@@ -66,7 +97,7 @@ def build_dashboard_payload():
     payload['v51_ingest']=v51_bridge.ingest_payload(wallet_app,payload);payload['early_discoveries']=v51_bridge.dashboard_rows(wallet_app,limit=30)
     return payload
 
-wallet_app.refresh_evm_watchlist=refresh_evm_watchlist;wallet_app.build_dashboard_payload=build_dashboard_payload;wallet_app.VERSION='5.2.1-dexscreener-links'
+wallet_app.refresh_evm_watchlist=refresh_evm_watchlist;wallet_app.build_dashboard_payload=build_dashboard_payload;wallet_app.VERSION='5.2.2-abundance-wallet-cohort'
 
 @wallet_app.app.get('/api/v51/discoveries')
 def discoveries_api():
