@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "5.1.1-quality-alts-dashboard"
+VERSION = "5.2-quality-alts-live"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -279,25 +279,70 @@ ASYMMETRIC_WEIGHT = 0.35
 CONFIDENCE_MULTIPLIERS = {"HIGH": 1.0, "MEDIUM": 0.75, "LOW": 0.5}
 HARD_RELATIONSHIP_STRENGTHS = {"high", "moderate"}
 QUALITY_ALT_UNIVERSE = (
-    ("ETH", "Ethereum", "core", 90, 88, 96, 82, 96, 76),
-    ("SOL", "Solana", "core", 92, 91, 94, 78, 94, 72),
-    ("BNB", "BNB", "core", 86, 84, 93, 80, 88, 74),
-    ("LINK", "Chainlink", "quality_growth", 88, 82, 91, 79, 92, 78),
-    ("AAVE", "Aave", "quality_growth", 86, 89, 84, 86, 88, 82),
-    ("UNI", "Uniswap", "quality_growth", 88, 90, 88, 81, 90, 75),
-    ("AVAX", "Avalanche", "growth", 78, 72, 82, 76, 82, 77),
-    ("SUI", "Sui", "growth", 83, 82, 84, 55, 86, 70),
+    ("ETH", "Ethereum", "core", "ethereum", 90, 88, 96, 82, 96, 76),
+    ("SOL", "Solana", "core", "solana", 92, 91, 94, 78, 94, 72),
+    ("BNB", "BNB", "core", "binancecoin", 86, 84, 93, 80, 88, 74),
+    ("LINK", "Chainlink", "quality_growth", "chainlink", 88, 82, 91, 79, 92, 78),
+    ("AAVE", "Aave", "quality_growth", "aave", 86, 89, 84, 86, 88, 82),
+    ("UNI", "Uniswap", "quality_growth", "uniswap", 88, 90, 88, 81, 90, 75),
+    ("AVAX", "Avalanche", "growth", "avalanche-2", 78, 72, 82, 76, 82, 77),
+    ("SUI", "Sui", "growth", "sui", 83, 82, 84, 55, 86, 70),
 )
 QUALITY_ALT_WEIGHTS = {
     "adoption": 0.20, "economic_activity": 0.15, "liquidity": 0.15,
     "tokenomics": 0.15, "ecosystem": 0.10, "valuation": 0.10,
     "institutional": 0.10, "security": 0.05,
 }
+QUALITY_ALT_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+_quality_alt_cache = {"at": 0.0, "data": None}
+
+def quality_alt_market_data():
+    """Fetch a bounded public market snapshot; degrade safely if unavailable."""
+    now = time.time()
+    if _quality_alt_cache["data"] is not None and now - _quality_alt_cache["at"] < 300:
+        return _quality_alt_cache["data"]
+    ids = ",".join(row[3] for row in QUALITY_ALT_UNIVERSE)
+    try:
+        response = upstream_request(
+            "GET", QUALITY_ALT_MARKETS_URL,
+            params={"vs_currency": "usd", "ids": ids, "price_change_percentage": "24h,7d,30d"},
+            timeout=12, retries=1, provider="coingecko",
+        )
+        if response.status_code != 200:
+            return {}
+        payload = response.json()
+        data = {str(x.get("id")): x for x in payload if isinstance(x, dict)}
+        _quality_alt_cache.update({"at": now, "data": data})
+        return data
+    except Exception:
+        return {}
+
+def quality_alt_entry_state(market):
+    """Price/volume entry regime. Never upgrades when live inputs are missing."""
+    if not market:
+        return "WATCH", "live_market_unavailable", None
+    p24 = market.get("price_change_percentage_24h_in_currency")
+    p7 = market.get("price_change_percentage_7d_in_currency")
+    p30 = market.get("price_change_percentage_30d_in_currency")
+    volume = market.get("total_volume") or 0
+    cap = market.get("market_cap") or 0
+    volume_ratio = (volume / cap) if cap else None
+    vals = (p24, p7, p30)
+    if any(v is None for v in vals):
+        return "WATCH", "partial_live_market", volume_ratio
+    # Regime labels are descriptive research flags, not trade instructions.
+    if p30 >= 35 and p7 >= 12:
+        return "OVERHEATED", "strong_30d_and_7d_extension", volume_ratio
+    if p30 <= -25 and p7 <= -10:
+        return "DETERIORATING", "persistent_30d_and_7d_weakness", volume_ratio
+    if -30 <= p30 <= -8 and p7 > -8 and p24 > -4 and (volume_ratio or 0) >= 0.025:
+        return "ACCUMULATION_ZONE", "pullback_with_stabilising_momentum_and_liquidity", volume_ratio
+    return "WATCH", "no_extreme_entry_regime", volume_ratio
 
 def quality_alt_rows():
-    """Transparent baseline quality screen. Scores are research inputs, not buy instructions."""
+    markets = quality_alt_market_data()
     rows = []
-    for symbol, name, bucket, adoption, economics, liquidity, tokenomics, ecosystem, valuation in QUALITY_ALT_UNIVERSE:
+    for symbol, name, bucket, coin_id, adoption, economics, liquidity, tokenomics, ecosystem, valuation in QUALITY_ALT_UNIVERSE:
         institutional = 90 if symbol in {"ETH", "SOL", "BNB", "LINK"} else 76
         security = 90 if symbol in {"ETH", "LINK"} else 80
         score = round(
@@ -310,31 +355,44 @@ def quality_alt_rows():
             + institutional * QUALITY_ALT_WEIGHTS["institutional"]
             + security * QUALITY_ALT_WEIGHTS["security"], 1
         )
-        # Entry state is deliberately conservative until live market/fundamental
-        # inputs are wired in; the dashboard must not manufacture a live signal.
+        market = markets.get(coin_id) or {}
+        state, reason, volume_ratio = quality_alt_entry_state(market)
         rows.append({
             "symbol": symbol, "name": name, "bucket": bucket,
-            "quality_score": score, "state": "WATCH",
+            "quality_score": score, "state": state,
             "adoption": adoption, "economic_activity": economics,
             "liquidity": liquidity, "tokenomics": tokenomics,
             "ecosystem": ecosystem, "valuation": valuation,
             "institutional": institutional, "security": security,
-            "entry_data": "baseline_only",
-            "note": "Quality baseline loaded; live entry conditions pending provider data.",
+            "price_usd": market.get("current_price"),
+            "market_cap_usd": market.get("market_cap"),
+            "volume_24h_usd": market.get("total_volume"),
+            "volume_market_cap_ratio": round(volume_ratio, 4) if volume_ratio is not None else None,
+            "price_24h_pct": market.get("price_change_percentage_24h_in_currency"),
+            "price_7d_pct": market.get("price_change_percentage_7d_in_currency"),
+            "price_30d_pct": market.get("price_change_percentage_30d_in_currency"),
+            "entry_data": "live_market" if market else "baseline_only",
+            "entry_reason": reason,
+            "note": "Fundamental scores are baseline research inputs; entry state uses live market regime data.",
         })
     return sorted(rows, key=lambda x: x["quality_score"], reverse=True)
 
 @app.get("/quality-alts")
 def quality_alts_endpoint():
+    assets = quality_alt_rows()
     return jsonify({
         "success": True, "version": VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "method": {
             "weights": QUALITY_ALT_WEIGHTS,
             "states": ["ACCUMULATION_ZONE", "WATCH", "OVERHEATED", "DETERIORATING"],
-            "warning": "Research screen only. WATCH is used until live entry data is available.",
+            "warning": "Research screen only. Live price regimes do not constitute buy/sell instructions.",
         },
-        "assets": quality_alt_rows(),
+        "summary": {
+            state: sum(1 for x in assets if x["state"] == state)
+            for state in ("ACCUMULATION_ZONE", "WATCH", "OVERHEATED", "DETERIORATING")
+        },
+        "assets": assets,
     })
 
 
@@ -11716,7 +11774,7 @@ details{margin-top:30px;padding:0}summary{cursor:pointer;padding:16px 18px;font-
 
 <section class="section"><div class="section-head"><div><h2>Research Now</h2><div class="section-copy">The five strongest current opportunities, including watches awaiting one key confirmation.</div></div></div><div class="cards" id="researchCards"></div></section>
 
-<section class="section"><div class="section-head"><div><h2>Quality Alts</h2><div class="section-copy">Established crypto assets screened separately from meme signals. Quality is a baseline; entry state stays conservative until live entry data is verified.</div></div></div><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>State</th><th>Quality</th><th>Bucket</th><th>Adoption</th><th>Economics</th><th>Liquidity</th><th>Tokenomics</th><th>Ecosystem</th><th>Valuation</th><th>Entry data</th></tr></thead><tbody id="qualityAltsBody"></tbody></table></div></section>
+<section class="section"><div class="section-head"><div><h2>Quality Alts</h2><div class="section-copy">Established crypto assets screened separately from meme signals. Quality is a baseline; entry state stays conservative until live entry data is verified.</div></div></div><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>State</th><th>Quality</th><th>Price</th><th>24h</th><th>7d</th><th>30d</th><th>24h volume</th><th>Market cap</th><th>Vol/MC</th><th>Why</th></tr></thead><tbody id="qualityAltsBody"></tbody></table></div></section>
 
 <section class="section"><div class="section-head"><div><h2>Emerging Signals</h2><div class="section-copy">Solana consensus, Robinhood paper candidates and off-watchlist early-buyer discoveries in one ranked feed.</div></div></div><div class="panel table-wrap"><table><thead><tr><th>Coin</th><th>Decision</th><th>Score</th><th>Signal</th><th>Buyers</th><th>Buyer history</th><th>Best entry</th><th>Liquidity</th><th>1h volume</th><th>Safety</th><th>Why / missing gate</th></tr></thead><tbody id="emergingBody"></tbody></table></div></section>
 
@@ -11738,7 +11796,7 @@ function decisionPill(v){return `<span class="pill ${cls(v)}">${esc(v)}</span>`}
 async function load(){try{const r=await fetch('/dashboard-data',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);const d=await r.json(),s=d.v5_summary||{};
 document.getElementById('researchCount').textContent=num(s.research_now);document.getElementById('watchCount').textContent=num(s.watch);document.getElementById('emergingCount').textContent=num(s.emerging);document.getElementById('reviewCount').textContent=num(s.portfolio_review);document.getElementById('walletEdge').textContent=`${num(s.positive_wallets_24h)} / ${num(s.measured_wallets_24h)}`;document.getElementById('refreshState').textContent='Live · '+new Date().toLocaleTimeString();
 const research=d.research_now||[];document.getElementById('researchCards').innerHTML=research.length?research.map(x=>`<article class="signal-card ${cls(x.decision)}"><div class="signal-top"><div>${tokenLink(x)}<div class="chain">${esc(x.chain_label)} · ${esc(x.source)}</div></div><div class="score">${num(x.opportunity_score)}</div></div><div class="decision ${cls(x.decision)}">${esc(x.decision)}</div><div class="reason"><b>${num(x.qualified_buyers||x.buy_clusters)}</b> qualified buyers · signal ${age(x.signal_age_seconds)} ago</div><div class="reason">Liquidity ${money(x.liquidity_usd)} · 1h volume ${money(x.volume_h1_usd)}</div>${(x.reasons||[]).slice(0,3).map(v=>`<div class="reason">• ${esc(v)}</div>`).join('')}</article>`).join(''):'<div class="empty">No coin currently clears the minimum research threshold. That is a valid result—not a reason to lower the gates.</div>';
-const qaResp=await fetch('/quality-alts',{cache:'no-store'});const qa=qaResp.ok?await qaResp.json():{assets:[]};const quality=qa.assets||[];document.getElementById('qualityAltsBody').innerHTML=quality.length?quality.map(x=>`<tr><td><span class="token">${esc(x.symbol)}</span><div class="small">${esc(x.name)}</div></td><td>${decisionPill(x.state)}</td><td><b>${num(x.quality_score)}</b>/100</td><td class="small">${esc(x.bucket)}</td><td>${num(x.adoption)}</td><td>${num(x.economic_activity)}</td><td>${num(x.liquidity)}</td><td>${num(x.tokenomics)}</td><td>${num(x.ecosystem)}</td><td>${num(x.valuation)}</td><td class="small">${esc(x.entry_data)}<br>${esc(x.note)}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">Quality Alt data unavailable.</td></tr>';
+const qaResp=await fetch('/quality-alts',{cache:'no-store'});const qa=qaResp.ok?await qaResp.json():{assets:[]};const quality=qa.assets||[];document.getElementById('qualityAltsBody').innerHTML=quality.length?quality.map(x=>`<tr><td><span class="token">${esc(x.symbol)}</span><div class="small">${esc(x.name)} · ${esc(x.bucket)}</div></td><td>${decisionPill(x.state)}</td><td><b>${num(x.quality_score)}</b>/100</td><td>${money(x.price_usd)}</td><td>${trend(x.price_24h_pct)}</td><td>${trend(x.price_7d_pct)}</td><td>${trend(x.price_30d_pct)}</td><td>${money(x.volume_24h_usd)}</td><td>${money(x.market_cap_usd)}</td><td>${x.volume_market_cap_ratio==null?"—":num(x.volume_market_cap_ratio)}</td><td class="small">${esc(x.entry_reason)}<br>${esc(x.entry_data)}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">Quality Alt data unavailable.</td></tr>';
 const emerging=d.emerging_signals||[];document.getElementById('emergingBody').innerHTML=emerging.length?emerging.map(x=>`<tr><td>${tokenLink(x)}<div class="small">${esc(x.chain_label)} · ${esc(x.source)}</div></td><td>${decisionPill(x.decision)}</td><td><b>${num(x.opportunity_score)}</b>/100</td><td>${age(x.signal_age_seconds)} ago</td><td>${num(x.qualified_buyers||x.buy_clusters)}<div class="small">${num(x.sell_clusters)} sellers</div></td><td>${x.successful_history_tokens==null?'collecting':num(x.successful_history_tokens)+' wins'}</td><td>${x.best_entry_rank==null?'—':'#'+num(x.best_entry_rank)}</td><td>${money(x.liquidity_usd)}</td><td>${money(x.volume_h1_usd)}</td><td>${esc(x.safety_status)}</td><td class="small">${esc((x.reasons||[]).join(' · '))}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No fresh emerging signals.</td></tr>';
 const p=d.portfolio||[],run=d.portfolio_holdings?.latest_run,w=d.portfolio_holdings?.wallets||{};document.getElementById('portfolioStatus').textContent=run?`${p.length} detected holdings · checked ${when(run.completed_at)} · next ${when(run.next_check_at)}`:'Holdings discovery is pending.';document.getElementById('portfolioBody').innerHTML=p.length?p.map(x=>`<tr><td>${tokenLink(x)}<div class="small">${esc(x.chain_label)}</div></td><td>${decisionPill(x.urgency)}<div class="small">${esc(x.monitor_state)}</div></td><td>${balance(x.wallet_ui_balance)}</td><td>${money(x.wallet_usd_value)}</td><td>${money(x.price_usd)}</td><td>${trend(x.price_1h_pct)}</td><td>${trend(x.price_6h_pct)}</td><td>${trend(x.price_24h_pct)}</td><td>${money(x.liquidity_usd)}</td><td>${x.holder_change_24h==null?'—':num(x.holder_change_24h)}</td><td class="small">${esc(x.data_quality)}<br>${when(x.last_checked_at)}</td></tr>`).join(''):'<tr><td colspan="11" class="empty">No holdings discovered yet.</td></tr>';
 const pc=d.candidate_pipeline?.counts||{},q=d.snapshot_quality||{},items=[['Candidates',pc.discovered],['Scored',pc.scored],['Screened',pc.screened],['Validated',pc.validated],['Repeat evidence',pc.observation_repeat_evidence],['Probation',pc.probation],['Snapshots 24h',q.snapshots_24h],['Complete data',q.complete_pct==null?'—':q.complete_pct+'%'],['Provider available',q.provider_available_pct==null?'—':q.provider_available_pct+'%'],['Holder coverage',q.holder_coverage_pct==null?'—':q.holder_coverage_pct+'%'],['Anomalies',q.anomaly_pct==null?'—':q.anomaly_pct+'%'],['Refresh run',d.latest_refresh?'#'+d.latest_refresh.id:'—']];document.getElementById('diagGrid').innerHTML=items.map(x=>`<div class="diag"><b>${esc(x[1])}</b><span>${esc(x[0])}</span></div>`).join('');document.getElementById('qualityWarning').textContent=`Safety gating remains conservative. Complete snapshot coverage: ${q.complete_pct??'—'}%; holder coverage: ${q.holder_coverage_pct??'—'}%. Unverified safety prevents a Research Now label.`;document.getElementById('footer').textContent=`${esc(d.version)} · generated ${when(d.generated_at)} · auto-refreshes every 60 seconds · read-only paper research`;
