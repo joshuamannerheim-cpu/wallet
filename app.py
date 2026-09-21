@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "5.0.1-gmgn-links"
+VERSION = "5.1-quality-alts"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -278,6 +278,66 @@ WATCH_WEIGHT = 1.0
 ASYMMETRIC_WEIGHT = 0.35
 CONFIDENCE_MULTIPLIERS = {"HIGH": 1.0, "MEDIUM": 0.75, "LOW": 0.5}
 HARD_RELATIONSHIP_STRENGTHS = {"high", "moderate"}
+QUALITY_ALT_UNIVERSE = (
+    ("ETH", "Ethereum", "core", 90, 88, 96, 82, 96, 76),
+    ("SOL", "Solana", "core", 92, 91, 94, 78, 94, 72),
+    ("BNB", "BNB", "core", 86, 84, 93, 80, 88, 74),
+    ("LINK", "Chainlink", "quality_growth", 88, 82, 91, 79, 92, 78),
+    ("AAVE", "Aave", "quality_growth", 86, 89, 84, 86, 88, 82),
+    ("UNI", "Uniswap", "quality_growth", 88, 90, 88, 81, 90, 75),
+    ("AVAX", "Avalanche", "growth", 78, 72, 82, 76, 82, 77),
+    ("SUI", "Sui", "growth", 83, 82, 84, 55, 86, 70),
+)
+QUALITY_ALT_WEIGHTS = {
+    "adoption": 0.20, "economic_activity": 0.15, "liquidity": 0.15,
+    "tokenomics": 0.15, "ecosystem": 0.10, "valuation": 0.10,
+    "institutional": 0.10, "security": 0.05,
+}
+
+def quality_alt_rows():
+    """Transparent baseline quality screen. Scores are research inputs, not buy instructions."""
+    rows = []
+    for symbol, name, bucket, adoption, economics, liquidity, tokenomics, ecosystem, valuation in QUALITY_ALT_UNIVERSE:
+        institutional = 90 if symbol in {"ETH", "SOL", "BNB", "LINK"} else 76
+        security = 90 if symbol in {"ETH", "LINK"} else 80
+        score = round(
+            adoption * QUALITY_ALT_WEIGHTS["adoption"]
+            + economics * QUALITY_ALT_WEIGHTS["economic_activity"]
+            + liquidity * QUALITY_ALT_WEIGHTS["liquidity"]
+            + tokenomics * QUALITY_ALT_WEIGHTS["tokenomics"]
+            + ecosystem * QUALITY_ALT_WEIGHTS["ecosystem"]
+            + valuation * QUALITY_ALT_WEIGHTS["valuation"]
+            + institutional * QUALITY_ALT_WEIGHTS["institutional"]
+            + security * QUALITY_ALT_WEIGHTS["security"], 1
+        )
+        # Entry state is deliberately conservative until live market/fundamental
+        # inputs are wired in; the dashboard must not manufacture a live signal.
+        rows.append({
+            "symbol": symbol, "name": name, "bucket": bucket,
+            "quality_score": score, "state": "WATCH",
+            "adoption": adoption, "economic_activity": economics,
+            "liquidity": liquidity, "tokenomics": tokenomics,
+            "ecosystem": ecosystem, "valuation": valuation,
+            "institutional": institutional, "security": security,
+            "entry_data": "baseline_only",
+            "note": "Quality baseline loaded; live entry conditions pending provider data.",
+        })
+    return sorted(rows, key=lambda x: x["quality_score"], reverse=True)
+
+@app.get("/quality-alts")
+def quality_alts_endpoint():
+    return jsonify({
+        "success": True, "version": VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "method": {
+            "weights": QUALITY_ALT_WEIGHTS,
+            "states": ["ACCUMULATION_ZONE", "WATCH", "OVERHEATED", "DETERIORATING"],
+            "warning": "Research screen only. WATCH is used until live entry data is available.",
+        },
+        "assets": quality_alt_rows(),
+    })
+
+
 DEFAULT_TOKEN_WATCHLIST = (
     ("base", "0x4200000000000000000000000000000000000006", "ETH", "Ether / WETH", "benchmark", "evm_monitoring_ready"),
     ("robinhood", "0x232CDFc415D10b673845D83Dc02ba2eaBe7e30d1", "IF", "What IF", "portfolio", "evm_monitoring_ready"),
