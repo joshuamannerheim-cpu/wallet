@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
-VERSION = "5.2-quality-alts-live"
+VERSION = "5.2.1-quality-alts-calibrated"
 SCREENING_VERSION = "4.2.2"
 INDEPENDENT_REPEAT_SECONDS = 6 * 60 * 60
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -331,13 +331,17 @@ def quality_alt_entry_state(market):
     if any(v is None for v in vals):
         return "WATCH", "partial_live_market", volume_ratio
     # Regime labels are descriptive research flags, not trade instructions.
-    if p30 >= 35 and p7 >= 12:
-        return "OVERHEATED", "strong_30d_and_7d_extension", volume_ratio
-    if p30 <= -25 and p7 <= -10:
-        return "DETERIORATING", "persistent_30d_and_7d_weakness", volume_ratio
-    if -30 <= p30 <= -8 and p7 > -8 and p24 > -4 and (volume_ratio or 0) >= 0.025:
-        return "ACCUMULATION_ZONE", "pullback_with_stabilising_momentum_and_liquidity", volume_ratio
-    return "WATCH", "no_extreme_entry_regime", volume_ratio
+    # Require broader confirmation for extreme labels so a short rally or
+    # pullback does not dominate the slower-moving quality screen.
+    if p30 >= 45 and p7 >= 18 and p24 >= -2 and (volume_ratio or 0) >= 0.025:
+        return "OVERHEATED", "extended_30d_and_7d_move_with_active_volume", volume_ratio
+    if p30 <= -30 and p7 <= -12 and p24 <= 0:
+        return "DETERIORATING", "persistent_30d_7d_and_24h_weakness", volume_ratio
+    # A pullback becomes interesting only after short-term selling pressure
+    # has clearly stabilised and liquidity remains healthy.
+    if -35 <= p30 <= -10 and -6 <= p7 <= 6 and p24 >= -2 and (volume_ratio or 0) >= 0.03:
+        return "ACCUMULATION_ZONE", "meaningful_pullback_with_stabilisation_and_active_volume", volume_ratio
+    return "WATCH", "no_confirmed_extreme_entry_regime", volume_ratio
 
 def quality_alt_rows():
     markets = quality_alt_market_data()
@@ -11774,7 +11778,7 @@ details{margin-top:30px;padding:0}summary{cursor:pointer;padding:16px 18px;font-
 
 <section class="section"><div class="section-head"><div><h2>Research Now</h2><div class="section-copy">The five strongest current opportunities, including watches awaiting one key confirmation.</div></div></div><div class="cards" id="researchCards"></div></section>
 
-<section class="section"><div class="section-head"><div><h2>Quality Alts</h2><div class="section-copy">Established crypto assets screened separately from meme signals. Quality is a baseline; entry state stays conservative until live entry data is verified.</div></div></div><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>State</th><th>Quality</th><th>Price</th><th>24h</th><th>7d</th><th>30d</th><th>24h volume</th><th>Market cap</th><th>Vol/MC</th><th>Why</th></tr></thead><tbody id="qualityAltsBody"></tbody></table></div></section>
+<section class="section"><div class="section-head"><div><h2>Quality Alts</h2><div class="section-copy">Established crypto assets screened separately from meme signals. Entry states require multi-period confirmation; quality scores are research baselines, not trade instructions.</div></div></div><div class="panel table-wrap"><table><thead><tr><th>Asset</th><th>State</th><th>Quality</th><th>Price</th><th>24h</th><th>7d</th><th>30d</th><th>24h volume</th><th>Market cap</th><th>Vol/MC</th><th>Why</th></tr></thead><tbody id="qualityAltsBody"></tbody></table></div></section>
 
 <section class="section"><div class="section-head"><div><h2>Emerging Signals</h2><div class="section-copy">Solana consensus, Robinhood paper candidates and off-watchlist early-buyer discoveries in one ranked feed.</div></div></div><div class="panel table-wrap"><table><thead><tr><th>Coin</th><th>Decision</th><th>Score</th><th>Signal</th><th>Buyers</th><th>Buyer history</th><th>Best entry</th><th>Liquidity</th><th>1h volume</th><th>Safety</th><th>Why / missing gate</th></tr></thead><tbody id="emergingBody"></tbody></table></div></section>
 
